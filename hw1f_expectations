@@ -1,0 +1,132 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ----------------------------
+# Inputs you need to provide
+# ----------------------------
+FACTOR = "InterestRate.HKD-OIS"
+alpha = 0.15      # HW1 Alpha
+sigma = 0.01      # HW1 Sigma (assumed constant here)
+# out = ...        # simulation output
+# a = ...          # original curve at t=0: zero rates by tenor (continuous compounding)
+
+# Example shape for a:
+# a_tenors = np.array([...], dtype=float)   # in years
+# a_rates  = np.array([...], dtype=float)   # zero rates for those tenors
+
+
+def scenarios_to_array(out, factor=FACTOR):
+    """
+    RiskFlow scenarios DataFrame -> (dates, tenors, rates[t, tenor, scenario])
+    """
+    scen = out["Results"]["scenarios"][factor]  # index=(tenor,scenario), cols=dates
+    tenors = np.array(sorted(pd.to_numeric(scen.index.get_level_values("tenor").unique())), dtype=float)
+    scenarios = np.array(sorted(pd.to_numeric(scen.index.get_level_values("scenario").unique())), dtype=int)
+    dates = pd.to_datetime(scen.columns)
+
+    mats = []
+    for tau in tenors:
+        block = scen.xs(tau, level="tenor").reindex(scenarios)   # rows=scenario, cols=dates
+        mats.append(block.to_numpy().T)                          # (time, scenario)
+    rates = np.stack(mats, axis=1)                               # (time, tenor, scenario)
+    return dates, tenors, rates
+
+
+def build_zero_interp(a_tenors, a_rates):
+    def z(u):
+        return np.interp(u, a_tenors, a_rates, left=a_rates[0], right=a_rates[-1])
+    return z
+
+
+def p0_ratio(z0, t, tau):
+    # P(0,u)=exp(-z0(u)*u)
+    P0_T = np.exp(-z0(t + tau) * (t + tau))
+    P0_t = np.exp(-z0(t) * t)
+    return P0_T / P0_t
+
+
+def hw1_A_B(alpha, sigma, t, tau):
+    """
+    Matches RiskFlow style:
+    B = (1-exp(-alpha*tau))/alpha
+    Aterm from model docs/code structure (constant sigma simplification).
+    """
+    B = (1.0 - np.exp(-alpha * tau)) / alpha
+    I = sigma**2 * (np.exp(alpha * t) - 1.0) / alpha
+    J = sigma**2 * (np.exp(2.0 * alpha * t) - 1.0) / (2.0 * alpha)
+    Aterm = (B / alpha) * np.exp(-alpha * t) * (
+        2.0 * I - (np.exp(-alpha * t) + np.exp(-alpha * (t + tau))) * J
+    )
+    A = np.exp(-0.5 * Aterm)
+    return A, B, Aterm
+
+
+def setup_test(out, a_tenors, a_rates, alpha, sigma, factor=FACTOR):
+    dates, tenors, sim_rates = scenarios_to_array(out, factor)
+    t_years = ((dates - dates[0]).days / 365.0).to_numpy(dtype=float)
+    z0 = build_zero_interp(a_tenors, a_rates)
+
+    # pick one reference tenor to infer 1-factor state x_t from simulated curve
+    k_ref = 0
+    tau_ref = tenors[k_ref]
+
+    rows = []
+    for i, t in enumerate(t_years):
+        # original curve target: P(0,T)/P(0,t), T=t+tau
+        lhs = np.array([p0_ratio(z0, t, tau) for tau in tenors])
+
+        # direct simulated DF ratio proxy: E[exp(-tau * R_sim(t,tau))]
+        direct = np.array([
+            np.mean(np.exp(-tau * sim_rates[i, k, :])) for k, tau in enumerate(tenors)
+        ])
+
+        # infer factor state x_t from reference tenor:
+        tau = tau_ref
+        A_ref, B_ref, Aterm_ref = hw1_A_B(alpha, sigma, t, tau)
+        fwd_ref = z0(t + tau) * (t + tau) - z0(t) * t   # same object as model fwd_curve
+        x_t = (tau * sim_rates[i, k_ref, :] - fwd_ref - 0.5 * Aterm_ref) / B_ref
+
+        # requested test: E[A(t,T)*exp(-B(t,T)*r(t))]  (here r(t) interpreted as 1-factor state x_t)
+        rhs = []
+        for tau in tenors:
+            A, B, _ = hw1_A_B(alpha, sigma, t, tau)
+            rhs.append(np.mean(A * np.exp(-B * x_t)))
+        rhs = np.array(rhs)
+
+        rows.append({
+            "date": dates[i],
+            "t": t,
+            "lhs_P0T_over_P0t": lhs,
+            "rhs_E_AexpBr": rhs,
+            "direct_E_exp_minus_tauR": direct,
+            "abs_err_rhs": np.abs(lhs - rhs),
+            "abs_err_direct": np.abs(lhs - direct),
+        })
+
+    return tenors, rows
+
+
+def plot_test_for_date(tenors, row):
+    plt.figure(figsize=(9, 5))
+    plt.plot(tenors, row["lhs_P0T_over_P0t"], "k-", lw=2, label="Original P(0,T)/P(0,t)")
+    plt.plot(tenors, row["rhs_E_AexpBr"], "r--", lw=1.8, label="Sim E[A(t,T)exp(-B r(t))]")
+    plt.plot(tenors, row["direct_E_exp_minus_tauR"], "b:", lw=1.8, label="Sim E[exp(-tau*R(t,tau))]")
+    plt.xlabel("Tenor tau (years)")
+    plt.ylabel("Discount ratio")
+    plt.title(f"HW1 test at {row['date'].date()} (t={row['t']:.4f}y)")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# ----------------------------
+# Usage
+# ----------------------------
+# tenors0 = np.array([...], dtype=float)
+# rates0  = np.array([...], dtype=float)   # your 'a' curve
+# tenors, test_rows = setup_test(out, tenors0, rates0, alpha, sigma, factor=FACTOR)
+# for row in test_rows:
+#     plot_test_for_date(tenors, row)
+1
