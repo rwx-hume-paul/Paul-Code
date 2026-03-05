@@ -129,4 +129,68 @@ def plot_test_for_date(tenors, row):
 # tenors, test_rows = setup_test(out, tenors0, rates0, alpha, sigma, factor=FACTOR)
 # for row in test_rows:
 #     plot_test_for_date(tenors, row)
-1
+
+
+
+def scenarios_to_array(out, factor=FACTOR):
+    scen = out["Results"]["scenarios"][factor]  # index=(tenor,scenario), cols=dates
+    tenors = np.array(sorted(pd.to_numeric(scen.index.get_level_values("tenor").unique())), dtype=float)
+    scenarios = np.array(sorted(pd.to_numeric(scen.index.get_level_values("scenario").unique())), dtype=int)
+    dates = pd.to_datetime(scen.columns)
+
+    mats = []
+    for tau in tenors:
+        block = scen.xs(tau, level="tenor").reindex(scenarios)
+        mats.append(block.to_numpy().T)  # (time, scenario)
+    rates = np.stack(mats, axis=1)      # (time, tenor, scenario)
+    return dates, tenors, rates
+
+
+
+def B_tau(alpha, tau):
+    return (1.0 - np.exp(-alpha * tau)) / alpha
+
+def v_t_const_sigma(alpha, sigma, t):
+    return sigma * sigma * (1.0 - np.exp(-2.0 * alpha * t)) / (2.0 * alpha)
+
+def variance_test_hw1(out, a_tenors, a_rates, alpha, sigma, factor=FACTOR):
+    dates, tenors, sim_rates = scenarios_to_array(out, factor)
+    t_years = ((dates - dates[0]).days / 365.0).to_numpy(dtype=float)
+    z0 = z_interp(a_tenors, a_rates)
+
+    rows = []
+    for i, t in enumerate(t_years):
+        lhs_ratio = np.array([p0_ratio(z0, t, tau) for tau in tenors])  # P(0,T)/P(0,t)
+        Y = np.exp(-tenors.reshape(-1, 1) * sim_rates[i, :, :])         # (tenor, scenario)
+
+        var_sim = Y.var(axis=1, ddof=1)
+        v_t = v_t_const_sigma(alpha, sigma, t)
+        b = B_tau(alpha, tenors)
+        var_model = lhs_ratio**2 * (np.exp((b**2) * v_t) - 1.0)
+
+        rows.append({
+            "date": dates[i],
+            "t": t,
+            "var_sim": var_sim,
+            "var_model": var_model,
+            "ratio_sim_over_model": np.divide(var_sim, var_model, out=np.full_like(var_sim, np.nan), where=var_model>0),
+        })
+    return tenors, rows
+
+def plot_variance_for_date(tenors, row):
+    plt.figure(figsize=(9, 5))
+    plt.plot(tenors, row["var_sim"], "b-", lw=2, label="Sim Var[exp(-tau R)]")
+    plt.plot(tenors, row["var_model"], "r--", lw=2, label="HW1 model variance")
+    plt.xlabel("Tenor tau (years)")
+    plt.ylabel("Variance")
+    plt.title(f"Second-moment test at {row['date'].date()} (t={row['t']:.4f}y)")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+# a_tenors, a_rates = your original t=0 curve ("a"), continuous-compounded zero rates
+# alpha, sigma = HW1 params
+tenors, var_rows = variance_test_hw1(out, a_tenors, a_rates, alpha, sigma, factor="InterestRate.HKD-OIS")
+for row in var_rows:
+    plot_variance_for_date(tenors, row)
