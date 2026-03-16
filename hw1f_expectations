@@ -192,5 +192,26 @@ def plot_variance_for_date(tenors, row):
 # a_tenors, a_rates = your original t=0 curve ("a"), continuous-compounded zero rates
 # alpha, sigma = HW1 params
 tenors, var_rows = variance_test_hw1(out, a_tenors, a_rates, alpha, sigma, factor="InterestRate.HKD-OIS")
+
+            if debug_energy and not debug_logged and payoff.numel() > 0:
+                t_row = 0
+                s_idx = min(max(debug_scenario, 0), payoff.shape[2] - 1)
+                max_items = max(debug_max, 0)
+                payoff_row = payoff[t_row, :, s_idx].detach().cpu().numpy()
+                discount_row = discount_rates[time_ofs + t_row, :, s_idx].detach().cpu().numpy()
+                pay_days = cashflows.np[:, utils.CASHFLOW_INDEX_Pay_Day].astype(np.int64)
+                items = list(zip(pay_days.tolist(), payoff_row.tolist()))
+                if max_items:
+                    items = items[:max_items]
+                logging.info(
+                    "EnergyDebug: forward values (weighted avg) at t=%s scenario=%s: %s",
+                    float(time_block[time_ofs + t_row]), s_idx, items)
+                disc_items = list(zip(cash_pmts.astype(np.int64).tolist(), discount_row.tolist()))
+                if max_items:
+                    disc_items = disc_items[:max_items]
+                logging.info(
+                    "EnergyDebug: discount factors at t=%s scenario=%s: %s",
+                    float(time_block[time_ofs + t_row]), s_idx, disc_items)
+                debug_logged = True
 for row in var_rows:
     plot_variance_for_date(tenors, row)
