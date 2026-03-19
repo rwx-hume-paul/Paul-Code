@@ -403,3 +403,50 @@ var_model = hw2_var_termstructured(
     alpha2, sigma2_tenors, sigma2_vals,
     rho
 )
+
+def variance_test_hw2(
+    out,
+    a_tenors, a_rates,
+    alpha1, sigma1_tenors, sigma1_vals,
+    alpha2, sigma2_tenors, sigma2_vals,
+    rho,
+    factor=FACTOR
+):
+    dates, tenors, sim_rates = scenarios_to_array(out, factor)
+    t_years = ((dates - dates[0]).days / 365.0).to_numpy(dtype=float)
+
+    rows = []
+    for i, t in enumerate(t_years):
+        # Simulated variance of Y(t,tau)=exp(-tau*R(t,tau))
+        Y = np.exp(-tenors.reshape(-1, 1) * sim_rates[i, :, :])  # (tenor, scenario)
+        var_sim = Y.var(axis=1, ddof=1)
+
+        # Theoretical variance (term-structured sigmas)
+        var_model = hw2_var_termstructured(
+            tenors, t,
+            a_tenors, a_rates,
+            alpha1, sigma1_tenors, sigma1_vals,
+            alpha2, sigma2_tenors, sigma2_vals,
+            rho
+        )
+
+        rows.append({
+            "date": dates[i],
+            "t": t,
+            "var_sim": var_sim,
+            "var_model": var_model,
+            "ratio_sim_over_model": np.divide(
+                var_sim, var_model, out=np.full_like(var_sim, np.nan), where=var_model > 0
+            ),
+        })
+    return tenors, rows
+
+tenors, rows = variance_test_hw2(
+    out,
+    a_tenors, a_rates,
+    alpha1, sigma1_tenors, sigma1_vals,
+    alpha2, sigma2_tenors, sigma2_vals,
+    rho,
+    factor="InterestRate.HKD-OIS"
+)
+
