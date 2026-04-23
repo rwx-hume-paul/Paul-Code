@@ -1,452 +1,55 @@
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-# ----------------------------
-# Inputs you need to provide
-# ----------------------------
-FACTOR = "InterestRate.HKD-OIS"
-alpha = 0.15      # HW1 Alpha
-sigma = 0.01      # HW1 Sigma (assumed constant here)
-# out = ...        # simulation output
-# a = ...          # original curve at t=0: zero rates by tenor (continuous compounding)
-
-# Example shape for a:
-# a_tenors = np.array([...], dtype=float)   # in years
-# a_rates  = np.array([...], dtype=float)   # zero rates for those tenors
-
-
-def scenarios_to_array(out, factor=FACTOR):
-    """
-    RiskFlow scenarios DataFrame -> (dates, tenors, rates[t, tenor, scenario])
-    """
-    scen = out["Results"]["scenarios"][factor]  # index=(tenor,scenario), cols=dates
-    tenors = np.array(sorted(pd.to_numeric(scen.index.get_level_values("tenor").unique())), dtype=float)
-    scenarios = np.array(sorted(pd.to_numeric(scen.index.get_level_values("scenario").unique())), dtype=int)
-    dates = pd.to_datetime(scen.columns)
-
-    mats = []
-    for tau in tenors:
-        block = scen.xs(tau, level="tenor").reindex(scenarios)   # rows=scenario, cols=dates
-        mats.append(block.to_numpy().T)                          # (time, scenario)
-    rates = np.stack(mats, axis=1)                               # (time, tenor, scenario)
-    return dates, tenors, rates
-
-
-def build_zero_interp(a_tenors, a_rates):
-    def z(u):
-        return np.interp(u, a_tenors, a_rates, left=a_rates[0], right=a_rates[-1])
-    return z
-
-
-def p0_ratio(z0, t, tau):
-    # P(0,u)=exp(-z0(u)*u)
-    P0_T = np.exp(-z0(t + tau) * (t + tau))
-    P0_t = np.exp(-z0(t) * t)
-    return P0_T / P0_t
-
-
-def hw1_A_B(alpha, sigma, t, tau):
-    """
-    Matches RiskFlow style:
-    B = (1-exp(-alpha*tau))/alpha
-    Aterm from model docs/code structure (constant sigma simplification).
-    """
-    B = (1.0 - np.exp(-alpha * tau)) / alpha
-    I = sigma**2 * (np.exp(alpha * t) - 1.0) / alpha
-    J = sigma**2 * (np.exp(2.0 * alpha * t) - 1.0) / (2.0 * alpha)
-    Aterm = (B / alpha) * np.exp(-alpha * t) * (
-        2.0 * I - (np.exp(-alpha * t) + np.exp(-alpha * (t + tau))) * J
-    )
-    A = np.exp(-0.5 * Aterm)
-    return A, B, Aterm
-
-
-def setup_test(out, a_tenors, a_rates, alpha, sigma, factor=FACTOR):
-    dates, tenors, sim_rates = scenarios_to_array(out, factor)
-    t_years = ((dates - dates[0]).days / 365.0).to_numpy(dtype=float)
-    z0 = build_zero_interp(a_tenors, a_rates)
-
-    # pick one reference tenor to infer 1-factor state x_t from simulated curve
-    k_ref = 0
-    tau_ref = tenors[k_ref]
-
-    rows = []
-    for i, t in enumerate(t_years):
-        # original curve target: P(0,T)/P(0,t), T=t+tau
-        lhs = np.array([p0_ratio(z0, t, tau) for tau in tenors])
-
-        # direct simulated DF ratio proxy: E[exp(-tau * R_sim(t,tau))]
-        direct = np.array([
-            np.mean(np.exp(-tau * sim_rates[i, k, :])) for k, tau in enumerate(tenors)
-        ])
-
-        # infer factor state x_t from reference tenor:
-        tau = tau_ref
-        A_ref, B_ref, Aterm_ref = hw1_A_B(alpha, sigma, t, tau)
-        fwd_ref = z0(t + tau) * (t + tau) - z0(t) * t   # same object as model fwd_curve
-        x_t = (tau * sim_rates[i, k_ref, :] - fwd_ref - 0.5 * Aterm_ref) / B_ref
-
-        # requested test: E[A(t,T)*exp(-B(t,T)*r(t))]  (here r(t) interpreted as 1-factor state x_t)
-        rhs = []
-        for tau in tenors:
-            A, B, _ = hw1_A_B(alpha, sigma, t, tau)
-            rhs.append(np.mean(A * np.exp(-B * x_t)))
-        rhs = np.array(rhs)
-
-        rows.append({
-            "date": dates[i],
-            "t": t,
-            "lhs_P0T_over_P0t": lhs,
-            "rhs_E_AexpBr": rhs,
-            "direct_E_exp_minus_tauR": direct,
-            "abs_err_rhs": np.abs(lhs - rhs),
-            "abs_err_direct": np.abs(lhs - direct),
-        })
-
-    return tenors, rows
-
-
-def plot_test_for_date(tenors, row):
-    plt.figure(figsize=(9, 5))
-    plt.plot(tenors, row["lhs_P0T_over_P0t"], "k-", lw=2, label="Original P(0,T)/P(0,t)")
-    plt.plot(tenors, row["rhs_E_AexpBr"], "r--", lw=1.8, label="Sim E[A(t,T)exp(-B r(t))]")
-    plt.plot(tenors, row["direct_E_exp_minus_tauR"], "b:", lw=1.8, label="Sim E[exp(-tau*R(t,tau))]")
-    plt.xlabel("Tenor tau (years)")
-    plt.ylabel("Discount ratio")
-    plt.title(f"HW1 test at {row['date'].date()} (t={row['t']:.4f}y)")
-    plt.grid(alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-
-# ----------------------------
-# Usage
-# ----------------------------
-# tenors0 = np.array([...], dtype=float)
-# rates0  = np.array([...], dtype=float)   # your 'a' curve
-# tenors, test_rows = setup_test(out, tenors0, rates0, alpha, sigma, factor=FACTOR)
-# for row in test_rows:
-#     plot_test_for_date(tenors, row)
-
-
-
-def scenarios_to_array(out, factor=FACTOR):
-    scen = out["Results"]["scenarios"][factor]  # index=(tenor,scenario), cols=dates
-    tenors = np.array(sorted(pd.to_numeric(scen.index.get_level_values("tenor").unique())), dtype=float)
-    scenarios = np.array(sorted(pd.to_numeric(scen.index.get_level_values("scenario").unique())), dtype=int)
-    dates = pd.to_datetime(scen.columns)
-
-    mats = []
-    for tau in tenors:
-        block = scen.xs(tau, level="tenor").reindex(scenarios)
-        mats.append(block.to_numpy().T)  # (time, scenario)
-    rates = np.stack(mats, axis=1)      # (time, tenor, scenario)
-    return dates, tenors, rates
-
-
-
-def B_tau(alpha, tau):
-    return (1.0 - np.exp(-alpha * tau)) / alpha
-
-def v_t_const_sigma(alpha, sigma, t):
-    return sigma * sigma * (1.0 - np.exp(-2.0 * alpha * t)) / (2.0 * alpha)
-
-def variance_test_hw1(out, a_tenors, a_rates, alpha, sigma, factor=FACTOR):
-    dates, tenors, sim_rates = scenarios_to_array(out, factor)
-    t_years = ((dates - dates[0]).days / 365.0).to_numpy(dtype=float)
-    z0 = z_interp(a_tenors, a_rates)
-
-    rows = []
-    for i, t in enumerate(t_years):
-        lhs_ratio = np.array([p0_ratio(z0, t, tau) for tau in tenors])  # P(0,T)/P(0,t)
-        Y = np.exp(-tenors.reshape(-1, 1) * sim_rates[i, :, :])         # (tenor, scenario)
-
-        var_sim = Y.var(axis=1, ddof=1)
-        v_t = v_t_const_sigma(alpha, sigma, t)
-        b = B_tau(alpha, tenors)
-        var_model = lhs_ratio**2 * (np.exp((b**2) * v_t) - 1.0)
-
-        rows.append({
-            "date": dates[i],
-            "t": t,
-            "var_sim": var_sim,
-            "var_model": var_model,
-            "ratio_sim_over_model": np.divide(var_sim, var_model, out=np.full_like(var_sim, np.nan), where=var_model>0),
-        })
-    return tenors, rows
-
-def plot_variance_for_date(tenors, row):
-    plt.figure(figsize=(9, 5))
-    plt.plot(tenors, row["var_sim"], "b-", lw=2, label="Sim Var[exp(-tau R)]")
-    plt.plot(tenors, row["var_model"], "r--", lw=2, label="HW1 model variance")
-    plt.xlabel("Tenor tau (years)")
-    plt.ylabel("Variance")
-    plt.title(f"Second-moment test at {row['date'].date()} (t={row['t']:.4f}y)")
-    plt.grid(alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-
-# a_tenors, a_rates = your original t=0 curve ("a"), continuous-compounded zero rates
-# alpha, sigma = HW1 params
-tenors, var_rows = variance_test_hw1(out, a_tenors, a_rates, alpha, sigma, factor="InterestRate.HKD-OIS")
-
-            if debug_energy and not debug_logged and payoff.numel() > 0:
-                t_row = 0
-                s_idx = min(max(debug_scenario, 0), payoff.shape[2] - 1)
-                max_items = max(debug_max, 0)
-                payoff_row = payoff[t_row, :, s_idx].detach().cpu().numpy()
-                discount_row = discount_rates[time_ofs + t_row, :, s_idx].detach().cpu().numpy()
-                pay_days = cashflows.np[:, utils.CASHFLOW_INDEX_Pay_Day].astype(np.int64)
-                items = list(zip(pay_days.tolist(), payoff_row.tolist()))
-                if max_items:
-                    items = items[:max_items]
-                logging.info(
-                    "EnergyDebug: forward values (weighted avg) at t=%s scenario=%s: %s",
-                    float(time_block[time_ofs + t_row]), s_idx, items)
-                disc_items = list(zip(cash_pmts.astype(np.int64).tolist(), discount_row.tolist()))
-                if max_items:
-                    disc_items = disc_items[:max_items]
-                logging.info(
-                    "EnergyDebug: discount factors at t=%s scenario=%s: %s",
-                    float(time_block[time_ofs + t_row]), s_idx, disc_items)
-                debug_logged = True
-for row in var_rows:
-    plot_variance_for_date(tenors, row)
-
-            if debug_energy and not debug_logged and payoff.numel() > 0:
-                t_row = 0
-                s_idx = min(max(debug_scenario, 0), payoff.shape[2] - 1)
-                max_items = max(debug_max, 0)
-                payoff_row = payoff[t_row, :, s_idx].detach().cpu().numpy()
-                discount_row = discount_rates[time_ofs + t_row, :, s_idx].detach().cpu().numpy()
-                pay_days = cashflows.np[:, utils.CASHFLOW_INDEX_Pay_Day].astype(np.int64)
-                items = list(zip(pay_days.tolist(), payoff_row.tolist()))
-                if max_items:
-                    items = items[:max_items]
-                logging.info(
-                    "EnergyDebug: forward values (weighted avg) at t=%s scenario=%s: %s",
-                    float(time_block[time_ofs + t_row]), s_idx, items)
-                disc_items = list(zip(cash_pmts.astype(np.int64).tolist(), discount_row.tolist()))
-                if max_items:
-                    disc_items = disc_items[:max_items]
-                logging.info(
-                    "EnergyDebug: discount factors at t=%s scenario=%s: %s",
-                    float(time_block[time_ofs + t_row]), s_idx, disc_items)
-                debug_logged = True
-
-import numpy as np
-
-import numpy as np
-import pandas as pd
-
-FACTOR = "InterestRate.HKD-OIS"
-
-def scenarios_to_array(out, factor=FACTOR):
-    """
-    RiskFlow scenarios DataFrame -> (dates, tenors, rates[t, tenor, scenario])
-    """
-    scen = out["Results"]["scenarios"][factor]  # index=(tenor,scenario), cols=dates
-    if not isinstance(scen.index, pd.MultiIndex):
-        raise ValueError("Expected MultiIndex (tenor, scenario).")
-    tenors = np.array(sorted(pd.to_numeric(scen.index.get_level_values("tenor").unique())), dtype=float)
-    scenarios = np.array(sorted(pd.to_numeric(scen.index.get_level_values("scenario").unique())), dtype=int)
-    dates = pd.to_datetime(scen.columns)
-
-    mats = []
-    for tau in tenors:
-        block = scen.xs(tau, level="tenor").reindex(scenarios)
-        mats.append(block.to_numpy().T)  # (time, scenario)
-    rates = np.stack(mats, axis=1)      # (time, tenor, scenario)
-    return dates, tenors, rates
-
-def z_interp(a_tenors, a_rates):
-    return lambda u: np.interp(u, a_tenors, a_rates, left=a_rates[0], right=a_rates[-1])
-
-def p0_ratio(z0, t, tau):
-    return np.exp(-z0(t + tau) * (t + tau) + z0(t) * t)
-
-def hw2_B(alpha, tau):
-    return (1.0 - np.exp(-alpha * tau)) / alpha
-
-def hw2_varX(alpha, sigma, t):
-    # OU variance for factor X_t with constant sigma
-    return sigma * sigma * (1.0 - np.exp(-2.0 * alpha * t)) / (2.0 * alpha)
-
-def hw2_covX(alpha1, alpha2, sigma1, sigma2, rho, t):
-    # Covariance between two OU factors with constant sigmas
-    return rho * sigma1 * sigma2 * (1.0 - np.exp(-(alpha1 + alpha2) * t)) / (alpha1 + alpha2)
-
-def hw2_expectations_from_sims(out, a_tenors, a_rates, factor=FACTOR):
-    """
-    Empirical mean/variance of Y(t,tau)=exp(-tau*R(t,tau)).
-    Also returns P(0,T)/P(0,t) for comparison.
-    """
-    dates, tenors, sim_rates = scenarios_to_array(out, factor)
-    t_years = ((dates - dates[0]).days / 365.0).to_numpy(dtype=float)
-    z0 = z_interp(a_tenors, a_rates)
-
-    rows = []
-    for i, t in enumerate(t_years):
-        lhs = np.array([p0_ratio(z0, t, tau) for tau in tenors])
-        Y = np.exp(-tenors.reshape(-1, 1) * sim_rates[i, :, :])  # (tenor, scenario)
-        mean_sim = Y.mean(axis=1)
-        var_sim = Y.var(axis=1, ddof=1)
-        rows.append({
-            "date": dates[i],
-            "t": t,
-            "lhs_P0T_over_P0t": lhs,
-            "mean_sim": mean_sim,
-            "var_sim": var_sim,
-            "ratio_mean": np.divide(mean_sim, lhs, out=np.full_like(lhs, np.nan), where=lhs>0),
-        })
-    return tenors, rows
-
-def hw2_theoretical_var(
-    tenors, t, a_tenors, a_rates,
-    alpha1, sigma1, alpha2, sigma2, rho
-):
-    """
-    Optional closed-form variance for Y(t,tau)=exp(-tau*R(t,tau))
-    under 2-factor OU with constant sigmas.
-    """
-    z0 = z_interp(a_tenors, a_rates)
-    lhs = np.array([p0_ratio(z0, t, tau) for tau in tenors])
-
-    b1 = hw2_B(alpha1, tenors)
-    b2 = hw2_B(alpha2, tenors)
-
-    v1 = hw2_varX(alpha1, sigma1, t)
-    v2 = hw2_varX(alpha2, sigma2, t)
-    c12 = hw2_covX(alpha1, alpha2, sigma1, sigma2, rho, t)
-
-    # Var of (b1*X1 + b2*X2)
-    v = (b1**2) * v1 + (b2**2) * v2 + 2.0 * b1 * b2 * c12
-
-    # If Y = (P0T/P0t) * exp(- (b1 X1 + b2 X2)), then
-    # Var[Y] = (P0T/P0t)^2 * (exp(v) - 1)
-    return lhs**2 * (np.exp(v) - 1.0)
-
-# Usage:
-# tenors, rows = hw2_expectations_from_sims(out, a_tenors, a_rates, factor="InterestRate.HKD-OIS")
-# for r in rows: compare r["mean_sim"] vs r["lhs_P0T_over_P0t"], and r["var_sim"].
-#
-# If you have HW2 params:
-# var_th = hw2_theoretical_var(tenors, r["t"], a_tenors, a_rates, alpha1, sigma1, alpha2, sigma2, rho)
-
-
-
-
-
-def integrate_term_structure(t, tenors, values, exp_power):
-    """
-    Numeric integral of exp(exp_power*s) * values(s) over s in [0, t]
-    where values(s) is piecewise-linear defined on (tenors, values).
-    """
-    if t <= 0.0:
-        return 0.0
-
-    # grid = union of tenors and [0, t], clipped to [0,t]
-    grid = np.array(sorted(set(np.concatenate([tenors, [0.0, t]]))))
-    grid = grid[(grid >= 0.0) & (grid <= t)]
-    if grid.size < 2:
-        return 0.0
-
-    vals = np.interp(grid, tenors, values, left=values[0], right=values[-1])
-    integrand = np.exp(exp_power * grid) * vals
-    return np.trapz(integrand, grid)
-
-def hw2_var_termstructured(
-    tenors, t, a_tenors, a_rates,
-    alpha1, sigma1_tenors, sigma1_vals,
-    alpha2, sigma2_tenors, sigma2_vals,
-    rho
-):
-    """
-    Theoretical variance of Y=exp(-tau*R(t,tau)) for HW2 with term-structured sigmas.
-    """
-    # P(0,T)/P(0,t)
-    z0 = lambda u: np.interp(u, a_tenors, a_rates, left=a_rates[0], right=a_rates[-1])
-    lhs = np.array([np.exp(-z0(t + tau) * (t + tau) + z0(t) * t) for tau in tenors])
-
-    # J1, J2, K12
-    J1 = integrate_term_structure(t, sigma1_tenors, sigma1_vals**2, exp_power=2.0*alpha1)
-    J2 = integrate_term_structure(t, sigma2_tenors, sigma2_vals**2, exp_power=2.0*alpha2)
-
-    # cross integral uses sigma1*sigma2
-    # build a common grid for interpolation
-    grid = np.array(sorted(set(np.concatenate([sigma1_tenors, sigma2_tenors, [0.0, t]]))))
-    grid = grid[(grid >= 0.0) & (grid <= t)]
-    s1 = np.interp(grid, sigma1_tenors, sigma1_vals, left=sigma1_vals[0], right=sigma1_vals[-1])
-    s2 = np.interp(grid, sigma2_tenors, sigma2_vals, left=sigma2_vals[0], right=sigma2_vals[-1])
-    K12 = np.trapz(np.exp((alpha1 + alpha2) * grid) * (s1 * s2), grid)
-
-    # B(tau)
-    b1 = (1.0 - np.exp(-alpha1 * tenors)) / alpha1
-    b2 = (1.0 - np.exp(-alpha2 * tenors)) / alpha2
-
-    # variance of b1*X1 + b2*X2 (X_i = e^{-alpha_i t} Y_i)
-    v = (b1**2) * np.exp(-2.0*alpha1*t) * J1 \
-        + (b2**2) * np.exp(-2.0*alpha2*t) * J2 \
-        + 2.0 * b1 * b2 * np.exp(-(alpha1+alpha2)*t) * rho * K12
-
-    return lhs**2 * (np.exp(v) - 1.0)
-
-
-
-var_model = hw2_var_termstructured(
-    tenors, t,
-    a_tenors, a_rates,
-    alpha1, sigma1_tenors, sigma1_vals,
-    alpha2, sigma2_tenors, sigma2_vals,
-    rho
-)
-
-def variance_test_hw2(
-    out,
-    a_tenors, a_rates,
-    alpha1, sigma1_tenors, sigma1_vals,
-    alpha2, sigma2_tenors, sigma2_vals,
-    rho,
-    factor=FACTOR
-):
-    dates, tenors, sim_rates = scenarios_to_array(out, factor)
-    t_years = ((dates - dates[0]).days / 365.0).to_numpy(dtype=float)
-
-    rows = []
-    for i, t in enumerate(t_years):
-        # Simulated variance of Y(t,tau)=exp(-tau*R(t,tau))
-        Y = np.exp(-tenors.reshape(-1, 1) * sim_rates[i, :, :])  # (tenor, scenario)
-        var_sim = Y.var(axis=1, ddof=1)
-
-        # Theoretical variance (term-structured sigmas)
-        var_model = hw2_var_termstructured(
-            tenors, t,
-            a_tenors, a_rates,
-            alpha1, sigma1_tenors, sigma1_vals,
-            alpha2, sigma2_tenors, sigma2_vals,
-            rho
-        )
-
-        rows.append({
-            "date": dates[i],
-            "t": t,
-            "var_sim": var_sim,
-            "var_model": var_model,
-            "ratio_sim_over_model": np.divide(
-                var_sim, var_model, out=np.full_like(var_sim, np.nan), where=var_model > 0
-            ),
-        })
-    return tenors, rows
-
-tenors, rows = variance_test_hw2(
-    out,
-    a_tenors, a_rates,
-    alpha1, sigma1_tenors, sigma1_vals,
-    alpha2, sigma2_tenors, sigma2_vals,
-    rho,
-    factor="InterestRate.HKD-OIS"
-)
-
+import QuantLib as ql
+
+def get_ois_year_fractions(valuation_date, start_date, end_date,
+                           day_count_str="ACT/365",
+                           calendar_str="TARGET",
+                           business_convention_str="Following"):
+    # --- Convert Python dates to QuantLib Dates ---
+    val_date = ql.Date(valuation_date.day, valuation_date.month, valuation_date.year)
+    start = ql.Date(start_date.day, start_date.month, start_date.year)
+    end = ql.Date(end_date.day, end_date.month, end_date.year)
+
+    # --- Set evaluation date ---
+    ql.Settings.instance().evaluationDate = val_date
+
+    # --- Calendar ---
+    if calendar_str.upper() == "TARGET":
+        calendar = ql.TARGET()
+    else:
+        raise ValueError("Unsupported calendar")
+
+    # --- Business convention ---
+    if business_convention_str.lower() == "following":
+        convention = ql.Following
+    elif business_convention_str.lower() == "modified following":
+        convention = ql.ModifiedFollowing
+    else:
+        raise ValueError("Unsupported business convention")
+
+    # --- Day count ---
+    if day_count_str.upper() == "ACT/365":
+        day_count = ql.Actual365Fixed()
+    elif day_count_str.upper() == "ACT/360":
+        day_count = ql.Actual360()
+    else:
+        raise ValueError("Unsupported day count")
+
+    # --- Generate daily schedule (business days only) ---
+    dates = []
+    d = val_date
+
+    while d <= start:
+        if calendar.isBusinessDay(d):
+            adjusted = calendar.adjust(d, convention)
+            dates.append(adjusted)
+        d = d + 1  # move one calendar day
+
+    # --- Remove duplicates (can occur due to adjustment) ---
+    dates = sorted(set(dates))
+
+    # --- Compute year fractions ---
+    year_fractions = [
+        day_count.yearFraction(val_date, d) for d in dates
+    ]
+
+    return dates, year_fractions
