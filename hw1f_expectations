@@ -53,3 +53,56 @@ def get_ois_year_fractions(valuation_date, start_date, end_date,
     ]
 
     return dates, year_fractions
+
+# Positive / Negative exposure masks
+d1_pos = d1.where(d1 > 0)
+d1_neg = d1.where(d1 < 0)
+
+d2_pos = d2.where(d2 > 0)
+d2_neg = d2.where(d2 < 0)
+
+diff_pos = diff.where(diff > 0)
+diff_neg = diff.where(diff < 0)
+
+# EPE (Expected Positive Exposure)
+epe1 = d1_pos.mean(axis=1, skipna=True)
+epe2 = d2_pos.mean(axis=1, skipna=True)
+epe_diff = diff_pos.mean(axis=1, skipna=True)
+
+# ENE (Expected Negative Exposure)
+ene1 = d1_neg.mean(axis=1, skipna=True)
+ene2 = d2_neg.mean(axis=1, skipna=True)
+ene_diff = diff_neg.mean(axis=1, skipna=True)
+
+mean_comp = pd.DataFrame({
+    # --- Means ---
+    'Mean RiskFlow': mean1,
+    'Mean Validation': mean2,
+    'Mean Diff': diff_mean,
+
+    # --- EPE ---
+    'EPE RiskFlow': epe1,
+    'EPE Validation': epe2,
+    'EPE Diff': epe_diff,
+
+    # --- ENE ---
+    'ENE RiskFlow': ene1,
+    'ENE Validation': ene2,
+    'ENE Diff': ene_diff,
+
+    # --- CIs ---
+    'RiskFlow CI95_L': ci95_risk_down,
+    'RiskFlow CI95_U': ci95_risk_up,
+    'RiskFlow CI99_L': ci99_risk_down,
+    'RiskFlow CI99_U': ci99_risk_up,
+
+    'Validation CI95_L': ci95_val_down,
+    'Validation CI95_U': ci95_val_up,
+    'Validation CI99_L': ci99_val_down,
+    'Validation CI99_U': ci99_val_up,
+
+    'Diff CI95_L': ci95_diff_down,
+    'Diff CI95_U': ci95_diff_up,
+    'Diff CI99_L': ci99_diff_down,
+    'Diff CI99_U': ci99_diff_up,
+})
