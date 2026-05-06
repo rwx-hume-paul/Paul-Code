@@ -54,55 +54,223 @@ def get_ois_year_fractions(valuation_date, start_date, end_date,
 
     return dates, year_fractions
 
-# Positive / Negative exposure masks
-d1_pos = d1.where(d1 > 0)
-d1_neg = d1.where(d1 < 0)
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from typing import Optional
+import matplotlib.pyplot as plt
 
-d2_pos = d2.where(d2 > 0)
-d2_neg = d2.where(d2 < 0)
+_SHEET1_FIXED = "RiskFlow_MTMs"
+_SHEET2_FIXED = "Validation_MTMs"
+_SHEET3_FIXED = "Diff_MTM"
+_SHEET4_FIXED = "Mean_Comparison"
 
-diff_pos = diff.where(diff > 0)
-diff_neg = diff.where(diff < 0)
+def compare_mtm_in_excel(
+        df1: pd.DataFrame,
+        df2: pd.DataFrame,
+        folder_path: str,
+        index: bool = True,
+        filename: Optional[str] = None,
+        bootstrap_reps: int = 1000,
+        random_state: Optional[int] = None
+) -> None:
+    """
+    Save two MTM DataDrames to an Excel file with four sheets inside the given folder
+    Returns:
+        None
+    """
+    # Align inputs into DataFrames
+    if not isinstance(df1, pd.DataFrame):
+        df1 = pd.DataFrame(df1)
+    if not isinstance(df2, pd.DataFrame):
+        df2 = pd.DataFrame(df2)
 
-# EPE (Expected Positive Exposure)
-epe1 = d1_pos.mean(axis=1, skipna=True)
-epe2 = d2_pos.mean(axis=1, skipna=True)
-epe_diff = diff_pos.mean(axis=1, skipna=True)
+    # Align indexes and columns (outer join)
+    idx = df1.index.union(df2.index)
+    cols = df1.columns.union(df2.columns)
 
-# ENE (Expected Negative Exposure)
-ene1 = d1_neg.mean(axis=1, skipna=True)
-ene2 = d2_neg.mean(axis=1, skipna=True)
-ene_diff = diff_neg.mean(axis=1, skipna=True)
+    d1 = df1.reindex(index=idx, columns=cols, fill_value=np.nan)
+    d2 = df2.reindex(index=idx, columns=cols, fill_value=np.nan)
 
-mean_comp = pd.DataFrame({
-    # --- Means ---
-    'Mean RiskFlow': mean1,
-    'Mean Validation': mean2,
-    'Mean Diff': diff_mean,
+    diff = d1 - d2
 
-    # --- EPE ---
-    'EPE RiskFlow': epe1,
-    'EPE Validation': epe2,
-    'EPE Diff': epe_diff,
+    mean1 = d1.mean(axis=1, skipna=True)
+    mean2 = d2.mean(axis=1, skipna=True)
+    diff_mean = diff.mean(axis=1)
 
-    # --- ENE ---
-    'ENE RiskFlow': ene1,
-    'ENE Validation': ene2,
-    'ENE Diff': ene_diff,
+    # Positive / Negative exposure masks
+    d1_pos = d1.where(d1 > 0)
+    d1_neg = d1.where(d1 < 0)
 
-    # --- CIs ---
-    'RiskFlow CI95_L': ci95_risk_down,
-    'RiskFlow CI95_U': ci95_risk_up,
-    'RiskFlow CI99_L': ci99_risk_down,
-    'RiskFlow CI99_U': ci99_risk_up,
+    d2_pos = d2.where(d2 > 0)
+    d2_neg = d2.where(d2 < 0)
 
-    'Validation CI95_L': ci95_val_down,
-    'Validation CI95_U': ci95_val_up,
-    'Validation CI99_L': ci99_val_down,
-    'Validation CI99_U': ci99_val_up,
+    diff_pos = diff.where(diff > 0)
+    diff_neg = diff.where(diff < 0)
 
-    'Diff CI95_L': ci95_diff_down,
-    'Diff CI95_U': ci95_diff_up,
-    'Diff CI99_L': ci99_diff_down,
-    'Diff CI99_U': ci99_diff_up,
-})
+    # EPE (Expected Positive Exposure)
+    epe1 = d1_pos.mean(axis=1, skipna=True)
+    epe2 = d2_pos.mean(axis=1, skipna=True)
+    epe_diff = diff_pos.mean(axis=1, skipna=True)
+
+    # ENE (Expected Negative Exposure)
+    ene1 = d1_neg.mean(axis=1, skipna=True)
+    ene2 = d2_neg.mean(axis=1, skipna=True)
+    ene_diff = diff_neg.mean(axis=1, skipna=True)
+
+    # Bootstrap empirical CIs (per date)
+    # If bootstrap_reps <=0, we'll skip CIs and fill with NaNs
+    if boostrap_reps > 0:
+        rng = np.random.default_rng(random_state)
+        n_sims = d1.shape[1]
+        n_rows = d1.shape[0]
+
+        boot_means1 = np.empty((bootstrap_reps, n_rows), dtype=float)
+        boot_means2 = np.empty((bootstrap_reps, n_rows), dtype=float)
+        boot_means_diff = np.empty((bootstrap_reps, n_rows), dtype=float)
+
+        for b in range(bootstrap_reps):
+            # Sample simulation indices with replacement (paired sampling)
+            idxs = rng.integers(low=0, high=n_sims, size=n_sims)
+            b1 = d1.iloc[:, idxs].mean(axis=1)
+            b2 = d2.iloc[:, idxs].mean(axis=1)
+            boot_means1[b, :] = b1.values
+            boot_means2[b, :] = b2.values
+            boot_means_diff[b, :] = (b1-b2).values
+
+        # 95% and 99% percentiles CIs (two-tailed)
+        ci95_risk_down = np.percentile(boot_means1, 2.5, axis=0)
+        ci95_risk_up = np.percentile(boot_means1, 97.5, axis=0)
+        ci99_risk_down = np.percentile(boot_means1, 0.5, axis=0)
+        ci99_risk_ups = np.percentile(boot_means1, 99.5, axis=0)
+
+        ci95_val_down = np.percentile(boot_means2, 2.5, axis=0)
+        ci95_val_up = np.percentile(boot_means2, 97.5, axis=0)
+        ci99_val_down = np.percentile(boot_means2, 0.5, axis=0)
+        ci99_val_ups = np.percentile(boot_means2, 99.5, axis=0)
+
+        ci95_diff_down = np.percentile(boot_means_diff, 2.5, axis=0)
+        ci95_diff_up = np.percentile(boot_means_diff, 97.5, axis=0)
+        ci99_diff_down = np.percentile(boot_means_diff, 0.5, axis=0)
+        ci99_diff_up = np.percentile(boot_means_diff, 99.5, axis=0)
+    else:
+        ci95_risk_down = ci95_risk_up = ci99_risk_down = ci99_risk_up = np.full_like(mean1, np.nan)
+        ci95_val_down = ci95_val_up = ci99_val_down = ci99_val_up = np.full_like(mean2, np.nan)
+        ci95_diff_down = ci95_diff_up = ci99_diff_down = ci99_diff_up = np.full_like(diff_mean, np.nan)
+
+    # Prepare Mean_Comparison with means and CIs
+    mean_comp = pd.DataFrame({
+        'Mean RiskFlow': mean1,
+
+        # --- Means ---
+        'Mean RiskFlow': mean1,
+        'Mean Validation': mean2,
+        'Mean Diff': diff_mean,
+
+        # --- EPE ---
+        'EPE RiskFlow': epe1,
+        'EPE Validation': epe2,
+        'EPE Diff': epe_diff,
+
+        # --- ENE ---
+        'ENE RiskFlow': ene1,
+        'ENE Validation': ene2,
+        'ENE Diff': ene_diff,
+        #'RiskFlow CI95_L': ci95_risk_down,
+        #'RiskFlow CI95_U': ci95_risk_up,
+        #'RiskFlow CI99_L': ci99_risk_down,
+        #'RiskFlow CI99_U': ci99_risk_up,
+
+        #'Mean Validation': mean2,
+        #'Validation CI95_L': ci95_val_down,
+        #'Validation CI95_U': ci95_val_up,
+        #'Validation CI99_L': ci99_val_down,
+        #'Validation CI99_U': ci99_val_up,
+
+        #'Mean Diff': diff_mean,
+        #'Diff CI95_L': ci95_diff_down,
+        #'Diff CI95_U': ci95_diff_up,
+        #'Diff CI99_L': ci99_diff_down,
+        #'ValiDiffdation CI99_U': ci99_diff_up,
+    })
+
+    folder = Path(folder_path)
+    folder.mkdir(parents=True, exist_ok=True)
+
+    if filename is None:
+        ts = __import__('datetime').datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        filename = f"mtms_comparison_{ts}.xlsx"
+
+    out_path = folder/ filename
+
+    with pd.ExcelWriter(str(out_path), engine='xlsxwriter') as writer:
+        d1.to_excel(writer, sheet_name=_SHEET1_FIXED, index=index)
+        d2.to_excel(writer, sheet_name=_SHEET2_FIXED, index=index)
+        diff.to_excel(writer, sheet_name=_SHEET3_FIXED, index=index)
+        mean_comp.to_excel(writer, sheet_name=_SHEET4_FIXED, index=index)
+
+# -------------------
+# Plotting
+# -------------------
+
+    # Ensure index is datetime-like for plotting
+    x = pd.to_datetime(mean1.index)
+
+    # ---- Graph 1 ----
+    plt.figure()
+
+    # Means
+    plt.plot(x, mean1, linestyle='-', label='Mean RiskFlow')  # black solid (default)
+    plt.plot(x, mean2, linestyle='--', label='Mean Validation')  # orange dashed
+
+    # EPE
+    plt.plot(x, epe1, linestyle='-', label='EPE RiskFlow')
+    plt.plot(x, epe2, linestyle='--', label='EPE Validation')
+
+    # ENE
+    plt.plot(x, ene1, linestyle='-', label='ENE RiskFlow')
+    plt.plot(x, ene2, linestyle='--', label='ENE Validation')
+
+    # Apply requested colors explicitly
+    lines = plt.gca().get_lines()
+
+    # Mean
+    lines[0].set_color('black')
+    lines[1].set_color('orange')
+
+    # EPE
+    lines[2].set_color('black')
+    lines[3].set_color('blue')
+
+    # ENE
+    lines[4].set_color('black')
+    lines[5].set_color('green')
+
+    plt.xlabel("Date")
+    plt.ylabel("Exposure")
+    plt.title("Exposure Comparison (Mean, EPE, ENE)")
+    plt.legend()
+    plt.grid()
+
+    graph1_path = folder / "exposure_comparison.png"
+    plt.savefig(graph1_path)
+    plt.close()
+
+
+    # ---- Graph 2 ----
+    plt.figure()
+
+    plt.plot(x, diff_mean, label='Mean Diff')
+    plt.plot(x, epe_diff, label='EPE Diff')
+    plt.plot(x, ene_diff, label='ENE Diff')
+
+    plt.xlabel("Date")
+    plt.ylabel("Difference")
+    plt.title("Exposure Differences")
+    plt.legend()
+    plt.grid()
+
+    graph2_path = folder / "exposure_differences.png"
+    plt.savefig(graph2_path)
+    plt.close()
