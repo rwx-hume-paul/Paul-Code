@@ -1,276 +1,363 @@
-import QuantLib as ql
+"""Benchmark volatility skew surface for equities.
 
-def get_ois_year_fractions(valuation_date, start_date, end_date,
-                           day_count_str="ACT/365",
-                           calendar_str="TARGET",
-                           business_convention_str="Following"):
-    # --- Convert Python dates to QuantLib Dates ---
-    val_date = ql.Date(valuation_date.day, valuation_date.month, valuation_date.year)
-    start = ql.Date(start_date.day, start_date.month, start_date.year)
-    end = ql.Date(end_date.day, end_date.month, end_date.year)
+Implements the Front Arena benchmark skew model with 9 parameters and
+6 piecewise polynomial regions.  Supports sticky-strike and sticky-delta
+moneyness conventions.
 
-    # --- Set evaluation date ---
-    ql.Settings.instance().evaluationDate = val_date
+Each skew parameter is supplied as a numpy array of shape (n, 2) where
+each row is [year_frac, value], representing a term structure by expiry
+tenor.  Parameters are linearly interpolated (flat-extrapolated) to the
+requested option expiry.
+"""
 
-    # --- Calendar ---
-    if calendar_str.upper() == "TARGET":
-        calendar = ql.TARGET()
-    else:
-        raise ValueError("Unsupported calendar")
+from __future__ import annotations
 
-    # --- Business convention ---
-    if business_convention_str.lower() == "following":
-        convention = ql.Following
-    elif business_convention_str.lower() == "modified following":
-        convention = ql.ModifiedFollowing
-    else:
-        raise ValueError("Unsupported business convention")
-
-    # --- Day count ---
-    if day_count_str.upper() == "ACT/365":
-        day_count = ql.Actual365Fixed()
-    elif day_count_str.upper() == "ACT/360":
-        day_count = ql.Actual360()
-    else:
-        raise ValueError("Unsupported day count")
-
-    # --- Generate daily schedule (business days only) ---
-    dates = []
-    d = val_date
-
-    while d <= start:
-        if calendar.isBusinessDay(d):
-            adjusted = calendar.adjust(d, convention)
-            dates.append(adjusted)
-        d = d + 1  # move one calendar day
-
-    # --- Remove duplicates (can occur due to adjustment) ---
-    dates = sorted(set(dates))
-
-    # --- Compute year fractions ---
-    year_fractions = [
-        day_count.yearFraction(val_date, d) for d in dates
-    ]
-
-    return dates, year_fractions
-
-import os
-from pathlib import Path
 import numpy as np
-import pandas as pd
-from typing import Optional
-import matplotlib.pyplot as plt
 
-_SHEET1_FIXED = "RiskFlow_MTMs"
-_SHEET2_FIXED = "Validation_MTMs"
-_SHEET3_FIXED = "Diff_MTM"
-_SHEET4_FIXED = "Mean_Comparison"
 
-def compare_mtm_in_excel(
-        df1: pd.DataFrame,
-        df2: pd.DataFrame,
-        folder_path: str,
-        index: bool = True,
-        filename: Optional[str] = None,
-        bootstrap_reps: int = 1000,
-        random_state: Optional[int] = None
-) -> None:
+class BenchmarkVolSkew:
+    """Benchmark skew volatility surface.
+
+    Parameters
+    ----------
+    v0 : array-like, shape (n, 2)
+        ATM (forward) volatility term structure.
+    s : array-like, shape (n, 2)
+        Slope term structure.
+    L : array-like, shape (n, 2)
+        Left curvature term structure.
+    R : array-like, shape (n, 2)
+        Right curvature term structure.
+    C : array-like, shape (n, 2)
+        Left cutoff term structure (values must be < 0).
+    D : array-like, shape (n, 2)
+        Right cutoff term structure (values must be > 0).
+    lam : array-like, shape (n, 2)
+        Left wing term structure (values must be > 0).
+    rho : array-like, shape (n, 2)
+        Right wing term structure (values must be > 0).
+    atm_ref : array-like, shape (n, 2)
+        ATM reference quote term structure.
     """
-    Save two MTM DataDrames to an Excel file with four sheets inside the given folder
-    Returns:
-        None
-    """
-    # Align inputs into DataFrames
-    if not isinstance(df1, pd.DataFrame):
-        df1 = pd.DataFrame(df1)
-    if not isinstance(df2, pd.DataFrame):
-        df2 = pd.DataFrame(df2)
 
-    # Align indexes and columns (outer join)
-    idx = df1.index.union(df2.index)
-    cols = df1.columns.union(df2.columns)
+    def __init__(
+        self,
+        v0: np.ndarray,
+        s: np.ndarray,
+        L: np.ndarray,
+        R: np.ndarray,
+        C: np.ndarray,
+        D: np.ndarray,
+        lam: np.ndarray,
+        rho: np.ndarray,
+        atm_ref: np.ndarray,
+    ):
+        self.v0_term = self._sort_by_tenor(v0)
+        self.s_term = self._sort_by_tenor(s)
+        self.L_term = self._sort_by_tenor(L)
+        self.R_term = self._sort_by_tenor(R)
+        self.C_term = self._sort_by_tenor(C)
+        self.D_term = self._sort_by_tenor(D)
+        self.lam_term = self._sort_by_tenor(lam)
+        self.rho_term = self._sort_by_tenor(rho)
+        self.atm_ref_term = self._sort_by_tenor(atm_ref)
 
-    d1 = df1.reindex(index=idx, columns=cols, fill_value=np.nan)
-    d2 = df2.reindex(index=idx, columns=cols, fill_value=np.nan)
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
 
-    diff = d1 - d2
+    @staticmethod
+    def _sort_by_tenor(term) -> np.ndarray:
+        """Convert to array and sort rows by ascending tenor (column 0)."""
+        arr = np.atleast_2d(np.asarray(term, dtype=np.float64))
+        return arr[arr[:, 0].argsort()]
 
-    mean1 = d1.mean(axis=1, skipna=True)
-    mean2 = d2.mean(axis=1, skipna=True)
-    diff_mean = diff.mean(axis=1)
+    @staticmethod
+    def _interp_param(term: np.ndarray, tenor: float) -> float:
+        """Linearly interpolate a parameter term structure to *tenor*."""
+        tenors = term[:, 0]
+        values = term[:, 1]
+        return float(np.interp(tenor, tenors, values))
 
-    # Positive / Negative exposure masks
-    d1_pos = d1.where(d1 > 0)
-    d1_neg = d1.where(d1 < 0)
+    @staticmethod
+    def _interp_variance(term: np.ndarray, tenor: float) -> float:
+        """Interpolate volatility linearly in variance (sigma^2 * T) space.
 
-    d2_pos = d2.where(d2 > 0)
-    d2_neg = d2.where(d2 < 0)
+        Converts to total variance at each pillar, interpolates linearly,
+        then converts back to volatility at the target tenor.
+        """
+        tenors = term[:, 0]
+        vols = term[:, 1]
+        variances = vols**2 * tenors
+        var_at_tenor = float(np.interp(tenor, tenors, variances))
+        if tenor <= 0:
+            return float(vols[0])
+        return float(np.sqrt(var_at_tenor / tenor))
 
-    diff_pos = diff.where(diff > 0)
-    diff_neg = diff.where(diff < 0)
+    def _params_at_tenor(self, tenor: float) -> dict[str, float]:
+        """Interpolate all 9 skew parameters to a single expiry *tenor*."""
+        return {
+            "v0": self._interp_variance(self.v0_term, tenor),
+            "s": self._interp_param(self.s_term, tenor),
+            "L": self._interp_param(self.L_term, tenor),
+            "R": self._interp_param(self.R_term, tenor),
+            "C": self._interp_param(self.C_term, tenor),
+            "D": self._interp_param(self.D_term, tenor),
+            "lam": self._interp_param(self.lam_term, tenor),
+            "rho": self._interp_param(self.rho_term, tenor),
+            "atm_ref": self._interp_param(self.atm_ref_term, tenor),
+        }
 
-    # EPE (Expected Positive Exposure)
-    epe1 = d1_pos.mean(axis=1, skipna=True)
-    epe2 = d2_pos.mean(axis=1, skipna=True)
-    epe_diff = diff_pos.mean(axis=1, skipna=True)
+    # ------------------------------------------------------------------
+    # wing calibration
+    # ------------------------------------------------------------------
 
-    # ENE (Expected Negative Exposure)
-    ene1 = d1_neg.mean(axis=1, skipna=True)
-    ene2 = d2_neg.mean(axis=1, skipna=True)
-    ene_diff = diff_neg.mean(axis=1, skipna=True)
+    @staticmethod
+    def _left_wing(v0: float, s: float, L: float, C: float, lam: float):
+        """Solve for left-wing quadratic coefficients (alpha, beta, gamma).
 
-    # Bootstrap empirical CIs (per date)
-    # If bootstrap_reps <=0, we'll skip CIs and fill with NaNs
-    if boostrap_reps > 0:
-        rng = np.random.default_rng(random_state)
-        n_sims = d1.shape[1]
-        n_rows = d1.shape[0]
+        Continuity of v and v' at x = C, plus v'((1+lam)*C) = 0.
+        """
+        gamma = -(s + 2 * L * C) / (2 * lam * C)
+        beta = -2 * gamma * (1 + lam) * C
+        alpha = v0 + s * C + L * C**2 - beta * C - gamma * C**2
+        return alpha, beta, gamma
 
-        boot_means1 = np.empty((bootstrap_reps, n_rows), dtype=float)
-        boot_means2 = np.empty((bootstrap_reps, n_rows), dtype=float)
-        boot_means_diff = np.empty((bootstrap_reps, n_rows), dtype=float)
+    @staticmethod
+    def _right_wing(v0: float, s: float, R: float, D: float, rho: float):
+        """Solve for right-wing quadratic coefficients (varsigma, xi, zeta).
 
-        for b in range(bootstrap_reps):
-            # Sample simulation indices with replacement (paired sampling)
-            idxs = rng.integers(low=0, high=n_sims, size=n_sims)
-            b1 = d1.iloc[:, idxs].mean(axis=1)
-            b2 = d2.iloc[:, idxs].mean(axis=1)
-            boot_means1[b, :] = b1.values
-            boot_means2[b, :] = b2.values
-            boot_means_diff[b, :] = (b1-b2).values
+        Continuity of v and v' at x = D, plus v'((1+rho)*D) = 0.
+        """
+        zeta = -(s + 2 * R * D) / (2 * rho * D)
+        xi = -2 * zeta * (1 + rho) * D
+        varsigma = v0 + s * D + R * D**2 - xi * D - zeta * D**2
+        return varsigma, xi, zeta
 
-        # 95% and 99% percentiles CIs (two-tailed)
-        ci95_risk_down = np.percentile(boot_means1, 2.5, axis=0)
-        ci95_risk_up = np.percentile(boot_means1, 97.5, axis=0)
-        ci99_risk_down = np.percentile(boot_means1, 0.5, axis=0)
-        ci99_risk_ups = np.percentile(boot_means1, 99.5, axis=0)
+    # ------------------------------------------------------------------
+    # moneyness
+    # ------------------------------------------------------------------
 
-        ci95_val_down = np.percentile(boot_means2, 2.5, axis=0)
-        ci95_val_up = np.percentile(boot_means2, 97.5, axis=0)
-        ci99_val_down = np.percentile(boot_means2, 0.5, axis=0)
-        ci99_val_ups = np.percentile(boot_means2, 99.5, axis=0)
+    @staticmethod
+    def log_moneyness(
+        strike: float | np.ndarray,
+        atm_ref: float,
+        forward_skew: float | np.ndarray | None = None,
+        forward_expiry: float | np.ndarray | None = None,
+        sticky: str = "strike",
+    ) -> float | np.ndarray:
+        """Compute log-moneyness *x*.
 
-        ci95_diff_down = np.percentile(boot_means_diff, 2.5, axis=0)
-        ci95_diff_up = np.percentile(boot_means_diff, 97.5, axis=0)
-        ci99_diff_down = np.percentile(boot_means_diff, 0.5, axis=0)
-        ci99_diff_up = np.percentile(boot_means_diff, 99.5, axis=0)
-    else:
-        ci95_risk_down = ci95_risk_up = ci99_risk_down = ci99_risk_up = np.full_like(mean1, np.nan)
-        ci95_val_down = ci95_val_up = ci99_val_down = ci99_val_up = np.full_like(mean2, np.nan)
-        ci95_diff_down = ci95_diff_up = ci99_diff_down = ci99_diff_up = np.full_like(diff_mean, np.nan)
+        Parameters
+        ----------
+        strike : float or array
+            Option strike(s).
+        atm_ref : float
+            ATM reference quote for this tenor.
+        forward_skew : float or array, optional
+            Risk-neutral forward at the skew tenor.  Required for
+            ``sticky='delta'``.
+        forward_expiry : float or array, optional
+            Risk-neutral forward at option expiry.  Required for
+            ``sticky='delta'``.
+        sticky : {'strike', 'delta'}
+            Moneyness convention.
 
-    # Prepare Mean_Comparison with means and CIs
-    mean_comp = pd.DataFrame({
-        'Mean RiskFlow': mean1,
+        Returns
+        -------
+        x : float or np.ndarray
+        """
+        if sticky == "strike":
+            return np.log(strike / atm_ref)
+        elif sticky == "delta":
+            if forward_skew is None or forward_expiry is None:
+                raise ValueError(
+                    "forward_skew and forward_expiry are required for sticky='delta'"
+                )
+            return np.log(strike / atm_ref * forward_skew / forward_expiry)
+        else:
+            raise ValueError(f"Unknown sticky rule: {sticky!r}")
 
-        # --- Means ---
-        'Mean RiskFlow': mean1,
-        'Mean Validation': mean2,
-        'Mean Diff': diff_mean,
+    # ------------------------------------------------------------------
+    # piecewise evaluation
+    # ------------------------------------------------------------------
 
-        # --- EPE ---
-        'EPE RiskFlow': epe1,
-        'EPE Validation': epe2,
-        'EPE Diff': epe_diff,
+    @staticmethod
+    def _evaluate(
+        x: float | np.ndarray,
+        v0: float,
+        s: float,
+        L: float,
+        R: float,
+        C: float,
+        D: float,
+        lam: float,
+        rho: float,
+    ) -> np.ndarray:
+        """Evaluate the benchmark skew at log-moneyness *x*.
 
-        # --- ENE ---
-        'ENE RiskFlow': ene1,
-        'ENE Validation': ene2,
-        'ENE Diff': ene_diff,
-        #'RiskFlow CI95_L': ci95_risk_down,
-        #'RiskFlow CI95_U': ci95_risk_up,
-        #'RiskFlow CI99_L': ci99_risk_down,
-        #'RiskFlow CI99_U': ci99_risk_up,
+        Returns volatility as an ndarray broadcastable to the shape of *x*.
+        """
+        x = np.asarray(x, dtype=np.float64)
+        scalar = x.ndim == 0
+        x = np.atleast_1d(x)
 
-        #'Mean Validation': mean2,
-        #'Validation CI95_L': ci95_val_down,
-        #'Validation CI95_U': ci95_val_up,
-        #'Validation CI99_L': ci99_val_down,
-        #'Validation CI99_U': ci99_val_up,
+        has_left_wing = (lam != 0) and (C != 0)
+        has_right_wing = (rho != 0) and (D != 0)
 
-        #'Mean Diff': diff_mean,
-        #'Diff CI95_L': ci95_diff_down,
-        #'Diff CI95_U': ci95_diff_up,
-        #'Diff CI99_L': ci99_diff_down,
-        #'ValiDiffdation CI99_U': ci99_diff_up,
-    })
+        if has_left_wing:
+            alpha, beta, gamma = BenchmarkVolSkew._left_wing(v0, s, L, C, lam)
+            lam_C = (1 + lam) * C
+        else:
+            lam_C = C
 
-    folder = Path(folder_path)
-    folder.mkdir(parents=True, exist_ok=True)
+        if has_right_wing:
+            varsigma, xi, zeta = BenchmarkVolSkew._right_wing(v0, s, R, D, rho)
+            rho_D = (1 + rho) * D
+        else:
+            rho_D = D
 
-    if filename is None:
-        ts = __import__('datetime').datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"mtms_comparison_{ts}.xlsx"
+        vol = np.empty_like(x)
 
-    out_path = folder/ filename
+        if has_left_wing:
+            # Region I:  x < (1+lam)*C  — flat left wing
+            m1 = x < lam_C
+            vol[m1] = alpha + beta * lam_C + gamma * lam_C**2
 
-    with pd.ExcelWriter(str(out_path), engine='xlsxwriter') as writer:
-        d1.to_excel(writer, sheet_name=_SHEET1_FIXED, index=index)
-        d2.to_excel(writer, sheet_name=_SHEET2_FIXED, index=index)
-        diff.to_excel(writer, sheet_name=_SHEET3_FIXED, index=index)
-        mean_comp.to_excel(writer, sheet_name=_SHEET4_FIXED, index=index)
+            # Region II: (1+lam)*C <= x < C
+            m2 = (x >= lam_C) & (x < C)
+            vol[m2] = alpha + beta * x[m2] + gamma * x[m2] ** 2
+        else:
+            # No wing — flat-extrapolate the left quadratic at C
+            m1 = x < C
+            vol[m1] = v0 + s * C + L * C**2
 
-# -------------------
-# Plotting
-# -------------------
+        # Region III: C <= x < 0
+        m3 = (x >= C) & (x < 0)
+        vol[m3] = v0 + s * x[m3] + L * x[m3] ** 2
 
-    # Ensure index is datetime-like for plotting
-    x = pd.to_datetime(mean1.index)
+        # Region IV: 0 <= x < D
+        m4 = (x >= 0) & (x < D)
+        vol[m4] = v0 + s * x[m4] + R * x[m4] ** 2
 
-    # ---- Graph 1 ----
-    plt.figure()
+        if has_right_wing:
+            # Region V: D <= x < (1+rho)*D
+            m5 = (x >= D) & (x < rho_D)
+            vol[m5] = varsigma + xi * x[m5] + zeta * x[m5] ** 2
 
-    # Means
-    plt.plot(x, mean1, linestyle='-', label='Mean RiskFlow')  # black solid (default)
-    plt.plot(x, mean2, linestyle='--', label='Mean Validation')  # orange dashed
+            # Region VI: x >= (1+rho)*D  — flat right wing
+            m6 = x >= rho_D
+            vol[m6] = varsigma + xi * rho_D + zeta * rho_D**2
+        else:
+            # No wing — flat-extrapolate the right quadratic at D
+            m6 = x >= D
+            vol[m6] = v0 + s * D + R * D**2
 
-    # EPE
-    plt.plot(x, epe1, linestyle='-', label='EPE RiskFlow')
-    plt.plot(x, epe2, linestyle='--', label='EPE Validation')
+        if scalar:
+            return vol[0]
+        return vol
 
-    # ENE
-    plt.plot(x, ene1, linestyle='-', label='ENE RiskFlow')
-    plt.plot(x, ene2, linestyle='--', label='ENE Validation')
+    # ------------------------------------------------------------------
+    # public API
+    # ------------------------------------------------------------------
 
-    # Apply requested colors explicitly
-    lines = plt.gca().get_lines()
+    def _vol_from_params(
+        self,
+        strike: float | np.ndarray,
+        params: dict[str, float],
+        forward_skew: float | np.ndarray | None,
+        forward_expiry: float | np.ndarray | None,
+        sticky: str,
+    ) -> np.ndarray:
+        """Evaluate implied vol for *strike* given a fully-specified params dict."""
+        x = self.log_moneyness(
+            strike,
+            params["atm_ref"],
+            forward_skew=forward_skew,
+            forward_expiry=forward_expiry,
+            sticky=sticky,
+        )
+        return self._evaluate(
+            x,
+            v0=params["v0"],
+            s=params["s"],
+            L=params["L"],
+            R=params["R"],
+            C=params["C"],
+            D=params["D"],
+            lam=params["lam"],
+            rho=params["rho"],
+        )
 
-    # Mean
-    lines[0].set_color('black')
-    lines[1].set_color('orange')
+    def get_vol(
+        self,
+        strike: float | np.ndarray,
+        tenor: float,
+        forward_skew: float | np.ndarray | None = None,
+        forward_expiry: float | np.ndarray | None = None,
+        sticky: str = "strike",
+    ) -> np.ndarray:
+        """Return implied volatility for a given strike and expiry tenor.
 
-    # EPE
-    lines[2].set_color('black')
-    lines[3].set_color('blue')
+        The two skew-pillar dates that bracket *tenor* (from the v0 term
+        structure) are used to build two complete skews.  Log-moneyness is
+        computed separately for each pillar using its own ``atm_ref``.  The
+        resulting pair of implied volatilities is then interpolated to
+        *tenor* linearly in total-variance space.  When *tenor* falls
+        exactly on a pillar date that pillar's skew is used directly with
+        no interpolation.  Flat extrapolation is applied outside the pillar
+        range.
 
-    # ENE
-    lines[4].set_color('black')
-    lines[5].set_color('green')
+        Parameters
+        ----------
+        strike : float or array
+            Option strike price(s).
+        tenor : float
+            Time to expiry in year fractions.
+        forward_skew : float or array, optional
+            Risk-neutral forward at the skew tenor (needed for sticky delta).
+        forward_expiry : float or array, optional
+            Risk-neutral forward at option expiry (needed for sticky delta).
+        sticky : {'strike', 'delta'}
+            Stickiness convention.  Default ``'strike'``.
 
-    plt.xlabel("Date")
-    plt.ylabel("Exposure")
-    plt.title("Exposure Comparison (Mean, EPE, ENE)")
-    plt.legend()
-    plt.grid()
+        Returns
+        -------
+        np.ndarray
+            Implied volatility, same shape as *strike*.
+        """
+        pillar_tenors = self.v0_term[:, 0]
+        idx = int(np.searchsorted(pillar_tenors, tenor))
 
-    graph1_path = folder / "exposure_comparison.png"
-    plt.savefig(graph1_path)
-    plt.close()
+        # Flat extrapolation before (or exactly on) the first pillar
+        if idx == 0:
+            p = self._params_at_tenor(pillar_tenors[0])
+            return self._vol_from_params(strike, p, forward_skew, forward_expiry, sticky)
 
+        # Flat extrapolation beyond the last pillar
+        if idx == len(pillar_tenors):
+            p = self._params_at_tenor(pillar_tenors[-1])
+            return self._vol_from_params(strike, p, forward_skew, forward_expiry, sticky)
 
-    # ---- Graph 2 ----
-    plt.figure()
+        t2 = float(pillar_tenors[idx])
 
-    plt.plot(x, diff_mean, label='Mean Diff')
-    plt.plot(x, epe_diff, label='EPE Diff')
-    plt.plot(x, ene_diff, label='ENE Diff')
+        # Exactly on a pillar — no interpolation needed
+        if np.isclose(tenor, t2):
+            p = self._params_at_tenor(t2)
+            return self._vol_from_params(strike, p, forward_skew, forward_expiry, sticky)
 
-    plt.xlabel("Date")
-    plt.ylabel("Difference")
-    plt.title("Exposure Differences")
-    plt.legend()
-    plt.grid()
+        # Tenor lies strictly between two pillars
+        t1 = float(pillar_tenors[idx - 1])
+        p1 = self._params_at_tenor(t1)
+        p2 = self._params_at_tenor(t2)
 
-    graph2_path = folder / "exposure_differences.png"
-    plt.savefig(graph2_path)
-    plt.close()
+        vol1 = self._vol_from_params(strike, p1, forward_skew, forward_expiry, sticky)
+        vol2 = self._vol_from_params(strike, p2, forward_skew, forward_expiry, sticky)
+
+        # Interpolate linearly in total-variance space
+        var1 = vol1 ** 2 * t1
+        var2 = vol2 ** 2 * t2
+        w = (tenor - t1) / (t2 - t1)
+        var_tenor = var1 + w * (var2 - var1)
+
+        return np.sqrt(np.maximum(var_tenor, 0.0) / tenor)
