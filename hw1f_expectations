@@ -1,363 +1,103 @@
-"""Benchmark volatility skew surface for equities.
 
-Implements the Front Arena benchmark skew model with 9 parameters and
-6 piecewise polynomial regions.  Supports sticky-strike and sticky-delta
-moneyness conventions.
+class MalzVol:
+    """Volatility surface parameterized by (delta, tenor).
 
-Each skew parameter is supplied as a numpy array of shape (n, 2) where
-each row is [year_frac, value], representing a term structure by expiry
-tenor.  Parameters are linearly interpolated (flat-extrapolated) to the
-requested option expiry.
-"""
+    The surface is supplied as a list of [delta, tenor, vol] triples.  Delta
+    values serve as the moneyness axis; interpolation at a given strike and
+    forward uses log-moneyness x = ln(F / K) against that axis.
 
-from __future__ import annotations
-
-import numpy as np
-
-
-class BenchmarkVolSkew:
-    """Benchmark skew volatility surface.
+    Interpolation scheme
+    --------------------
+    - **Tenor** : linear in total variance (sigma^2 * T).
+    - **Delta** : linear in x = ln(F / K) against the stored delta coordinates.
+    - **Extrapolation** : flat in both dimensions.
 
     Parameters
     ----------
-    v0 : array-like, shape (n, 2)
-        ATM (forward) volatility term structure.
-    s : array-like, shape (n, 2)
-        Slope term structure.
-    L : array-like, shape (n, 2)
-        Left curvature term structure.
-    R : array-like, shape (n, 2)
-        Right curvature term structure.
-    C : array-like, shape (n, 2)
-        Left cutoff term structure (values must be < 0).
-    D : array-like, shape (n, 2)
-        Right cutoff term structure (values must be > 0).
-    lam : array-like, shape (n, 2)
-        Left wing term structure (values must be > 0).
-    rho : array-like, shape (n, 2)
-        Right wing term structure (values must be > 0).
-    atm_ref : array-like, shape (n, 2)
-        ATM reference quote term structure.
+    surface : list of [delta, tenor, vol]
+        Raw surface points.  Multiple rows may share the same tenor (they
+        define the smile for that expiry) or the same delta (they trace a
+        term structure for that moneyness level).
     """
 
-    def __init__(
-        self,
-        v0: np.ndarray,
-        s: np.ndarray,
-        L: np.ndarray,
-        R: np.ndarray,
-        C: np.ndarray,
-        D: np.ndarray,
-        lam: np.ndarray,
-        rho: np.ndarray,
-        atm_ref: np.ndarray,
-    ):
-        self.v0_term = self._sort_by_tenor(v0)
-        self.s_term = self._sort_by_tenor(s)
-        self.L_term = self._sort_by_tenor(L)
-        self.R_term = self._sort_by_tenor(R)
-        self.C_term = self._sort_by_tenor(C)
-        self.D_term = self._sort_by_tenor(D)
-        self.lam_term = self._sort_by_tenor(lam)
-        self.rho_term = self._sort_by_tenor(rho)
-        self.atm_ref_term = self._sort_by_tenor(atm_ref)
+    def __init__(self, surface: list) -> None:
+        arr = np.array(surface, dtype=np.float64)  # shape (N, 3): [delta, tenor, vol]
+
+        self._tenors = np.unique(arr[:, 1])
+
+        # For each tenor pillar store sorted (deltas, vols) arrays
+        self._pillars: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        for t in self._tenors:
+            rows = arr[arr[:, 1] == t]
+            order = np.argsort(rows[:, 0])
+            self._pillars[float(t)] = (rows[order, 0], rows[order, 2])
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _sort_by_tenor(term) -> np.ndarray:
-        """Convert to array and sort rows by ascending tenor (column 0)."""
-        arr = np.atleast_2d(np.asarray(term, dtype=np.float64))
-        return arr[arr[:, 0].argsort()]
-
-    @staticmethod
-    def _interp_param(term: np.ndarray, tenor: float) -> float:
-        """Linearly interpolate a parameter term structure to *tenor*."""
-        tenors = term[:, 0]
-        values = term[:, 1]
-        return float(np.interp(tenor, tenors, values))
-
-    @staticmethod
-    def _interp_variance(term: np.ndarray, tenor: float) -> float:
-        """Interpolate volatility linearly in variance (sigma^2 * T) space.
-
-        Converts to total variance at each pillar, interpolates linearly,
-        then converts back to volatility at the target tenor.
-        """
-        tenors = term[:, 0]
-        vols = term[:, 1]
-        variances = vols**2 * tenors
-        var_at_tenor = float(np.interp(tenor, tenors, variances))
-        if tenor <= 0:
-            return float(vols[0])
-        return float(np.sqrt(var_at_tenor / tenor))
-
-    def _params_at_tenor(self, tenor: float) -> dict[str, float]:
-        """Interpolate all 9 skew parameters to a single expiry *tenor*."""
-        return {
-            "v0": self._interp_variance(self.v0_term, tenor),
-            "s": self._interp_param(self.s_term, tenor),
-            "L": self._interp_param(self.L_term, tenor),
-            "R": self._interp_param(self.R_term, tenor),
-            "C": self._interp_param(self.C_term, tenor),
-            "D": self._interp_param(self.D_term, tenor),
-            "lam": self._interp_param(self.lam_term, tenor),
-            "rho": self._interp_param(self.rho_term, tenor),
-            "atm_ref": self._interp_param(self.atm_ref_term, tenor),
-        }
-
-    # ------------------------------------------------------------------
-    # wing calibration
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _left_wing(v0: float, s: float, L: float, C: float, lam: float):
-        """Solve for left-wing quadratic coefficients (alpha, beta, gamma).
-
-        Continuity of v and v' at x = C, plus v'((1+lam)*C) = 0.
-        """
-        gamma = -(s + 2 * L * C) / (2 * lam * C)
-        beta = -2 * gamma * (1 + lam) * C
-        alpha = v0 + s * C + L * C**2 - beta * C - gamma * C**2
-        return alpha, beta, gamma
-
-    @staticmethod
-    def _right_wing(v0: float, s: float, R: float, D: float, rho: float):
-        """Solve for right-wing quadratic coefficients (varsigma, xi, zeta).
-
-        Continuity of v and v' at x = D, plus v'((1+rho)*D) = 0.
-        """
-        zeta = -(s + 2 * R * D) / (2 * rho * D)
-        xi = -2 * zeta * (1 + rho) * D
-        varsigma = v0 + s * D + R * D**2 - xi * D - zeta * D**2
-        return varsigma, xi, zeta
-
-    # ------------------------------------------------------------------
-    # moneyness
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def log_moneyness(
-        strike: float | np.ndarray,
-        atm_ref: float,
-        forward_skew: float | np.ndarray | None = None,
-        forward_expiry: float | np.ndarray | None = None,
-        sticky: str = "strike",
+    def _vol_at_pillar(
+        self, t: float, x: float | np.ndarray
     ) -> float | np.ndarray:
-        """Compute log-moneyness *x*.
-
-        Parameters
-        ----------
-        strike : float or array
-            Option strike(s).
-        atm_ref : float
-            ATM reference quote for this tenor.
-        forward_skew : float or array, optional
-            Risk-neutral forward at the skew tenor.  Required for
-            ``sticky='delta'``.
-        forward_expiry : float or array, optional
-            Risk-neutral forward at option expiry.  Required for
-            ``sticky='delta'``.
-        sticky : {'strike', 'delta'}
-            Moneyness convention.
-
-        Returns
-        -------
-        x : float or np.ndarray
-        """
-        if sticky == "strike":
-            return np.log(strike / atm_ref)
-        elif sticky == "delta":
-            if forward_skew is None or forward_expiry is None:
-                raise ValueError(
-                    "forward_skew and forward_expiry are required for sticky='delta'"
-                )
-            return np.log(strike / atm_ref * forward_skew / forward_expiry)
-        else:
-            raise ValueError(f"Unknown sticky rule: {sticky!r}")
-
-    # ------------------------------------------------------------------
-    # piecewise evaluation
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _evaluate(
-        x: float | np.ndarray,
-        v0: float,
-        s: float,
-        L: float,
-        R: float,
-        C: float,
-        D: float,
-        lam: float,
-        rho: float,
-    ) -> np.ndarray:
-        """Evaluate the benchmark skew at log-moneyness *x*.
-
-        Returns volatility as an ndarray broadcastable to the shape of *x*.
-        """
-        x = np.asarray(x, dtype=np.float64)
-        scalar = x.ndim == 0
-        x = np.atleast_1d(x)
-
-        has_left_wing = (lam != 0) and (C != 0)
-        has_right_wing = (rho != 0) and (D != 0)
-
-        if has_left_wing:
-            alpha, beta, gamma = BenchmarkVolSkew._left_wing(v0, s, L, C, lam)
-            lam_C = (1 + lam) * C
-        else:
-            lam_C = C
-
-        if has_right_wing:
-            varsigma, xi, zeta = BenchmarkVolSkew._right_wing(v0, s, R, D, rho)
-            rho_D = (1 + rho) * D
-        else:
-            rho_D = D
-
-        vol = np.empty_like(x)
-
-        if has_left_wing:
-            # Region I:  x < (1+lam)*C  — flat left wing
-            m1 = x < lam_C
-            vol[m1] = alpha + beta * lam_C + gamma * lam_C**2
-
-            # Region II: (1+lam)*C <= x < C
-            m2 = (x >= lam_C) & (x < C)
-            vol[m2] = alpha + beta * x[m2] + gamma * x[m2] ** 2
-        else:
-            # No wing — flat-extrapolate the left quadratic at C
-            m1 = x < C
-            vol[m1] = v0 + s * C + L * C**2
-
-        # Region III: C <= x < 0
-        m3 = (x >= C) & (x < 0)
-        vol[m3] = v0 + s * x[m3] + L * x[m3] ** 2
-
-        # Region IV: 0 <= x < D
-        m4 = (x >= 0) & (x < D)
-        vol[m4] = v0 + s * x[m4] + R * x[m4] ** 2
-
-        if has_right_wing:
-            # Region V: D <= x < (1+rho)*D
-            m5 = (x >= D) & (x < rho_D)
-            vol[m5] = varsigma + xi * x[m5] + zeta * x[m5] ** 2
-
-            # Region VI: x >= (1+rho)*D  — flat right wing
-            m6 = x >= rho_D
-            vol[m6] = varsigma + xi * rho_D + zeta * rho_D**2
-        else:
-            # No wing — flat-extrapolate the right quadratic at D
-            m6 = x >= D
-            vol[m6] = v0 + s * D + R * D**2
-
-        if scalar:
-            return vol[0]
-        return vol
+        """Interpolate (flat-extrapolate) vol in the delta dimension at pillar *t*."""
+        deltas, vols = self._pillars[t]
+        return np.interp(x, deltas, vols)
 
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
 
-    def _vol_from_params(
-        self,
-        strike: float | np.ndarray,
-        params: dict[str, float],
-        forward_skew: float | np.ndarray | None,
-        forward_expiry: float | np.ndarray | None,
-        sticky: str,
-    ) -> np.ndarray:
-        """Evaluate implied vol for *strike* given a fully-specified params dict."""
-        x = self.log_moneyness(
-            strike,
-            params["atm_ref"],
-            forward_skew=forward_skew,
-            forward_expiry=forward_expiry,
-            sticky=sticky,
-        )
-        return self._evaluate(
-            x,
-            v0=params["v0"],
-            s=params["s"],
-            L=params["L"],
-            R=params["R"],
-            C=params["C"],
-            D=params["D"],
-            lam=params["lam"],
-            rho=params["rho"],
-        )
-
     def get_vol(
         self,
         strike: float | np.ndarray,
+        forward: float | np.ndarray,
         tenor: float,
-        forward_skew: float | np.ndarray | None = None,
-        forward_expiry: float | np.ndarray | None = None,
-        sticky: str = "strike",
-    ) -> np.ndarray:
-        """Return implied volatility for a given strike and expiry tenor.
-
-        The two skew-pillar dates that bracket *tenor* (from the v0 term
-        structure) are used to build two complete skews.  Log-moneyness is
-        computed separately for each pillar using its own ``atm_ref``.  The
-        resulting pair of implied volatilities is then interpolated to
-        *tenor* linearly in total-variance space.  When *tenor* falls
-        exactly on a pillar date that pillar's skew is used directly with
-        no interpolation.  Flat extrapolation is applied outside the pillar
-        range.
+    ) -> float | np.ndarray:
+        """Return implied volatility by 2-D interpolation.
 
         Parameters
         ----------
         strike : float or array
             Option strike price(s).
+        forward : float or array
+            Risk-neutral forward price(s) at option expiry.
         tenor : float
             Time to expiry in year fractions.
-        forward_skew : float or array, optional
-            Risk-neutral forward at the skew tenor (needed for sticky delta).
-        forward_expiry : float or array, optional
-            Risk-neutral forward at option expiry (needed for sticky delta).
-        sticky : {'strike', 'delta'}
-            Stickiness convention.  Default ``'strike'``.
 
         Returns
         -------
-        np.ndarray
-            Implied volatility, same shape as *strike*.
+        float or np.ndarray
+            Implied volatility, same shape as *strike* / *forward*.
         """
-        pillar_tenors = self.v0_term[:, 0]
-        idx = int(np.searchsorted(pillar_tenors, tenor))
+        x = np.log(forward / strike)
 
-        # Flat extrapolation before (or exactly on) the first pillar
+        tenors = self._tenors
+        idx = int(np.searchsorted(tenors, tenor))
+
+        # Flat extrapolation before the first pillar
         if idx == 0:
-            p = self._params_at_tenor(pillar_tenors[0])
-            return self._vol_from_params(strike, p, forward_skew, forward_expiry, sticky)
+            return self._vol_at_pillar(float(tenors[0]), x)
 
         # Flat extrapolation beyond the last pillar
-        if idx == len(pillar_tenors):
-            p = self._params_at_tenor(pillar_tenors[-1])
-            return self._vol_from_params(strike, p, forward_skew, forward_expiry, sticky)
+        if idx == len(tenors):
+            return self._vol_at_pillar(float(tenors[-1]), x)
 
-        t2 = float(pillar_tenors[idx])
+        t2 = float(tenors[idx])
 
-        # Exactly on a pillar — no interpolation needed
+        # Exactly on a tenor pillar — no tenor interpolation needed
         if np.isclose(tenor, t2):
-            p = self._params_at_tenor(t2)
-            return self._vol_from_params(strike, p, forward_skew, forward_expiry, sticky)
+            return self._vol_at_pillar(t2, x)
 
         # Tenor lies strictly between two pillars
-        t1 = float(pillar_tenors[idx - 1])
-        p1 = self._params_at_tenor(t1)
-        p2 = self._params_at_tenor(t2)
-
-        vol1 = self._vol_from_params(strike, p1, forward_skew, forward_expiry, sticky)
-        vol2 = self._vol_from_params(strike, p2, forward_skew, forward_expiry, sticky)
+        t1 = float(tenors[idx - 1])
+        vol1 = self._vol_at_pillar(t1, x)
+        vol2 = self._vol_at_pillar(t2, x)
 
         # Interpolate linearly in total-variance space
         var1 = vol1 ** 2 * t1
         var2 = vol2 ** 2 * t2
         w = (tenor - t1) / (t2 - t1)
-        var_tenor = var1 + w * (var2 - var1)
+        var = var1 + w * (var2 - var1)
 
-        return np.sqrt(np.maximum(var_tenor, 0.0) / tenor)
+        return np.sqrt(np.maximum(var, 0.0) / tenor)
+
