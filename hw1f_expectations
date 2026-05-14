@@ -1,148 +1,252 @@
-from __future__ import annotations
-
-from datetime import date
-from typing import Callable, TYPE_CHECKING
-
 import numpy as np
-
-from instruments.instrument import Instrument
-from utils.ql_helpers import DAY_COUNTERS
-from market_data.yield_curve import YieldCurve
-from market_data.risk_factor import CurveSlice, ScalarSlice, RiskFactorSlice
-from models.equity_pv import fx_forward_price, black76_euro_option
-
-if TYPE_CHECKING:
-    from market_data.vol_surface import MalzVol
+from scipy.optimize import brentq
+from scipy.stats import norm
 
 
-class FXOption(Instrument):
-    """European FX option priced with Black-76 on the FX forward.
+class MalzVol:
+    """FX volatility surface parameterized by market delta-quoted vols.
 
-    The forward is built from spot, forecast (basis) curve, domestic discount
-    curve, and foreign discount curve via :func:`fx_forward_price`.  The
-    option is then valued with :func:`black76_euro_option`.
+    Input is a list of [delta, tenor, vol] triples where delta is the
+    option delta (e.g. 0.25 for 25-delta call, -0.25 for 25-delta put,
+    ±0.5 for ATM).
+
+    At construction the delta-quoted surface is converted to a
+    log-moneyness x = ln(F/K) grid via Malz root-finding, matching the
+    approach in riskflow's FXVol risk factor.  The resulting per-pillar
+    grid is stored as (x_nodes, vols) and used at runtime.
+
+    Interpolation scheme
+    --------------------
+    - **Moneyness** : linear in x = ln(F/K), flat-extrapolated at wings.
+    - **Tenor**     : linear in total variance (sigma^2 * T), flat-extrapolated.
 
     Parameters
     ----------
-    name : str
-        Trade identifier.
-    expiry_date : date
-        Option expiry / exercise date.
-    strike : float
-        Strike FX rate.
-    is_call : bool
-        True for a call (right to buy foreign), False for a put.
-    nominal : float
-        Notional amount.
-    spot_name : str
-        Risk factor name for the FX spot rate (scalar).
-    forecast_curve_name : str
-        Risk factor name for the basis / forecast curve.
-    domestic_curve_name : str
-        Risk factor name for the domestic discount curve.
-    foreign_curve_name : str
-        Risk factor name for the foreign discount curve.
-    vol_name : str, optional
-        Risk factor name for a flat Black implied volatility (scalar).
-        Ignored when *vol_surface* is provided.
-    forecast_interpolator : callable, optional
-        Interpolator factory for the forecast curve.
-    domestic_interpolator : callable, optional
-        Interpolator factory for the domestic discount curve.
-    foreign_interpolator : callable, optional
-        Interpolator factory for the foreign discount curve.
-    vol_surface : MalzVol, optional
-        Malz volatility surface.  When supplied, implied vol is read from
-        the surface (using *strike*, forward, and remaining tenor) instead
-        of from the scenario cube.
-    day_count : str
-        Day count convention for year fractions (default ``"ACT/365"``).
+    surface : list of [delta, tenor, vol]
+        Market delta-quoted surface points.
+    tol : float
+        Maximum acceptable |sigma_exact - sigma_interp| error on the
+        adaptive x-grid.  Defaults to 1e-4 (same as riskflow).
     """
 
-    def __init__(
-        self,
-        name: str,
-        expiry_date: date,
-        strike: float,
-        is_call: bool,
-        nominal: float,
-        spot_name: str,
-        forecast_curve_name: str,
-        domestic_curve_name: str,
-        foreign_curve_name: str,
-        vol_name: str = "",
-        forecast_interpolator: Callable = None,
-        domestic_interpolator: Callable = None,
-        foreign_interpolator: Callable = None,
-        vol_surface: MalzVol | None = None,
-        day_count: str = "ACT/365",
-    ):
-        super().__init__(name)
-        self.expiry_date = expiry_date
-        self.strike = strike
-        self.is_call = is_call
-        self.nominal = nominal
-        self.spot_name = spot_name
-        self.forecast_curve_name = forecast_curve_name
-        self.domestic_curve_name = domestic_curve_name
-        self.foreign_curve_name = foreign_curve_name
-        self.vol_name = vol_name
-        self.forecast_interpolator = forecast_interpolator
-        self.domestic_interpolator = domestic_interpolator
-        self.foreign_interpolator = foreign_interpolator
-        self.vol_surface = vol_surface
-        self._dc = DAY_COUNTERS[day_count]
+    _INITIAL_X_GRID = np.array([-0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5])
 
-    def scenario_npvs(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict[tuple[str, date], np.ndarray] | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        # Past expiry: worth nothing
-        if val_date >= self.expiry_date:
-            spot_slice = market_state[self.spot_name]
-            n_paths = spot_slice.values.shape[0]
-            return np.zeros(n_paths)
+    def __init__(self, surface: list, tol: float = 1e-4) -> None:
+        arr = np.asarray(surface, dtype=np.float64)  # (N, 3): [delta, tenor, vol]
+        self._tenors = np.unique(arr[:, 1])
 
-        from utils.ql_helpers import to_ql_date
+        # Build per-expiry skew dicts from raw delta-quoted input
+        malz_skews = {}
+        for T in self._tenors:
+            rows = arr[arr[:, 1] == T]
+            idx = np.argsort(rows[:, 0])
+            malz_skews[T] = self._prepare_malz_skew(
+                {"delta": rows[idx, 0], "vol": rows[idx, 2].clip(min=1e-4)}, T
+            )
 
-        T = self._dc.yearFraction(to_ql_date(val_date), to_ql_date(self.expiry_date))
+        # Convert each expiry to a log-moneyness total-variance grid
+        w_table = self._build_x_grid(malz_skews, self._tenors, tol)
 
-        # FX spot
-        spot_slice: ScalarSlice = market_state[self.spot_name]
-        spot = spot_slice.values  # (n_paths,)
+        # Store per-pillar (x_nodes, vols) for runtime interpolation
+        self._pillars: dict[float, tuple[np.ndarray, np.ndarray]] = {}
+        for T in self._tenors:
+            w = w_table[T]
+            x_nodes = np.array(sorted(w.keys()))
+            variance = np.array([w[x] for x in x_nodes])
+            self._pillars[T] = (x_nodes, np.sqrt(variance / T))
 
-        # Forecast (basis) curve
-        forecast_slice: CurveSlice = market_state[self.forecast_curve_name]
-        forecast_curve = YieldCurve(
-            forecast_slice.tenors, forecast_slice.values, self.forecast_interpolator,
-        )
+    # ------------------------------------------------------------------
+    # Malz inversion helpers  (offline, run once at construction)
+    # ------------------------------------------------------------------
 
-        # Domestic discount curve
-        dom_slice: CurveSlice = market_state[self.domestic_curve_name]
-        dom_curve = YieldCurve(
-            dom_slice.tenors, dom_slice.values, self.domestic_interpolator,
-        )
+    @staticmethod
+    def _prepare_malz_skew(skew: dict, T: float) -> dict:
+        """Normalise a delta-quoted smile slice for one expiry.
 
-        # Foreign discount curve
-        for_slice: CurveSlice = market_state[self.foreign_curve_name]
-        for_curve = YieldCurve(
-            for_slice.tenors, for_slice.values, self.foreign_interpolator,
-        )
+        Identifies the ATM vol from the ±0.5 delta label, replaces it
+        with the true forward-delta ATM magnitude, mirrors ATM to both
+        wings if only one side was supplied, then splits into put/call
+        arrays for use by _sigma_exact.
+        """
+        d = np.asarray(skew["delta"], dtype=float)
+        v = np.asarray(skew["vol"],   dtype=float)
 
-        # FX forward and domestic discount factor
-        F, df = fx_forward_price(spot, forecast_curve, dom_curve, for_curve, T)
-
-        # Volatility
-        if self.vol_surface is not None:
-            vol = self.vol_surface.get_vol(strike=self.strike, forward=F, tenor=T)
+        p05 = np.where(np.isclose(d,  0.5))[0]
+        m05 = np.where(np.isclose(d, -0.5))[0]
+        if p05.size:
+            sigma_atm = float(v[p05[0]])
+        elif m05.size:
+            sigma_atm = float(v[m05[0]])
         else:
-            vol_slice: ScalarSlice = market_state[self.vol_name]
-            vol = vol_slice.values  # (n_paths,)
+            raise ValueError("Malz skew missing ATM label (delta = ±0.5).")
 
-        # Black-76 option value
-        option_pv = black76_euro_option(F, self.strike, vol, df, T, self.is_call)
+        # True pct-of-foreign forward-delta ATM: Δ_atm = 0.5 * exp(-0.5*σ²*T)
+        delta_atm = 0.5 * np.exp(-0.5 * sigma_atm * sigma_atm * T)
 
-        return option_pv * self.nominal
+        # Replace vendor ±0.5 labels with corrected ±delta_atm
+        new_d, new_v = [], []
+        for di, vi in zip(d, v):
+            if np.isclose(di,  0.5):
+                new_d.append(+delta_atm); new_v.append(vi)
+            elif np.isclose(di, -0.5):
+                new_d.append(-delta_atm); new_v.append(vi)
+            else:
+                new_d.append(di); new_v.append(vi)
+        d, v = np.asarray(new_d), np.asarray(new_v)
+
+        # Mirror ATM node to whichever wing was not supplied
+        if not np.any(d < 0) or not np.any(np.isclose(d, -delta_atm)):
+            d = np.append(d, -delta_atm); v = np.append(v, sigma_atm)
+        if not np.any(d > 0) or not np.any(np.isclose(d, +delta_atm)):
+            d = np.append(d, +delta_atm); v = np.append(v, sigma_atm)
+
+        idx = np.argsort(d)
+        d, v = d[idx], v[idx]
+
+        return {
+            "d_put":  d[d <= 0.0], "v_put":  v[d <= 0.0],
+            "d_call": d[d >= 0.0], "v_call": v[d >= 0.0],
+            "sigma_atm": sigma_atm,
+            "delta_atm": delta_atm,
+        }
+
+    @staticmethod
+    def _sigma_exact(skew: dict, T: float, x: float) -> float:
+        """Implied vol at log-moneyness x = ln(F/K) via Malz root-finding.
+
+        Solves for the delta δ* such that the pct-of-foreign forward delta
+        computed from σ(δ*) equals δ* itself, giving the self-consistent
+        implied vol at x.
+        """
+        sqrtT = np.sqrt(T)
+        sigma_atm = skew["sigma_atm"]
+        # ATM log-moneyness: x_atm = 0.5*σ_atm²*T  (d1 = d2 + σ√T, delta_atm = N(d2)*K/F)
+        x_atm  = 0.5 * sigma_atm * sigma_atm * T
+        is_call = x <= x_atm
+
+        d_wing = skew["d_call"] if is_call else skew["d_put"]
+        v_wing = skew["v_call"] if is_call else skew["v_put"]
+
+        def sigma_from_delta(delta: float) -> float:
+            return float(np.interp(delta, d_wing, v_wing))
+
+        def fwd_delta(sigma: float) -> float:
+            d1 = (x + 0.5 * sigma * sigma * T) / (sigma * sqrtT)
+            d2 = d1 - sigma * sqrtT
+            k_over_f = np.exp(-x)
+            return k_over_f * norm.cdf(d2) if is_call else -k_over_f * norm.cdf(-d2)
+
+        def residual(delta: float) -> float:
+            return fwd_delta(sigma_from_delta(delta)) - delta
+
+        a = max(0.0, d_wing.min()) if is_call else d_wing.min()
+        b = d_wing.max()           if is_call else min(0.0, d_wing.max())
+
+        fa, fb = residual(a), residual(b)
+        if fa * fb > 0:
+            delta_star = a if abs(fa) < abs(fb) else b
+        else:
+            delta_star = brentq(residual, a, b)
+
+        return sigma_from_delta(delta_star)
+
+    def _build_x_grid(
+        self, malz_skews: dict, expiries: np.ndarray, tol: float
+    ) -> dict:
+        """Build an adaptive log-moneyness total-variance grid per expiry.
+
+        Starts from _INITIAL_X_GRID and iteratively bisects intervals
+        where the linear-in-variance interpolation error exceeds tol,
+        matching riskflow's _build_maltz_x_grid.
+        """
+        # Seed total-variance table at initial x points for every expiry
+        w_table: dict[float, dict] = {}
+        for T in expiries:
+            w_table[T] = {}
+            for x in self._INITIAL_X_GRID:
+                s = self._sigma_exact(malz_skews[T], T, x)
+                w_table[T][x] = s * s * T
+
+        for T in expiries:
+            skew = malz_skews[T]
+            w    = w_table[T]
+            x_nodes = np.array(sorted(w))
+            while True:
+                # Midpoints and their exact vols
+                candidates = np.array([
+                    [0.5 * (xl + xr), self._sigma_exact(skew, T, 0.5 * (xl + xr))]
+                    for xl, xr in zip(x_nodes[:-1], x_nodes[1:])
+                ])
+                # Compare exact vols against linear-in-variance interpolation
+                x_sorted = np.array(sorted(w))
+                w_sorted = np.array([w[xi] for xi in x_sorted])
+                var_interp  = np.interp(candidates[:, 0], x_sorted, w_sorted)
+                sigma_interp = np.sqrt(np.maximum(var_interp, 0.0) / T)
+                err = np.abs(candidates[:, 1] - sigma_interp)
+
+                if err.max() <= tol:
+                    break
+
+                for xm, sm in candidates[err > tol]:
+                    w[xm] = sm * sm * T
+                x_nodes = np.array(sorted(w))
+
+        return w_table
+
+    # ------------------------------------------------------------------
+    # Runtime interpolation helpers
+    # ------------------------------------------------------------------
+
+    def _vol_at_pillar(self, t: float, x: np.ndarray) -> np.ndarray:
+        """Linear interp (flat-extrapolate) in log-moneyness at tenor pillar t."""
+        x_nodes, vols = self._pillars[t]
+        return np.interp(x, x_nodes, vols)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def get_vol(
+        self,
+        strike:  float | np.ndarray,
+        forward: float | np.ndarray,
+        tenor:   float,
+    ) -> float | np.ndarray:
+        """Return implied volatility by 2-D interpolation.
+
+        Parameters
+        ----------
+        strike  : option strike price(s)
+        forward : risk-neutral forward price(s) at expiry
+        tenor   : time to expiry in year fractions
+
+        Returns
+        -------
+        Implied volatility, same shape as *strike* / *forward*.
+        """
+        x = np.log(np.asarray(forward, dtype=float) / np.asarray(strike, dtype=float))
+
+        tenors = self._tenors
+        idx    = int(np.searchsorted(tenors, tenor))
+
+        # Flat extrapolation outside the pillar range
+        if idx == 0:
+            return self._vol_at_pillar(float(tenors[0]), x)
+        if idx == len(tenors):
+            return self._vol_at_pillar(float(tenors[-1]), x)
+
+        t2 = float(tenors[idx])
+        if np.isclose(tenor, t2):
+            return self._vol_at_pillar(t2, x)
+
+        t1   = float(tenors[idx - 1])
+        vol1 = self._vol_at_pillar(t1, x)
+        vol2 = self._vol_at_pillar(t2, x)
+
+        # Linear interpolation in total-variance space (riskflow Malz branch)
+        var1  = vol1 ** 2 * t1
+        var2  = vol2 ** 2 * t2
+        alpha = (tenor - t1) / (t2 - t1)
+        var   = var1 * (1.0 - alpha) + var2 * alpha
+
+        return np.sqrt(np.maximum(var, 0.0) / tenor)
