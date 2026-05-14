@@ -250,3 +250,26 @@ class MalzVol:
         var   = var1 * (1.0 - alpha) + var2 * alpha
 
         return np.sqrt(np.maximum(var, 0.0) / tenor)
+
+    sqrt_T = np.sqrt(T)
+
+    # Discounted intrinsic value, returned where vol == 0
+    if is_call:
+        intrinsic = df * np.maximum(forward - strike, 0.0)
+    else:
+        intrinsic = df * np.maximum(strike - forward, 0.0)
+
+    zero_vol = np.asarray(vol) == 0.0
+    safe_vol = np.where(zero_vol, 1.0, vol)
+
+    d1 = (np.log(forward / strike) + 0.5 * safe_vol**2 * T) / (safe_vol * sqrt_T)
+    d2 = d1 - safe_vol * sqrt_T
+
+    if is_call:
+        black76 = df * (forward * norm_cdf(d1) - strike * norm_cdf(d2))
+    else:
+        black76 = df * (strike * norm_cdf(-d2) - forward * norm_cdf(-d1))
+
+    price = np.where(zero_vol, intrinsic, black76)
+
+    return np.where(np.abs(price) <= 1e-6, 0.0, price)
