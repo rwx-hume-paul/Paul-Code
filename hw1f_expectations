@@ -1,46 +1,87 @@
+from __future__ import annotations
 
-def fx_forward_price(
-    fx_spot: np.ndarray,
-    forecast_curve: YieldCurve,
-    domestic_discount_curve: YieldCurve,
-    foreign_discount_curve: YieldCurve,
-    T: float,
-    foreign_forecast_curve: YieldCurve | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute the FX forward price using basis-adjusted covered interest parity.
+from datetime import date
+from typing import Callable
+
+import numpy as np
+
+from instruments.instrument import Instrument
+from utils.ql_helpers import DAY_COUNTERS, to_ql_date
+from market_data.yield_curve import YieldCurve
+from market_data.risk_factor import CurveSlice, RiskFactorSlice
+
+
+class DividendOption(Instrument):
+    """Present value of future dividend cashflows up to an expiry date.
+
+    Each cashflow is included only if its payment date falls strictly
+    before *expiry_date* and strictly after the valuation date.  The NPV
+    is the sum of discounted fixed amounts across all qualifying cashflows.
 
     Parameters
     ----------
-    fx_spot : np.ndarray
-        Spot FX rate (domestic per foreign), shape (n_paths,).
-    forecast_curve : YieldCurve
-        Domestic basis / forecast curve (e.g. ZAR-USD-BASIS for EURZAR).
-    domestic_discount_curve : YieldCurve
-        Domestic discount curve.
-    foreign_discount_curve : YieldCurve
-        Foreign discount curve.
-    T : float
-        Time to maturity in years.
-    foreign_forecast_curve : YieldCurve, optional
-        Foreign basis / forecast curve (e.g. EUR-USD-BASIS for EURZAR).
-        When omitted its discount factor defaults to 1.
-
-    Returns
-    -------
-    forward_fx : np.ndarray
-        FX forward price, shape (n_paths,).
-    df_dom : np.ndarray
-        Domestic discount factor = exp(-r_dom * T), shape (n_paths,).
+    name : str
+        Trade identifier.
+    expiry_date : date
+        Option expiry / observation cut-off date.  Dividends on or after
+        this date are excluded.
+    div_data : list of dict
+        Cashflow records as returned by :func:`pull_div_cashflows`.  Each
+        entry must contain:
+        ``{'Payment_Date': {'.Timestamp': 'YYYY-MM-DD'}, 'Fixed_Amount': float}``
+    discount_curve_name : str
+        Risk factor name for the discount curve.
+    discount_interpolator : callable
+        Interpolator factory for the discount curve.
+    day_count : str
+        Day count convention for year fractions (default ``"ACT/365"``).
     """
-    df_dom_forecast = forecast_curve.discount_factor(T)
-    df_dom = domestic_discount_curve.discount_factor(T)
-    df_for = foreign_discount_curve.discount_factor(T)
-    df_for_forecast = (
-        foreign_forecast_curve.discount_factor(T)
-        if foreign_forecast_curve is not None
-        else 1.0
-    )
 
-    forward_fx = (df_for * df_for_forecast) / (fx_spot * df_dom * df_dom_forecast)
+    def __init__(
+        self,
+        name: str,
+        expiry_date: date,
+        div_data: list[dict],
+        discount_curve_name: str,
+        discount_interpolator: Callable,
+        day_count: str = "ACT/365",
+    ):
+        super().__init__(name)
+        self.expiry_date = expiry_date
+        self.discount_curve_name = discount_curve_name
+        self.discount_interpolator = discount_interpolator
+        self._dc = DAY_COUNTERS[day_count]
 
-    return forward_fx, df_dom
+        # Parse and filter cashflows once at construction time
+        self._cashflows: list[tuple[date, float]] = []
+        for item in div_data:
+            ts = item["Payment_Date"][".Timestamp"]
+            pay_date = date.fromisoformat(str(ts).strip())
+            if pay_date < expiry_date:
+                self._cashflows.append((pay_date, float(item["Fixed_Amount"])))
+
+    def scenario_npvs(
+        self,
+        val_date: date,
+        market_state: dict[str, RiskFactorSlice],
+        fixings: dict[tuple[str, date], np.ndarray] | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        disc_slice: CurveSlice = market_state[self.discount_curve_name]
+        n_paths = disc_slice.values.shape[0]
+
+        disc_curve = YieldCurve(
+            disc_slice.tenors, disc_slice.values, self.discount_interpolator,
+        )
+
+        ql_val = to_ql_date(val_date)
+        pv = np.zeros(n_paths)
+
+        for pay_date, amount in self._cashflows:
+            if pay_date <= val_date:
+                continue
+            T = self._dc.yearFraction(ql_val, to_ql_date(pay_date))
+            df = disc_curve.discount_factor(T)
+            pv += amount * df
+
+        return pv
