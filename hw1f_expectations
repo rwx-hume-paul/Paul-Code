@@ -1,38 +1,79 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 import numpy as np
 
 from instruments.instrument import Instrument
 from utils.ql_helpers import DAY_COUNTERS, to_ql_date
 from market_data.yield_curve import YieldCurve
-from market_data.risk_factor import CurveSlice, RiskFactorSlice
+from market_data.risk_factor import CurveSlice, ScalarSlice, RiskFactorSlice
+from models.equity_pv import fx_forward_price, black76_euro_option
+
+if TYPE_CHECKING:
+    from market_data.vol_surface import MalzVol
 
 
-class DividendOption(Instrument):
-    """Present value of future dividend cashflows up to an expiry date.
+class FXOption(Instrument):
+    """European FX option priced with Black-76 on the FX forward.
 
-    Each cashflow is included only if its payment date falls strictly
-    before *expiry_date* and strictly after the valuation date.  The NPV
-    is the sum of discounted fixed amounts across all qualifying cashflows.
+    The forward is built from spot, domestic basis curve, domestic discount
+    curve, and foreign discount curve via :func:`fx_forward_price`.  The
+    option is then valued with :func:`black76_euro_option`.
 
     Parameters
     ----------
     name : str
         Trade identifier.
     expiry_date : date
-        Option expiry / observation cut-off date.  Dividends on or after
-        this date are excluded.
-    div_data : list of dict
-        Cashflow records as returned by :func:`pull_div_cashflows`.  Each
-        entry must contain:
-        ``{'Payment_Date': {'.Timestamp': 'YYYY-MM-DD'}, 'Fixed_Amount': float}``
-    discount_curve_name : str
-        Risk factor name for the discount curve.
-    discount_interpolator : callable
-        Interpolator factory for the discount curve.
+        Option expiry / exercise date.
+    strike : float
+        Strike FX rate (domestic per 1 foreign).
+    is_call : bool
+        True for a call (right to buy foreign), False for a put.
+    nominal : float
+        Notional amount in foreign currency.
+    domestic_basis : str
+        Risk factor name for the domestic basis / forecast curve
+        (e.g. ``"ZAR-USD-BASIS"``).
+    domestic_curve : str
+        Risk factor name for the domestic discount curve
+        (e.g. ``"InterestRate.ZAR-SWAP"``).
+    domestic_interpolator : callable, optional
+        Interpolator factory for the domestic discount curve.
+    domestic_basis_interpolator : callable, optional
+        Interpolator factory for the domestic basis curve.
+    foreign_basis : str, optional
+        Risk factor name for the foreign basis / forecast curve
+        (e.g. ``"EUR-USD-BASIS"``).  When omitted its discount factor
+        defaults to 1.
+    foreign_curve : str, optional
+        Risk factor name for the foreign discount curve.
+    foreign_interpolator : callable, optional
+        Interpolator factory for the foreign discount curve.
+    foreign_basis_interpolator : callable, optional
+        Interpolator factory for the foreign basis curve.
+    fx_spot_name : str, optional
+        Risk factor name for the FX spot rate (domestic per 1 foreign).
+        Used when *domestic_fx_name* / *foreign_fx_name* are not set.
+    domestic_fx_name : str, optional
+        Risk factor name for the domestic-vs-USD spot rate.  When both
+        *domestic_fx_name* and *foreign_fx_name* are provided the spot is
+        triangulated as ``domestic_fx / foreign_fx``.
+    foreign_fx_name : str, optional
+        Risk factor name for the foreign-vs-USD spot rate.
+    vol_name : str, optional
+        Risk factor name for a flat Black implied volatility (scalar).
+        Ignored when *vol_surface* is provided.
+    vol_surface : MalzVol, optional
+        Malz volatility surface.  When supplied, implied vol is read from
+        the surface (using *strike*, forward, and remaining tenor) instead
+        of from the scenario cube.
+    report_fx_name : str, optional
+        Risk factor name for the reporting-currency FX rate.  When supplied
+        the option NPV is divided by this rate to convert to the reporting
+        currency.
     day_count : str
         Day count convention for year fractions (default ``"ACT/365"``).
     """
@@ -41,24 +82,61 @@ class DividendOption(Instrument):
         self,
         name: str,
         expiry_date: date,
-        div_data: list[dict],
-        discount_curve_name: str,
-        discount_interpolator: Callable,
+        strike: float,
+        is_call: bool,
+        nominal: float,
+        domestic_basis: str,
+        domestic_curve: str,
+        domestic_interpolator: Callable = None,
+        domestic_basis_interpolator: Callable = None,
+        foreign_basis: str | None = None,
+        foreign_curve: str | None = None,
+        foreign_interpolator: Callable = None,
+        foreign_basis_interpolator: Callable = None,
+        fx_spot_name: str | None = None,
+        domestic_fx_name: str | None = None,
+        foreign_fx_name: str | None = None,
+        vol_name: str = "",
+        vol_surface: MalzVol | None = None,
+        report_fx_name: str | None = None,
         day_count: str = "ACT/365",
     ):
         super().__init__(name)
         self.expiry_date = expiry_date
-        self.discount_curve_name = discount_curve_name
-        self.discount_interpolator = discount_interpolator
+        self.strike = strike
+        self.is_call = is_call
+        self.nominal = nominal
+        self.domestic_basis = domestic_basis
+        self.domestic_curve = domestic_curve
+        self.domestic_interpolator = domestic_interpolator
+        self.domestic_basis_interpolator = domestic_basis_interpolator
+        self.foreign_basis = foreign_basis
+        self.foreign_curve = foreign_curve
+        self.foreign_interpolator = foreign_interpolator
+        self.foreign_basis_interpolator = foreign_basis_interpolator
+        self.fx_spot_name = fx_spot_name
+        self.domestic_fx_name = domestic_fx_name
+        self.foreign_fx_name = foreign_fx_name
+        self.vol_name = vol_name
+        self.vol_surface = vol_surface
+        self.report_fx_name = report_fx_name
         self._dc = DAY_COUNTERS[day_count]
 
-        # Parse and filter cashflows once at construction time
-        self._cashflows: list[tuple[date, float]] = []
-        for item in div_data:
-            ts = item["Payment_Date"][".Timestamp"]
-            pay_date = date.fromisoformat(str(ts).strip())
-            if pay_date < expiry_date:
-                self._cashflows.append((pay_date, float(item["Fixed_Amount"])))
+    def _get_fx_spot(
+        self, market_state: dict[str, RiskFactorSlice]
+    ) -> np.ndarray:
+        """Return fx_spot (domestic per foreign) from market state.
+
+        Triangulates through USD when both domestic_fx_name and
+        foreign_fx_name are set (e.g. ZAR/USD ÷ EUR/USD = ZAR/EUR).
+        Otherwise reads fx_spot_name directly.
+        """
+        if self.domestic_fx_name and self.foreign_fx_name:
+            dom: ScalarSlice = market_state[self.domestic_fx_name]
+            fgn: ScalarSlice = market_state[self.foreign_fx_name]
+            return dom.values / fgn.values
+        fx_slice: ScalarSlice = market_state[self.fx_spot_name]
+        return fx_slice.values
 
     def scenario_npvs(
         self,
@@ -67,21 +145,62 @@ class DividendOption(Instrument):
         fixings: dict[tuple[str, date], np.ndarray] | None = None,
         rng: np.random.Generator | None = None,
     ) -> np.ndarray:
-        disc_slice: CurveSlice = market_state[self.discount_curve_name]
-        n_paths = disc_slice.values.shape[0]
+        spot = self._get_fx_spot(market_state)  # (n_paths,)
+        n_paths = spot.shape[0]
 
-        disc_curve = YieldCurve(
-            disc_slice.tenors, disc_slice.values, self.discount_interpolator,
+        # Past expiry: worth nothing
+        if val_date >= self.expiry_date:
+            return np.zeros(n_paths)
+
+        T = self._dc.yearFraction(to_ql_date(val_date), to_ql_date(self.expiry_date))
+
+        # Domestic basis / forecast curve
+        dom_basis_slice: CurveSlice = market_state[self.domestic_basis]
+        dom_basis_curve = YieldCurve(
+            dom_basis_slice.tenors, dom_basis_slice.values, self.domestic_basis_interpolator,
         )
 
-        ql_val = to_ql_date(val_date)
-        pv = np.zeros(n_paths)
+        # Domestic discount curve
+        dom_slice: CurveSlice = market_state[self.domestic_curve]
+        dom_curve = YieldCurve(
+            dom_slice.tenors, dom_slice.values, self.domestic_interpolator,
+        )
 
-        for pay_date, amount in self._cashflows:
-            if pay_date <= val_date:
-                continue
-            T = self._dc.yearFraction(ql_val, to_ql_date(pay_date))
-            df = disc_curve.discount_factor(T)
-            pv += amount * df
+        # Foreign discount curve
+        for_curve = None
+        if self.foreign_curve:
+            for_slice: CurveSlice = market_state[self.foreign_curve]
+            for_curve = YieldCurve(
+                for_slice.tenors, for_slice.values, self.foreign_interpolator,
+            )
 
-        return pv
+        # Foreign basis / forecast curve — optional
+        for_basis_curve = None
+        if self.foreign_basis:
+            for_basis_slice: CurveSlice = market_state[self.foreign_basis]
+            for_basis_curve = YieldCurve(
+                for_basis_slice.tenors, for_basis_slice.values, self.foreign_basis_interpolator,
+            )
+
+        # FX forward and domestic discount factor
+        F, df = fx_forward_price(
+            spot, dom_basis_curve, dom_curve, for_curve, T,
+            foreign_forecast_curve=for_basis_curve,
+        )
+
+        # Volatility
+        if self.vol_surface is not None:
+            vol = self.vol_surface.get_vol(strike=self.strike, forward=F, tenor=T)
+        else:
+            vol_slice: ScalarSlice = market_state[self.vol_name]
+            vol = vol_slice.values  # (n_paths,)
+
+        # Black-76 option value
+        option_pv = black76_euro_option(F, self.strike, vol, df, T, self.is_call)
+        npv = option_pv * self.nominal
+
+        if self.report_fx_name is not None:
+            report_slice: ScalarSlice = market_state[self.report_fx_name]
+            npv = npv / report_slice.values
+
+        return npv
