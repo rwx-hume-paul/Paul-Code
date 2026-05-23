@@ -1,73 +1,248 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Callable
 
 import numpy as np
 
 from instruments.instrument import Instrument
-from utils.ql_helpers import DAY_COUNTERS, to_ql_date
+from instruments.ir_swap import IRSwap
+from instruments.components.cashflow_leg import LegType
+from market_data.vol_surface import IRVol
 from market_data.yield_curve import YieldCurve
 from market_data.risk_factor import CurveSlice, RiskFactorSlice
+from models.cashflow_pv import filter_future_periods, compute_period_year_fractions
+from models.equity_pv import black76_euro_option
+from utils.ql_helpers import to_ql_date
 
 
-class Loan(Instrument):
-    """Fixed-rate loan valued in a simulation context.
+class Swaption(Instrument):
+    """European swaption valued with Black-76.
 
-    The future value at maturity is determined by the original loan tenor and
-    simple interest rate.  At any valuation date the NPV is that future value
-    discounted back continuously using the discount curve::
+    Wraps an underlying IRSwap.  All trade parameters (notional, schedules,
+    discount curve) come from the swap; the only additional inputs are the
+    expiry date, strike, vol surface, and settlement style.
 
-        FV(t) = N * DF(t, T) * (1 + r * (T - t_start))
+    Pre-expiry NPV
+    --------------
+        NPV = black76(F, K, σ, df_expiry, T, is_payer) × notional × A
 
-    where ``DF(t, T)`` is the continuously-compounded discount factor from the
-    valuation date to maturity, and ``T - t_start`` is the full loan tenor
-    (fixed at inception).
+    where:
+      F          = par swap rate  =  PV(floating leg) / A
+      K          = swaption strike
+      σ          = IRVol.get_vol(K − F,  T,  swap_tenor)
+      df_expiry  = DF(val_date → expiry_date)
+      T          = year_fraction(val_date, expiry_date)
+      A          = Σ accrual_i × DF(t_i)   [fixed leg, future periods]
+
+    Post-expiry NPV
+    ---------------
+    - Cash settled:     zero on all paths
+    - Physical settled: max(underlying swap NPV, 0)
+                        (paths that are in-the-money exercise into the swap;
+                        out-of-the-money paths are floored at zero)
 
     Parameters
     ----------
     name : str
         Trade identifier.
-    start_date : date
-        Date the loan was originated (``t_start``).
-    end_date : date
-        Loan maturity date (``T``).
-    nominal : float
-        Principal / notional amount.
-    simple_rate : float
-        Simple (flat) interest rate of the loan (e.g. 0.08 for 8 %).
-    discount_curve_name : str
-        Risk factor name for the discount curve.
-    discount_interpolator : callable, optional
-        Interpolator factory for the discount curve.
-    day_count : str
-        Day count convention for year fractions (default ``"ACT/365"``).
+    underlying_swap : IRSwap
+        The underlying interest rate swap.  For a payer swaption set the
+        swap with receive_leg = floating and pay_leg = fixed; for a
+        receiver swaption swap the legs.
+    expiry_date : date
+        Date on which the option expires.
+    strike : float
+        Fixed-rate strike of the swaption.
+    vol_surface : IRVol
+        IR vol surface.  Queried with moneyness = K − F.
+    is_payer : bool
+        True for a payer swaption (holder pays fixed).  Default True.
+    settlement_style : str
+        "cash" or "physical".  Default "cash".
     """
 
     def __init__(
         self,
         name: str,
-        start_date: date,
-        end_date: date,
-        nominal: float,
-        simple_rate: float,
-        discount_curve_name: str,
-        discount_interpolator: Callable = None,
-        day_count: str = "ACT/365",
+        underlying_swap: IRSwap,
+        expiry_date: date,
+        strike: float,
+        vol_surface: IRVol,
+        is_payer: bool = True,
+        settlement_style: str = "cash",
     ):
         super().__init__(name)
-        self.start_date = start_date
-        self.end_date = end_date
-        self.nominal = nominal
-        self.simple_rate = simple_rate
-        self.discount_curve_name = discount_curve_name
-        self.discount_interpolator = discount_interpolator
-        self._dc = DAY_COUNTERS[day_count]
+        if settlement_style.lower() not in ("cash", "physical"):
+            raise ValueError(
+                f"settlement_style must be 'cash' or 'physical', got {settlement_style!r}"
+            )
 
-        # Full loan tenor is fixed at construction — does not change with val_date
-        self._loan_tenor = self._dc.yearFraction(
-            to_ql_date(start_date), to_ql_date(end_date)
+        self.underlying_swap = underlying_swap
+        self.expiry_date = expiry_date
+        self.strike = strike
+        self.vol_surface = vol_surface
+        self.is_payer = is_payer
+        self.settlement_style = settlement_style.lower()
+
+        # Populated by precompute() for physical settlement; None until then
+        self._exercise_mask: np.ndarray | None = None
+
+        # Swap tenor for vol surface lookup — fixed at construction
+        sc = underlying_swap.schedule_config
+        self._swap_tenor_yrs = float(
+            sc.curve_day_counter.yearFraction(
+                to_ql_date(underlying_swap.effective_date),
+                to_ql_date(underlying_swap.maturity_date),
+            )
         )
+
+        # Identify fixed vs floating legs from the underlying swap
+        swap = underlying_swap
+        if swap.receive_leg.leg_type == LegType.FIXED:
+            self._fixed_leg      = swap.receive_leg
+            self._fixed_schedule = swap.receive_schedule
+            self._float_leg      = swap.pay_leg
+            self._float_schedule = swap.pay_schedule
+        else:
+            self._fixed_leg      = swap.pay_leg
+            self._fixed_schedule = swap.pay_schedule
+            self._float_leg      = swap.receive_leg
+            self._float_schedule = swap.receive_schedule
+
+    # ------------------------------------------------------------------
+    # Precompute — exercise decision for physical settlement
+    # ------------------------------------------------------------------
+
+    def precompute(
+        self,
+        market_states: list[dict[str, RiskFactorSlice]],
+        dates: list[date],
+    ) -> None:
+        """Compute and store the per-path exercise mask for physical settlement.
+
+        Finds the last simulation date on or before expiry_date, evaluates
+        the par swap rate F at that date, and records which paths are in-the-money:
+          - payer swaption: exercised when F > K
+          - receiver swaption: exercised when F < K
+
+        Post-expiry scenario_npvs multiplies the swap NPV by this mask, so
+        paths that did not exercise always report zero exposure.
+        """
+        if self.settlement_style != "physical":
+            return
+
+        # Last sim date <= expiry_date (the date the exercise decision is made)
+        expiry_idx = None
+        for i, d in enumerate(dates):
+            if d <= self.expiry_date:
+                expiry_idx = i
+
+        if expiry_idx is None:
+            return
+
+        expiry_sim_date = dates[expiry_idx]
+        expiry_state = market_states[expiry_idx]
+
+        disc_slice: CurveSlice = expiry_state[self.underlying_swap.discount_curve_name]
+        n_paths = disc_slice.values.shape[0]
+
+        discount_curve = YieldCurve(
+            year_fracs=disc_slice.tenors,
+            rates=disc_slice.values,
+            interpolator=self.underlying_swap.interpolator,
+        )
+
+        F, _ = self._forward_rate_and_annuity(
+            expiry_sim_date, discount_curve, expiry_state, n_paths,
+        )
+
+        if self.is_payer:
+            self._exercise_mask = (F > self.strike).astype(float)
+        else:
+            self._exercise_mask = (F < self.strike).astype(float)
+
+    # ------------------------------------------------------------------
+    # Reset / fixing interface — delegate to the underlying swap
+    # ------------------------------------------------------------------
+
+    def get_reset_dates(self) -> list[tuple[date, str, date, date]]:
+        return self.underlying_swap.get_reset_dates()
+
+    def compute_fixings(
+        self,
+        resets: list[tuple[date, str, date, date]],
+        time_slice: dict[str, RiskFactorSlice],
+        scenario_date: date,
+    ) -> dict[tuple[str, date], np.ndarray]:
+        return self.underlying_swap.compute_fixings(resets, time_slice, scenario_date)
+
+    # ------------------------------------------------------------------
+    # Par swap rate and annuity
+    # ------------------------------------------------------------------
+
+    def _forward_rate_and_annuity(
+        self,
+        val_date: date,
+        discount_curve: YieldCurve,
+        market_state: dict[str, RiskFactorSlice],
+        n_paths: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute the par swap rate F and annuity A over future periods.
+
+        Uses the discount-factor approach for the floating leg PV:
+            coupon_pv_i = (DF_fcast(t_start) / DF_fcast(t_end) - 1) × DF_disc(t_end)
+        plus any additive spread on the floating leg.
+        """
+        sc = self.underlying_swap.schedule_config
+
+        # --- Annuity from fixed leg ---
+        future_fixed = filter_future_periods(self._fixed_schedule, val_date)
+        if not future_fixed:
+            return np.zeros(n_paths), np.zeros(n_paths)
+
+        _, t_ends_fx, accruals_fx = compute_period_year_fractions(
+            future_fixed, val_date, sc.curve_day_counter,
+        )
+
+        annuity = np.zeros(n_paths)
+        for tau, t_e in zip(accruals_fx, t_ends_fx):
+            annuity += float(tau) * discount_curve.discount_factor(float(t_e))
+
+        # --- Floating leg PV ---
+        future_float = filter_future_periods(self._float_schedule, val_date)
+        if not future_float:
+            return np.zeros(n_paths), annuity
+
+        t_starts_fl, t_ends_fl, accruals_fl = compute_period_year_fractions(
+            future_float, val_date, sc.curve_day_counter,
+        )
+
+        float_slice: CurveSlice = market_state[self._float_leg.curve_name]
+        float_curve = YieldCurve(
+            year_fracs=float_slice.tenors,
+            rates=float_slice.values,
+            interpolator=self.underlying_swap.interpolator,
+        )
+
+        spread = self._float_leg.spread  # float, default 0.0
+
+        float_pv = np.zeros(n_paths)
+        for tau, t_s, t_e in zip(accruals_fl, t_starts_fl, t_ends_fl):
+            ts, te = float(t_s), float(t_e)
+            df_fcast_s = float_curve.discount_factor(max(ts, 0.0))
+            df_fcast_e = float_curve.discount_factor(te)
+            df_disc_e  = discount_curve.discount_factor(te)
+            safe_e = np.where(np.abs(df_fcast_e) > 1e-12, df_fcast_e, 1e-12)
+            float_pv += (df_fcast_s / safe_e - 1.0) * df_disc_e
+            if spread:
+                float_pv += float(tau) * spread * df_disc_e
+
+        safe_annuity = np.where(annuity > 1e-12, annuity, 1.0)
+        return float_pv / safe_annuity, annuity
+
+    # ------------------------------------------------------------------
+    # Pricing
+    # ------------------------------------------------------------------
 
     def scenario_npvs(
         self,
@@ -76,21 +251,69 @@ class Loan(Instrument):
         fixings: dict[tuple[str, date], np.ndarray] | None = None,
         rng: np.random.Generator | None = None,
     ) -> np.ndarray:
-        disc_slice: CurveSlice = market_state[self.discount_curve_name]
+        disc_slice: CurveSlice = market_state[self.underlying_swap.discount_curve_name]
         n_paths = disc_slice.values.shape[0]
 
-        if val_date >= self.end_date:
+        # --- Post-expiry ---
+        if val_date > self.expiry_date:
+            if self.settlement_style == "physical":
+                swap_npv = self.underlying_swap.scenario_npvs(
+                    val_date, market_state, fixings=fixings,
+                )
+                if self._exercise_mask is not None:
+                    # Exercised paths carry full swap NPV (positive or negative);
+                    # non-exercised paths are always zero.
+                    return swap_npv * self._exercise_mask
+                # Fallback if precompute was not called (e.g. standalone use)
+                return np.maximum(swap_npv, 0.0)
             return np.zeros(n_paths)
 
-        disc_curve = YieldCurve(
-            disc_slice.tenors, disc_slice.values, self.discount_interpolator,
+        # Discount curve
+        discount_curve = YieldCurve(
+            year_fracs=disc_slice.tenors,
+            rates=disc_slice.values,
+            interpolator=self.underlying_swap.interpolator,
         )
 
-        T_remaining = self._dc.yearFraction(
-            to_ql_date(val_date), to_ql_date(self.end_date)
+        sc = self.underlying_swap.schedule_config
+        T = float(
+            sc.curve_day_counter.yearFraction(
+                to_ql_date(val_date), to_ql_date(self.expiry_date),
+            )
+        )
+        df_expiry = discount_curve.discount_factor(T)
+
+        # Par swap rate and annuity
+        F, annuity = self._forward_rate_and_annuity(
+            val_date, discount_curve, market_state, n_paths,
         )
 
-        df = disc_curve.discount_factor(T_remaining)
-        future_value = self.nominal * (1.0 + self.simple_rate * self._loan_tenor)
+        # On the expiry date itself (T = 0) cache the exercise decision so that
+        # post-expiry dates know which paths actually entered the swap.
+        # This is the primary way the mask is set; precompute() is a fallback
+        # for simulations whose time grid does not include the expiry date.
+        if self.settlement_style == "physical" and val_date == self.expiry_date:
+            self._exercise_mask = (
+                (F > self.strike) if self.is_payer else (F < self.strike)
+            ).astype(float)
 
-        return future_value * df
+        # Vol: moneyness = K − F, one value per path
+        moneyness = self.strike - F
+        vol = np.asarray(
+            self.vol_surface.get_vol(moneyness, T, self._swap_tenor_yrs),
+            dtype=float,
+        )
+        if vol.ndim == 0:
+            vol = np.full(n_paths, float(vol))
+
+        # Black-76 × notional × annuity
+        option_price = black76_euro_option(
+            forward=F,
+            strike=self.strike,
+            vol=vol,
+            df=df_expiry,
+            T=T,
+            is_call=self.is_payer,
+        )
+
+        return option_price * self.underlying_swap.notional * annuity
