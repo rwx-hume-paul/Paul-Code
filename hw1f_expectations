@@ -199,8 +199,39 @@ class CommodityAsian(Instrument):
         _fix: dict = fixings if fixings is not None else {}
         n_total = len(self._averaging_dates)
 
+        def _get_price(avg_date: date, pricing_date: date) -> np.ndarray:
+            key = (self.forward_curve_name, avg_date)
+            if key in _fix:
+                f = np.asarray(_fix[key], dtype=np.float64)
+                return np.full(n_paths, float(f)) if f.ndim == 0 else f
+            return get_forward_price_from_slice(
+                curve_serial_tenors=fwd_slice.tenors,
+                curve_values=fwd_slice.values,
+                value_date=val_date,
+                target_date=pricing_date,
+                day_counter=self._dc,
+                right_extrapolation=right_extrap,
+                left_extrapolation="flat",
+                _precomputed_tenors_yf=fwd_tenors_yf,
+            )
+
         # ------------------------------------------------------------------
-        # Accumulate realized prices for past averaging dates
+        # At or past period end: all fixings realized — intrinsic payoff
+        # Uses full average and original strike K (no adjusted-strike formula).
+        # ------------------------------------------------------------------
+        if val_date >= self.period_end:
+            price_sum = np.zeros(n_paths)
+            for avg_date, pricing_date in zip(self._averaging_dates, self._pricing_dates):
+                price_sum += _get_price(avg_date, pricing_date)
+            S_avg = price_sum / n_total
+            if self.is_call:
+                payoff = np.maximum(S_avg - self.strike, 0.0)
+            else:
+                payoff = np.maximum(self.strike - S_avg, 0.0)
+            return self.direction * payoff * self.notional * df
+
+        # ------------------------------------------------------------------
+        # Accumulate realized prices for past averaging dates (pre-expiry)
         # ------------------------------------------------------------------
         past_sum = np.zeros(n_paths)
         n_past = 0
@@ -209,50 +240,32 @@ class CommodityAsian(Instrument):
             if avg_date > val_date:
                 break
             n_past += 1
-            key = (self.forward_curve_name, avg_date)
-            if key in _fix:
-                f_past = np.asarray(_fix[key], dtype=np.float64)
-                if f_past.ndim == 0:
-                    f_past = np.full(n_paths, float(f_past))
-                past_sum += f_past
-            else:
-                # Fallback: read from current forward curve
-                past_sum += get_forward_price_from_slice(
-                    curve_serial_tenors=fwd_slice.tenors,
-                    curve_values=fwd_slice.values,
-                    value_date=val_date,
-                    target_date=pricing_date,
-                    day_counter=self._dc,
-                    right_extrapolation=right_extrap,
-                    left_extrapolation="flat",
-                    _precomputed_tenors_yf=fwd_tenors_yf,
-                )
+            past_sum += _get_price(avg_date, pricing_date)
 
         n_future = n_total - n_past
-
-        # ------------------------------------------------------------------
-        # All fixings known — discounted intrinsic
-        # ------------------------------------------------------------------
-        if n_future == 0:
-            S_avg = past_sum / n_total
-            if self.is_call:
-                payoff = np.maximum(S_avg - self.strike, 0.0)
-            else:
-                payoff = np.maximum(self.strike - S_avg, 0.0)
-            return self.direction * payoff * self.notional * df
 
         # ------------------------------------------------------------------
         # Effective strike adjusted for any past fixings
         # ------------------------------------------------------------------
         if n_past > 0:
             S_avg_past = past_sum / n_past
-            # K_eff is per-path (n_paths,) when S_avg_past is path-dependent
+            # K_eff is the Black-76 strike that reproduces the correct payoff.
+            # K_eff is per-path (n_paths,) when S_avg_past is path-dependent.
             K_eff: float | np.ndarray = (
                 (n_total / n_future) * self.strike
                 - (n_past / n_future) * S_avg_past
             )
+            # strike_bar is used only for vol-surface moneyness lookups.
+            # It equals K - accumulated_past_weighted_avg = K - past_sum/n_total,
+            # matching RiskFlow's convention (strike_bar = Strike - average where
+            # average = Σ past_weight_i * F_i with weight = 1/n_total).
+            # K_eff = (n_total/n_future) * strike_bar, so using K_eff for vol
+            # moneyness inflates the effective moneyness by n_total/n_future and
+            # causes divergence from RiskFlow once averaging starts.
+            strike_for_vol: float | np.ndarray = self.strike - past_sum / n_total
         else:
             K_eff = float(self.strike)
+            strike_for_vol = K_eff
 
         T_expiry = float(self._dc.yearFraction(
             to_ql_date(val_date), to_ql_date(self.period_end),
@@ -286,7 +299,7 @@ class CommodityAsian(Instrument):
             )  # (n_paths,)
 
             vol_i = np.asarray(
-                self.vol_surface.get_vol(K_eff, F_i, t_i), dtype=np.float64,
+                self.vol_surface.get_vol(strike_for_vol, F_i, t_i), dtype=np.float64,
             )
             if vol_i.ndim == 0:
                 vol_i = np.full(n_paths, float(vol_i))
