@@ -1,390 +1,157 @@
-from __future__ import annotations
-
 from datetime import date
-from typing import Callable, TYPE_CHECKING, cast
 
 import numpy as np
+import pandas as pd
 
-from instruments.instrument import Instrument
-from market_data.risk_factor import CurveSlice, ScalarSlice, RiskFactorSlice
-from market_data.yield_curve import YieldCurve
-from models.equity_pv import black76_euro_option
-from utils.ql_helpers import (
-    DAY_COUNTERS,
-    generate_business_days,
-    to_ql_date,
+from importers.df_importer import build_cube_from_dataframes, extract_simulation_dates_from_curve_df
+from instruments.equity_asian import EquityAsian
+from market_data.curve_generation import generate_static_curve_scenarios
+from market_data.vol_surface import BenchmarkVolSkew
+from portfolio.netting_set import NettingSet
+from portfolio.trade import Trade
+from pricing.exposure_engine import ExposureEngine
+from utils.comparison import compare_mtm_in_excel
+from utils.extract import (
+    collect_risk_factor_dataframes,
+    load_mtm_dataframe_from_results,
+    strip_time_from_index,
+)
+from utils.interpolation import hermite_rt_interp, reciprocal_time_interp
+from utils.json_handling import pull_curve, pull_eq_vol_skew
+
+
+json_path       = r"x"
+comparison_path = r"y"
+file_name       = "EQUITY-ASIAN-Compare.xlsx"
+
+DISC_NAME   = "InterestRate.ZAR-SWAP"
+CARRY_NAME  = "InterestRate.ZAR-SWAP"
+vol_name    = "EquityPriceVol.ZAR_NRP3"
+div_name    = "DividendRate.ZAR_NRP3"
+equity_name = "EquityPrice.ZAR_NRP"
+val_date    = date(2025, 7, 28)
+N_PATHS     = 500
+
+overrides = {
+    'Object':                 "CreditMonteCarlo",
+    'Calc_Scenarios':         'Yes',
+    'Time_grid':              '0d 2d 1w(1w) 3m(1m) 2y(3m)',
+    'Batch_Size':             1,
+    'Simulation_Batches':     N_PATHS,
+    'Random_Seed':            8,
+    'Percentile':             '95, 99',
+    'Dynamic_Scenario_Dates': 'Yes',
+}
+
+# ── raw market data ───────────────────────────────────────────────────────────
+risk_keys = [equity_name, DISC_NAME]
+risk_factors = collect_risk_factor_dataframes(
+    json_path=json_path, overrides=overrides, risk_keys=risk_keys,
+)
+zar_swap  = risk_factors[DISC_NAME].reset_index()
+spot_sims = risk_factors[equity_name].reset_index()
+spot_sims = spot_sims.drop(columns=["tenor"])
+
+div_curve  = np.array(pull_curve(json_path, div_name))
+div_tenors = div_curve[:, 0]
+div_rates  = div_curve[:, 1]
+
+# Coarse simulation dates from the ZAR-SWAP cube.
+sim_dates = extract_simulation_dates_from_curve_df(zar_swap)
+
+# ── vol surface ───────────────────────────────────────────────────────────────
+atm_vol, atm_ref, s, L, R, C, D, lam, rho = pull_eq_vol_skew(json_path, vol_name)
+vol_skew = BenchmarkVolSkew(atm_vol, s, L, R, C, D, lam, rho, atm_ref)
+
+# ── instrument ────────────────────────────────────────────────────────────────
+# Build the instrument first so required_sim_dates() is available before we
+# construct the div curve scenario grid — this is the critical ordering fix.
+equity_asian = EquityAsian(
+    name                  = "eq_asian",
+    period_start          = date(2026, 3, 6),
+    period_end            = date(2026, 3, 26),
+    settlement_date       = date(2026, 3, 26),
+    strike                = 138.88,
+    notional              = 642_871,
+    is_call               = True,
+    vol_surface           = vol_skew,
+    spot_name             = equity_name,
+    carry_curve_name      = CARRY_NAME,
+    discount_curve_name   = DISC_NAME,
+    dividend_curve_name   = div_name,
+    averaging_calendar    = "ZAR",
+    carry_interpolator    = hermite_rt_interp,
+    dividend_interpolator = reciprocal_time_interp,
+    discount_interpolator = hermite_rt_interp,
+    day_count             = "ACT/365",
+    direction             = 1,
+    sticky                = "strike",
 )
 
-if TYPE_CHECKING:
-    from market_data.vol_surface import BenchmarkVolSkew
+# ── extra dates — collected from every averaging instrument ───────────────────
+instruments = [equity_asian]   # extend as netting set grows
+extra_dates: list[date] = sorted({
+    d
+    for inst in instruments
+    if hasattr(inst, "required_sim_dates")
+    for d in inst.required_sim_dates()
+})
 
+# Augment the coarse sim_dates so the div curve scenario grid also covers every
+# averaging date — without this, build() intersects out the averaging dates.
+sim_dates_extended = tuple(sorted(set(sim_dates) | set(extra_dates)))
 
-class EquityAsian(Instrument):
-    """Arithmetically averaged Asian equity option priced via moment matching.
+# ── div curve scenarios (frozen, static) ─────────────────────────────────────
+div_paths, div_tenors, div_dates = generate_static_curve_scenarios(
+    rates            = div_rates,
+    tenors           = div_tenors,
+    simulation_dates = sim_dates_extended,
+    valuation_date   = val_date,
+    output_tenors    = div_tenors,
+    n_paths          = N_PATHS,
+    interpolator     = reciprocal_time_interp,
+    frozen           = True,
+)
 
-    Daily fixing dates are generated as business days in [period_start, period_end].
-    Each fixing's risk-neutral forward price is computed analytically from spot,
-    carry, and dividend curves via :func:`equity_forward_price`.  The arithmetic
-    average of future forwards is matched to a log-normal distribution using the
-    first two moments, producing a single adjusted volatility for a Black-76
-    European option.
+# ── build cube ────────────────────────────────────────────────────────────────
+# _insert_extra_dates linearly interpolates the ZAR-SWAP curve and equity spot
+# to every averaging date, giving each its own path-specific slice — the same
+# effect as RiskFlow's Dynamic_Scenario_Dates.
+builder = build_cube_from_dataframes(
+    valuation_date = val_date,
+    curve_dfs      = {"ZAR-SWAP": zar_swap},
+    scalar_dfs     = {equity_name: spot_sims},
+    extra_dates    = extra_dates,
+)
+builder.add_curve_factor(div_name, div_paths, div_tenors, div_dates)
+cube = builder.build()
 
-    When some fixings have already been observed the strike is adjusted to
-    account for the realized average so far, and only the remaining m future
-    fixings enter the moment-matching calculation.  Realized fixings are stored
-    as spot prices at each averaging date.
+# ── portfolio ─────────────────────────────────────────────────────────────────
+trade = Trade(
+    trade_id        = "asian-001",
+    counterparty_id = "ABC_CORP",
+    instrument      = equity_asian,
+    notional_scale  = 1.0,
+)
+netting_set = NettingSet(
+    netting_set_id  = "NS_ABC",
+    counterparty_id = "ABC_CORP",
+    trades          = [trade],
+    csa             = None,
+)
 
-    Pricing model (m future fixings)
-    ---------------------------------
-    Let F(i) = equity_forward_price at fixing i,
-        vol(i) = BenchmarkVolSkew.get_vol(strike_for_vol, t(i)),
-        t(i)   = year fraction from val_date to averaging date i.
+# ── run ───────────────────────────────────────────────────────────────────────
+engine  = ExposureEngine(cube=cube)
+profile = engine.compute(netting_set)
 
-        M1 = (1/m) Σᵢ F(i)
+mtm_validation = pd.DataFrame(
+    profile.mtm.T,
+    index   = list(profile.dates),
+    columns = list(range(profile.n_paths)),
+)
 
-        M2 = (1/m²) [ Σᵢ F(i)² exp(vol(i)² t(i))
-                       + 2 Σⱼ Σᵢ<ⱼ F(i) F(j) exp(vol(i)² t(i)) ]
+# ── compare with RiskFlow ─────────────────────────────────────────────────────
+mtm_riskflow = load_mtm_dataframe_from_results(json_path, overrides)
+mtm_riskflow = strip_time_from_index(mtm_riskflow)
 
-        σ_adj = sqrt( (ln M2 − 2 ln M1) / T_expiry )
-
-        PV = direction × Black76(M1, K_eff, σ_adj, df(T_settle), T_expiry, is_call)
-             × notional × (m / n_total  if past fixings exist)
-
-    Strike adjustment for past fixings (n_past past, m future, n_total = n_past + m):
-
-        K_eff        = (n_total / m) × K − (n_past / m) × S̄_past
-        strike_for_vol = K − past_sum / n_total   (RiskFlow moneyness convention)
-
-    Parameters
-    ----------
-    name : str
-        Trade identifier.
-    period_start : date
-        First date of the averaging window.
-    period_end : date
-        Last date of the averaging window (option expiry for moment-matching).
-    settlement_date : date
-        Date on which the settled payoff is paid; used only for discounting.
-    strike : float
-        Option strike.
-    notional : float
-        Contract notional.
-    is_call : bool
-        True for a call (buyer benefits when average > strike).
-    vol_surface : BenchmarkVolSkew
-        Equity implied-vol skew surface.
-    spot_name : str
-        Risk-factor name for the equity spot price (scalar).
-    carry_curve_name : str
-        Risk-factor name for the carry / funding curve.
-    discount_curve_name : str
-        Risk-factor name for the discount curve.
-    dividend_curve_name : str
-        Risk-factor name for the continuous dividend yield curve.
-    averaging_calendar : str
-        Calendar key used to enumerate business days in the averaging window.
-    carry_interpolator : callable
-        Interpolator factory for the carry curve.
-    dividend_interpolator : callable
-        Interpolator factory for the dividend yield curve.
-    discount_interpolator : callable
-        Interpolator factory for the discount curve.
-    day_count : str
-        Day-count convention key (default ``"ACT/365"``).
-    direction : int
-        ``+1`` for long, ``-1`` for short.  Default ``+1``.
-    sticky : str
-        Stickiness convention passed to ``vol_surface.get_vol``
-        (``'strike'`` or ``'delta'``).  Default ``'strike'``.
-    div_date : date, optional
-        Date of a discrete dividend paid within the averaging period.
-        When provided, the dividend yield is interpolated at this date
-        and applied to all averaging dates strictly before it; the yield
-        at ``period_end`` is applied to all averaging dates from
-        ``div_date`` onward.  When omitted, the yield at ``period_end``
-        is used for all fixing dates.
-    """
-
-    def __init__(
-        self,
-        name: str,
-        period_start: date,
-        period_end: date,
-        settlement_date: date,
-        strike: float,
-        notional: float,
-        is_call: bool,
-        vol_surface: BenchmarkVolSkew,
-        spot_name: str,
-        carry_curve_name: str,
-        discount_curve_name: str,
-        dividend_curve_name: str,
-        averaging_calendar: str,
-        carry_interpolator: Callable,
-        dividend_interpolator: Callable,
-        discount_interpolator: Callable,
-        day_count: str = "ACT/365",
-        direction: int = 1,
-        sticky: str = "strike",
-        div_date: date | None = None,
-    ) -> None:
-        super().__init__(name)
-        self.period_start = period_start
-        self.period_end = period_end
-        self.settlement_date = settlement_date
-        self.strike = strike
-        self.notional = notional
-        self.is_call = is_call
-        self.vol_surface = vol_surface
-        self.spot_name = spot_name
-        self.carry_curve_name = carry_curve_name
-        self.discount_curve_name = discount_curve_name
-        self.dividend_curve_name = dividend_curve_name
-        self.carry_interpolator = carry_interpolator
-        self.dividend_interpolator = dividend_interpolator
-        self.discount_interpolator = discount_interpolator
-        self.direction = direction
-        self.sticky = sticky
-        self.div_date = div_date
-        self._dc = DAY_COUNTERS[day_count]
-
-        self._averaging_dates: list[date] = generate_business_days(
-            period_start, period_end, averaging_calendar,
-        )
-
-    # ------------------------------------------------------------------
-    # Pricing
-    # ------------------------------------------------------------------
-
-    def scenario_npvs(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict[tuple[str, date], np.ndarray] | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        """Compute per-path NPV of the Asian equity option.
-
-        Parameters
-        ----------
-        val_date : date
-            Current valuation date.
-        market_state : dict
-            Mapping from risk-factor name to RiskFactorSlice.
-        fixings : dict or None
-            Realized spot prices for past averaging dates.
-            Key: ``(spot_name, averaging_date)`` →
-            ``np.ndarray (n_paths,)`` or scalar.
-        rng : ignored.
-
-        Returns
-        -------
-        np.ndarray, shape (n_paths,)
-        """
-        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
-        spot = spot_slice.values  # (n_paths,)
-        n_paths = spot.shape[0]
-
-        if val_date > self.settlement_date:
-            return np.zeros(n_paths)
-
-        carry_slice = cast(CurveSlice, market_state[self.carry_curve_name])
-        carry_curve = YieldCurve(
-            carry_slice.tenors, carry_slice.values, self.carry_interpolator,
-        )
-
-        div_slice = cast(CurveSlice, market_state[self.dividend_curve_name])
-        div_curve = YieldCurve(
-            div_slice.tenors, div_slice.values, self.dividend_interpolator,
-        )
-
-        disc_slice = cast(CurveSlice, market_state[self.discount_curve_name])
-        disc_curve = YieldCurve(
-            disc_slice.tenors, disc_slice.values, self.discount_interpolator,
-        )
-
-        T_settle = float(self._dc.yearFraction(
-            to_ql_date(val_date), to_ql_date(self.settlement_date),
-        ))
-        df = disc_curve.discount_factor(T_settle)
-
-        T_expiry = float(self._dc.yearFraction(
-            to_ql_date(val_date), to_ql_date(self.period_end),
-        ))
-
-        # ------------------------------------------------------------------
-        # Dividend yield setup: if div_date is supplied, interpolate q at
-        # that date (applied to averaging dates strictly before it) and q at
-        # expiry (applied from div_date onward).  Otherwise use q(T_expiry)
-        # as a single constant across all fixing dates.
-        # ------------------------------------------------------------------
-        if self.div_date is not None:
-            T_div = float(self._dc.yearFraction(
-                to_ql_date(val_date), to_ql_date(self.div_date),
-            ))
-            q_pre  = div_curve.get_rate(T_div)     # (n_paths,) — yield at dividend date
-            q_post = div_curve.get_rate(T_expiry)  # (n_paths,) — yield at expiry
-        else:
-            T_div  = None
-            q_post = div_curve.get_rate(T_expiry)  # (n_paths,) — constant for all dates
-
-        _fix: dict = fixings if fixings is not None else {}
-        n_total = len(self._averaging_dates)
-
-        def _get_fixing(avg_date: date) -> np.ndarray:
-            """Return realized spot price for a past averaging date."""
-            key = (self.spot_name, avg_date)
-            if key in _fix:
-                f = np.asarray(_fix[key], dtype=np.float64)
-                return np.full(n_paths, float(f)) if f.ndim == 0 else f
-            return spot.copy()
-
-        # ------------------------------------------------------------------
-        # At or past period end: all fixings realized — intrinsic payoff
-        # ------------------------------------------------------------------
-        if val_date >= self.period_end:
-            price_sum = np.zeros(n_paths)
-            for avg_date in self._averaging_dates:
-                price_sum += _get_fixing(avg_date)
-            S_avg = price_sum / n_total
-            if self.is_call:
-                payoff = np.maximum(S_avg - self.strike, 0.0)
-            else:
-                payoff = np.maximum(self.strike - S_avg, 0.0)
-            return self.direction * payoff * self.notional * df
-
-        # ------------------------------------------------------------------
-        # Accumulate realized spot prices for past averaging dates
-        # ------------------------------------------------------------------
-        past_sum = np.zeros(n_paths)
-        n_past = 0
-
-        for avg_date in self._averaging_dates:
-            if avg_date >= val_date:
-                break
-            n_past += 1
-            past_sum += _get_fixing(avg_date)
-
-        n_future = n_total - n_past
-
-        # ------------------------------------------------------------------
-        # Effective strike adjusted for any past fixings
-        # ------------------------------------------------------------------
-        if n_past > 0:
-            K_eff: float | np.ndarray = (
-                (n_total / n_future) * self.strike
-                - (n_past / n_future) * (past_sum / n_past)
-            )
-            strike_for_vol: float | np.ndarray = self.strike - past_sum / n_total
-        else:
-            K_eff = float(self.strike)
-            strike_for_vol = K_eff
-
-        # ------------------------------------------------------------------
-        # Moment matching over future fixing dates
-        # ------------------------------------------------------------------
-        M1_sum = np.zeros(n_paths)
-        M2_diag = np.zeros(n_paths)
-        M2_cross = np.zeros(n_paths)
-        running_weighted = np.zeros(n_paths)
-
-        for avg_date in self._averaging_dates:
-            if avg_date < val_date:
-                continue
-
-            t_i = float(self._dc.yearFraction(
-                to_ql_date(val_date), to_ql_date(avg_date),
-            ))
-
-            # Forward price using constant or stepped dividend yield.
-            # q is pre-dividend for dates before T_div, post-dividend after.
-            r_i = carry_curve.get_rate(t_i)
-            q_i = q_pre if (T_div is not None and t_i < T_div) else q_post
-            F_i = spot * np.exp((r_i - q_i) * t_i)
-
-            vol_i = np.asarray(
-                self.vol_surface.get_vol(
-                    strike=strike_for_vol,
-                    tenor=t_i,
-                    forward_skew=F_i if self.sticky == "delta" else None,
-                    forward_expiry=F_i if self.sticky == "delta" else None,
-                    sticky=self.sticky,
-                ),
-                dtype=np.float64,
-            )
-            if vol_i.ndim == 0:
-                vol_i = np.full(n_paths, float(vol_i))
-
-            exp_var_i = np.exp(vol_i ** 2 * t_i)
-
-            M2_cross += F_i * running_weighted
-            running_weighted += F_i * exp_var_i
-
-            M2_diag += F_i ** 2 * exp_var_i
-            M1_sum += F_i
-
-        M1 = M1_sum / n_future
-        M2 = (M2_diag + 2.0 * M2_cross) / (n_future ** 2)
-
-        safe_M1 = np.maximum(M1, 1e-12)
-        log_ratio = np.log(np.maximum(M2, safe_M1 ** 2)) - 2.0 * np.log(safe_M1)
-        log_ratio = np.maximum(log_ratio, 0.0)
-        adjusted_vol = (
-            np.sqrt(log_ratio / T_expiry) if T_expiry > 0.0 else np.zeros(n_paths)
-        )
-
-        option_pv = black76_euro_option(
-            forward=M1,
-            strike=K_eff,
-            vol=adjusted_vol,
-            df=df,
-            T=T_expiry,
-            is_call=self.is_call,
-        )
-
-        pv = self.direction * option_pv * self.notional
-        if n_past > 0:
-            pv = pv * (n_future / n_total)
-
-        return pv
-
-    # ------------------------------------------------------------------
-    # Fixing interface (called by ExposureEngine)
-    # ------------------------------------------------------------------
-
-    def compute_commodity_fixings(
-        self,
-        market_state: dict[str, RiskFactorSlice],
-        sim_date: date,
-        existing_fixings: dict | None = None,
-    ) -> dict:
-        """Stamp realized spot prices for newly past averaging dates.
-
-        Called by ExposureEngine at each simulation step before scenario_npvs.
-        Returns only the new fixings stamped at this step; the caller merges
-        them into its accumulator.
-
-        Each averaging date is stamped exactly once — at the first sim step
-        where avg_date <= sim_date — locking the realized spot price into the
-        path.
-        """
-        _existing = existing_fixings or {}
-        new_fixings: dict = {}
-
-        if not self._averaging_dates or self._averaging_dates[0] > sim_date:
-            return {}
-
-        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
-        spot = spot_slice.values  # (n_paths,)
-
-        for avg_date in self._averaging_dates:
-            if avg_date > sim_date:
-                break
-
-            key = (self.spot_name, avg_date)
-            if key in _existing:
-                continue
-
-            new_fixings[key] = spot.copy()
-
-        return new_fixings
+compare_mtm_in_excel(mtm_riskflow, mtm_validation, comparison_path, filename=file_name)
