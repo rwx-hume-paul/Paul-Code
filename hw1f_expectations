@@ -8,7 +8,7 @@ import numpy as np
 from instruments.instrument import Instrument
 from market_data.risk_factor import CurveSlice, ScalarSlice, RiskFactorSlice
 from market_data.yield_curve import YieldCurve
-from models.equity_pv import equity_forward_price, black76_euro_option
+from models.equity_pv import black76_euro_option
 from utils.ql_helpers import (
     DAY_COUNTERS,
     generate_business_days,
@@ -96,6 +96,13 @@ class EquityAsian(Instrument):
     sticky : str
         Stickiness convention passed to ``vol_surface.get_vol``
         (``'strike'`` or ``'delta'``).  Default ``'strike'``.
+    div_date : date, optional
+        Date of a discrete dividend paid within the averaging period.
+        When provided, the dividend yield is interpolated at this date
+        and applied to all averaging dates strictly before it; the yield
+        at ``period_end`` is applied to all averaging dates from
+        ``div_date`` onward.  When omitted, the yield at ``period_end``
+        is used for all fixing dates.
     """
 
     def __init__(
@@ -119,6 +126,7 @@ class EquityAsian(Instrument):
         day_count: str = "ACT/365",
         direction: int = 1,
         sticky: str = "strike",
+        div_date: date | None = None,
     ) -> None:
         super().__init__(name)
         self.period_start = period_start
@@ -137,6 +145,7 @@ class EquityAsian(Instrument):
         self.discount_interpolator = discount_interpolator
         self.direction = direction
         self.sticky = sticky
+        self.div_date = div_date
         self._dc = DAY_COUNTERS[day_count]
 
         self._averaging_dates: list[date] = generate_business_days(
@@ -199,6 +208,26 @@ class EquityAsian(Instrument):
         ))
         df = disc_curve.discount_factor(T_settle)
 
+        T_expiry = float(self._dc.yearFraction(
+            to_ql_date(val_date), to_ql_date(self.period_end),
+        ))
+
+        # ------------------------------------------------------------------
+        # Dividend yield setup: if div_date is supplied, interpolate q at
+        # that date (applied to averaging dates strictly before it) and q at
+        # expiry (applied from div_date onward).  Otherwise use q(T_expiry)
+        # as a single constant across all fixing dates.
+        # ------------------------------------------------------------------
+        if self.div_date is not None:
+            T_div = float(self._dc.yearFraction(
+                to_ql_date(val_date), to_ql_date(self.div_date),
+            ))
+            q_pre  = div_curve.get_rate(T_div)     # (n_paths,) — yield at dividend date
+            q_post = div_curve.get_rate(T_expiry)  # (n_paths,) — yield at expiry
+        else:
+            T_div  = None
+            q_post = div_curve.get_rate(T_expiry)  # (n_paths,) — constant for all dates
+
         _fix: dict = fixings if fixings is not None else {}
         n_total = len(self._averaging_dates)
 
@@ -251,10 +280,6 @@ class EquityAsian(Instrument):
             K_eff = float(self.strike)
             strike_for_vol = K_eff
 
-        T_expiry = float(self._dc.yearFraction(
-            to_ql_date(val_date), to_ql_date(self.period_end),
-        ))
-
         # ------------------------------------------------------------------
         # Moment matching over future fixing dates
         # ------------------------------------------------------------------
@@ -270,7 +295,12 @@ class EquityAsian(Instrument):
             t_i = float(self._dc.yearFraction(
                 to_ql_date(val_date), to_ql_date(avg_date),
             ))
-            F_i, _, _ = equity_forward_price(spot, carry_curve, div_curve, t_i)
+
+            # Forward price using constant or stepped dividend yield.
+            # q is pre-dividend for dates before T_div, post-dividend after.
+            r_i = carry_curve.get_rate(t_i)
+            q_i = q_pre if (T_div is not None and t_i < T_div) else q_post
+            F_i = spot * np.exp((r_i - q_i) * t_i)
 
             vol_i = np.asarray(
                 self.vol_surface.get_vol(
