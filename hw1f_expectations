@@ -260,7 +260,7 @@ class EquityAsian(Instrument):
         n_past = 0
 
         for avg_date in self._averaging_dates:
-            if avg_date > val_date:
+            if avg_date >= val_date:
                 break
             n_past += 1
             past_sum += _get_fixing(avg_date)
@@ -289,7 +289,7 @@ class EquityAsian(Instrument):
         running_weighted = np.zeros(n_paths)
 
         for avg_date in self._averaging_dates:
-            if avg_date <= val_date:
+            if avg_date < val_date:
                 continue
 
             t_i = float(self._dc.yearFraction(
