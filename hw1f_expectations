@@ -1,157 +1,31 @@
-from datetime import date
 
-import numpy as np
-import pandas as pd
+def load_full_grid_mtm_from_results(
+    json_path: str,
+    overrides: dict,
+) -> pd.DataFrame:
+    """Extract RiskFlow GrossMTM at ALL simulation dates.
 
-from importers.df_importer import build_cube_from_dataframes, extract_simulation_dates_from_curve_df
-from instruments.equity_asian import EquityAsian
-from market_data.curve_generation import generate_static_curve_scenarios
-from market_data.vol_surface import BenchmarkVolSkew
-from portfolio.netting_set import NettingSet
-from portfolio.trade import Trade
-from pricing.exposure_engine import ExposureEngine
-from utils.comparison import compare_mtm_in_excel
-from utils.extract import (
-    collect_risk_factor_dataframes,
-    load_mtm_dataframe_from_results,
-    strip_time_from_index,
-)
-from utils.interpolation import hermite_rt_interp, reciprocal_time_interp
-from utils.json_handling import pull_curve, pull_eq_vol_skew
+    Unlike load_mtm_dataframe_from_results (which returns the Time_grid
+    report dates only), this reads cr["GrossMTM"][0] at the full internal
+    time_grid.mtm_dates — which includes dates added via Dynamic_Scenario_Dates
+    such as Asian option averaging dates.
 
+    Returns
+    -------
+    pd.DataFrame
+        Index   : datetime.date, one row per simulation date
+        Columns : int, 0-based path index
+    """
+    cx = rf.Context()
+    cx.load_json(json_path)
+    calc, out = cx.run_job(overrides=overrides)
 
-json_path       = r"x"
-comparison_path = r"y"
-file_name       = "EQUITY-ASIAN-Compare.xlsx"
+    cr        = out["Netting"].sub_structures[0].obj.Calc_res
+    all_dates = sorted(calc.time_grid.mtm_dates)
+    gross_mtm = cr["GrossMTM"][0]          # (n_all_dates, n_paths)
 
-DISC_NAME   = "InterestRate.ZAR-SWAP"
-CARRY_NAME  = "InterestRate.ZAR-SWAP"
-vol_name    = "EquityPriceVol.ZAR_NRP3"
-div_name    = "DividendRate.ZAR_NRP3"
-equity_name = "EquityPrice.ZAR_NRP"
-val_date    = date(2025, 7, 28)
-N_PATHS     = 500
-
-overrides = {
-    'Object':                 "CreditMonteCarlo",
-    'Calc_Scenarios':         'Yes',
-    'Time_grid':              '0d 2d 1w(1w) 3m(1m) 2y(3m)',
-    'Batch_Size':             1,
-    'Simulation_Batches':     N_PATHS,
-    'Random_Seed':            8,
-    'Percentile':             '95, 99',
-    'Dynamic_Scenario_Dates': 'Yes',
-}
-
-# ── raw market data ───────────────────────────────────────────────────────────
-risk_keys = [equity_name, DISC_NAME]
-risk_factors = collect_risk_factor_dataframes(
-    json_path=json_path, overrides=overrides, risk_keys=risk_keys,
-)
-zar_swap  = risk_factors[DISC_NAME].reset_index()
-spot_sims = risk_factors[equity_name].reset_index()
-spot_sims = spot_sims.drop(columns=["tenor"])
-
-div_curve  = np.array(pull_curve(json_path, div_name))
-div_tenors = div_curve[:, 0]
-div_rates  = div_curve[:, 1]
-
-# Coarse simulation dates from the ZAR-SWAP cube.
-sim_dates = extract_simulation_dates_from_curve_df(zar_swap)
-
-# ── vol surface ───────────────────────────────────────────────────────────────
-atm_vol, atm_ref, s, L, R, C, D, lam, rho = pull_eq_vol_skew(json_path, vol_name)
-vol_skew = BenchmarkVolSkew(atm_vol, s, L, R, C, D, lam, rho, atm_ref)
-
-# ── instrument ────────────────────────────────────────────────────────────────
-# Build the instrument first so required_sim_dates() is available before we
-# construct the div curve scenario grid — this is the critical ordering fix.
-equity_asian = EquityAsian(
-    name                  = "eq_asian",
-    period_start          = date(2026, 3, 6),
-    period_end            = date(2026, 3, 26),
-    settlement_date       = date(2026, 3, 26),
-    strike                = 138.88,
-    notional              = 642_871,
-    is_call               = True,
-    vol_surface           = vol_skew,
-    spot_name             = equity_name,
-    carry_curve_name      = CARRY_NAME,
-    discount_curve_name   = DISC_NAME,
-    dividend_curve_name   = div_name,
-    averaging_calendar    = "ZAR",
-    carry_interpolator    = hermite_rt_interp,
-    dividend_interpolator = reciprocal_time_interp,
-    discount_interpolator = hermite_rt_interp,
-    day_count             = "ACT/365",
-    direction             = 1,
-    sticky                = "strike",
-)
-
-# ── extra dates — collected from every averaging instrument ───────────────────
-instruments = [equity_asian]   # extend as netting set grows
-extra_dates: list[date] = sorted({
-    d
-    for inst in instruments
-    if hasattr(inst, "required_sim_dates")
-    for d in inst.required_sim_dates()
-})
-
-# Augment the coarse sim_dates so the div curve scenario grid also covers every
-# averaging date — without this, build() intersects out the averaging dates.
-sim_dates_extended = tuple(sorted(set(sim_dates) | set(extra_dates)))
-
-# ── div curve scenarios (frozen, static) ─────────────────────────────────────
-div_paths, div_tenors, div_dates = generate_static_curve_scenarios(
-    rates            = div_rates,
-    tenors           = div_tenors,
-    simulation_dates = sim_dates_extended,
-    valuation_date   = val_date,
-    output_tenors    = div_tenors,
-    n_paths          = N_PATHS,
-    interpolator     = reciprocal_time_interp,
-    frozen           = True,
-)
-
-# ── build cube ────────────────────────────────────────────────────────────────
-# _insert_extra_dates linearly interpolates the ZAR-SWAP curve and equity spot
-# to every averaging date, giving each its own path-specific slice — the same
-# effect as RiskFlow's Dynamic_Scenario_Dates.
-builder = build_cube_from_dataframes(
-    valuation_date = val_date,
-    curve_dfs      = {"ZAR-SWAP": zar_swap},
-    scalar_dfs     = {equity_name: spot_sims},
-    extra_dates    = extra_dates,
-)
-builder.add_curve_factor(div_name, div_paths, div_tenors, div_dates)
-cube = builder.build()
-
-# ── portfolio ─────────────────────────────────────────────────────────────────
-trade = Trade(
-    trade_id        = "asian-001",
-    counterparty_id = "ABC_CORP",
-    instrument      = equity_asian,
-    notional_scale  = 1.0,
-)
-netting_set = NettingSet(
-    netting_set_id  = "NS_ABC",
-    counterparty_id = "ABC_CORP",
-    trades          = [trade],
-    csa             = None,
-)
-
-# ── run ───────────────────────────────────────────────────────────────────────
-engine  = ExposureEngine(cube=cube)
-profile = engine.compute(netting_set)
-
-mtm_validation = pd.DataFrame(
-    profile.mtm.T,
-    index   = list(profile.dates),
-    columns = list(range(profile.n_paths)),
-)
-
-# ── compare with RiskFlow ─────────────────────────────────────────────────────
-mtm_riskflow = load_mtm_dataframe_from_results(json_path, overrides)
-mtm_riskflow = strip_time_from_index(mtm_riskflow)
-
-compare_mtm_in_excel(mtm_riskflow, mtm_validation, comparison_path, filename=file_name)
+    return pd.DataFrame(
+        gross_mtm,
+        index   = [d.date() for d in all_dates],
+        columns = range(gross_mtm.shape[1]),
+    )
