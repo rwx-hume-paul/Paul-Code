@@ -1,44 +1,44 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Callable, cast
+from typing import Callable, TYPE_CHECKING, cast
 
 import numpy as np
 
 from instruments.instrument import Instrument
-from market_data.risk_factor import CurveSlice, RiskFactorSlice
+from market_data.risk_factor import CurveSlice, ScalarSlice, RiskFactorSlice
 from market_data.yield_curve import YieldCurve
-from models.equity_pv import black76_euro_option
-from utils.interpolation import (
-    forward_price_interpolator,
-    linear_interpolator,
-    get_forward_price_from_slice,
-    excel_serials_to_year_fracs,
-)
+from models.equity_pv import equity_forward_price, black76_euro_option
 from utils.ql_helpers import (
     DAY_COUNTERS,
-    advance_business_days,
     generate_business_days,
     to_ql_date,
 )
 
+if TYPE_CHECKING:
+    from market_data.vol_surface import BenchmarkVolSkew
 
-class CommodityAsian(Instrument):
-    """Arithmetically averaged Asian commodity option priced via moment matching.
+
+class EquityAsian(Instrument):
+    """Arithmetically averaged Asian equity option priced via moment matching.
 
     Daily fixing dates are generated as business days in [period_start, period_end].
-    The arithmetic average of future forward prices is matched to a log-normal
-    distribution using the first two moments, producing a single adjusted
-    volatility used in a Black-76 European option formula.
+    Each fixing's risk-neutral forward price is computed analytically from spot,
+    carry, and dividend curves via :func:`equity_forward_price`.  The arithmetic
+    average of future forwards is matched to a log-normal distribution using the
+    first two moments, producing a single adjusted volatility for a Black-76
+    European option.
 
     When some fixings have already been observed the strike is adjusted to
     account for the realized average so far, and only the remaining m future
-    fixings enter the moment-matching calculation.
+    fixings enter the moment-matching calculation.  Realized fixings are stored
+    as spot prices at each averaging date.
 
     Pricing model (m future fixings)
     ---------------------------------
-    Let F(i) = forward price at fixing i, vol(i) = vol at (K_eff, F(i), t(i)),
-    t(i) = year fraction from val_date to averaging date i.
+    Let F(i) = equity_forward_price at fixing i,
+        vol(i) = BenchmarkVolSkew.get_vol(strike_for_vol, t(i)),
+        t(i)   = year fraction from val_date to averaging date i.
 
         M1 = (1/m) Σᵢ F(i)
 
@@ -52,10 +52,8 @@ class CommodityAsian(Instrument):
 
     Strike adjustment for past fixings (n_past past, m future, n_total = n_past + m):
 
-        K_eff = (n_total / m) × K − (n_past / m) × S̄_past
-
-    where S̄_past is the arithmetic mean of realized past prices.
-    Vol moneyness is computed using K_eff when past fixings are present.
+        K_eff        = (n_total / m) × K − (n_past / m) × S̄_past
+        strike_for_vol = K − past_sum / n_total   (RiskFlow moneyness convention)
 
     Parameters
     ----------
@@ -68,35 +66,36 @@ class CommodityAsian(Instrument):
     settlement_date : date
         Date on which the settled payoff is paid; used only for discounting.
     strike : float
-        Option strike in the forward price currency (USD for non-composite).
+        Option strike.
     notional : float
-        Contract notional (number of units).
+        Contract notional.
     is_call : bool
         True for a call (buyer benefits when average > strike).
-    vol_surface : NonPreciousCommodityVol | MalzVol
-        Volatility surface.  Must expose
-        ``get_vol(strike, forward, tenor) → float | ndarray``.
-    forward_curve_name : str
-        Risk-factor name for the commodity forward CurveSlice.
+    vol_surface : BenchmarkVolSkew
+        Equity implied-vol skew surface.
+    spot_name : str
+        Risk-factor name for the equity spot price (scalar).
+    carry_curve_name : str
+        Risk-factor name for the carry / funding curve.
     discount_curve_name : str
-        Risk-factor name for the discount CurveSlice.
+        Risk-factor name for the discount curve.
+    dividend_curve_name : str
+        Risk-factor name for the continuous dividend yield curve.
     averaging_calendar : str
         Calendar key used to enumerate business days in the averaging window.
-    lag_calendar : str
-        Calendar key used to advance each averaging date by ``pricing_lag``
-        business days to obtain the effective forward-curve lookup date.
-    forward_interpolator : callable
-        Interpolator factory for the forward curve (default: forward-price
-        log-linear).
+    carry_interpolator : callable
+        Interpolator factory for the carry curve.
+    dividend_interpolator : callable
+        Interpolator factory for the dividend yield curve.
     discount_interpolator : callable
-        Interpolator factory for the discount curve (default: linear).
-    pricing_lag : int
-        Business-day lag for forward-curve lookup (1 for ICE Brent,
-        2 for NYMEX WTI).  Default 1.
+        Interpolator factory for the discount curve.
     day_count : str
         Day-count convention key (default ``"ACT/365"``).
     direction : int
         ``+1`` for long, ``-1`` for short.  Default ``+1``.
+    sticky : str
+        Stickiness convention passed to ``vol_surface.get_vol``
+        (``'strike'`` or ``'delta'``).  Default ``'strike'``.
     """
 
     def __init__(
@@ -108,16 +107,18 @@ class CommodityAsian(Instrument):
         strike: float,
         notional: float,
         is_call: bool,
-        vol_surface,
-        forward_curve_name: str,
+        vol_surface: BenchmarkVolSkew,
+        spot_name: str,
+        carry_curve_name: str,
         discount_curve_name: str,
+        dividend_curve_name: str,
         averaging_calendar: str,
-        lag_calendar: str,
-        forward_interpolator: Callable = forward_price_interpolator,
-        discount_interpolator: Callable = linear_interpolator,
-        pricing_lag: int = 1,
+        carry_interpolator: Callable,
+        dividend_interpolator: Callable,
+        discount_interpolator: Callable,
         day_count: str = "ACT/365",
         direction: int = 1,
+        sticky: str = "strike",
     ) -> None:
         super().__init__(name)
         self.period_start = period_start
@@ -127,21 +128,20 @@ class CommodityAsian(Instrument):
         self.notional = notional
         self.is_call = is_call
         self.vol_surface = vol_surface
-        self.forward_curve_name = forward_curve_name
+        self.spot_name = spot_name
+        self.carry_curve_name = carry_curve_name
         self.discount_curve_name = discount_curve_name
-        self.forward_interpolator = forward_interpolator
+        self.dividend_curve_name = dividend_curve_name
+        self.carry_interpolator = carry_interpolator
+        self.dividend_interpolator = dividend_interpolator
         self.discount_interpolator = discount_interpolator
-        self.pricing_lag = pricing_lag
         self.direction = direction
+        self.sticky = sticky
         self._dc = DAY_COUNTERS[day_count]
 
         self._averaging_dates: list[date] = generate_business_days(
             period_start, period_end, averaging_calendar,
         )
-        self._pricing_dates: list[date] = [
-            advance_business_days(d, pricing_lag, lag_calendar)
-            for d in self._averaging_dates
-        ]
 
     # ------------------------------------------------------------------
     # Pricing
@@ -154,7 +154,7 @@ class CommodityAsian(Instrument):
         fixings: dict[tuple[str, date], np.ndarray] | None = None,
         rng: np.random.Generator | None = None,
     ) -> np.ndarray:
-        """Compute per-path NPV of the Asian commodity option.
+        """Compute per-path NPV of the Asian equity option.
 
         Parameters
         ----------
@@ -163,8 +163,8 @@ class CommodityAsian(Instrument):
         market_state : dict
             Mapping from risk-factor name to RiskFactorSlice.
         fixings : dict or None
-            Realized forward prices for past averaging dates.
-            Key: ``(forward_curve_name, averaging_date)`` →
+            Realized spot prices for past averaging dates.
+            Key: ``(spot_name, averaging_date)`` →
             ``np.ndarray (n_paths,)`` or scalar.
         rng : ignored.
 
@@ -172,57 +172,51 @@ class CommodityAsian(Instrument):
         -------
         np.ndarray, shape (n_paths,)
         """
-        disc_slice = cast(CurveSlice, market_state[self.discount_curve_name])
-        n_paths = disc_slice.values.shape[0]
+        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
+        spot = spot_slice.values  # (n_paths,)
+        n_paths = spot.shape[0]
 
         if val_date > self.settlement_date:
             return np.zeros(n_paths)
 
+        carry_slice = cast(CurveSlice, market_state[self.carry_curve_name])
+        carry_curve = YieldCurve(
+            carry_slice.tenors, carry_slice.values, self.carry_interpolator,
+        )
+
+        div_slice = cast(CurveSlice, market_state[self.dividend_curve_name])
+        div_curve = YieldCurve(
+            div_slice.tenors, div_slice.values, self.dividend_interpolator,
+        )
+
+        disc_slice = cast(CurveSlice, market_state[self.discount_curve_name])
         disc_curve = YieldCurve(
             disc_slice.tenors, disc_slice.values, self.discount_interpolator,
         )
+
         T_settle = float(self._dc.yearFraction(
             to_ql_date(val_date), to_ql_date(self.settlement_date),
         ))
         df = disc_curve.discount_factor(T_settle)
 
-        fwd_slice = cast(CurveSlice, market_state[self.forward_curve_name])
-        fwd_tenors_yf = excel_serials_to_year_fracs(
-            fwd_slice.tenors, val_date, self._dc,
-        )
-        right_extrap = (
-            "flat"
-            if self.forward_interpolator is linear_interpolator
-            else "linear"
-        )
-
         _fix: dict = fixings if fixings is not None else {}
         n_total = len(self._averaging_dates)
 
-        def _get_price(avg_date: date, pricing_date: date) -> np.ndarray:
-            key = (self.forward_curve_name, avg_date)
+        def _get_fixing(avg_date: date) -> np.ndarray:
+            """Return realized spot price for a past averaging date."""
+            key = (self.spot_name, avg_date)
             if key in _fix:
                 f = np.asarray(_fix[key], dtype=np.float64)
                 return np.full(n_paths, float(f)) if f.ndim == 0 else f
-            return get_forward_price_from_slice(
-                curve_serial_tenors=fwd_slice.tenors,
-                curve_values=fwd_slice.values,
-                value_date=val_date,
-                target_date=pricing_date,
-                day_counter=self._dc,
-                right_extrapolation=right_extrap,
-                left_extrapolation="flat",
-                _precomputed_tenors_yf=fwd_tenors_yf,
-            )
+            return spot.copy()
 
         # ------------------------------------------------------------------
         # At or past period end: all fixings realized — intrinsic payoff
-        # Uses full average and original strike K (no adjusted-strike formula).
         # ------------------------------------------------------------------
         if val_date >= self.period_end:
             price_sum = np.zeros(n_paths)
-            for avg_date, pricing_date in zip(self._averaging_dates, self._pricing_dates):
-                price_sum += _get_price(avg_date, pricing_date)
+            for avg_date in self._averaging_dates:
+                price_sum += _get_fixing(avg_date)
             S_avg = price_sum / n_total
             if self.is_call:
                 payoff = np.maximum(S_avg - self.strike, 0.0)
@@ -231,16 +225,16 @@ class CommodityAsian(Instrument):
             return self.direction * payoff * self.notional * df
 
         # ------------------------------------------------------------------
-        # Accumulate realized prices for past averaging dates (pre-expiry)
+        # Accumulate realized spot prices for past averaging dates
         # ------------------------------------------------------------------
         past_sum = np.zeros(n_paths)
         n_past = 0
 
-        for avg_date, pricing_date in zip(self._averaging_dates, self._pricing_dates):
+        for avg_date in self._averaging_dates:
             if avg_date > val_date:
                 break
             n_past += 1
-            past_sum += _get_price(avg_date, pricing_date)
+            past_sum += _get_fixing(avg_date)
 
         n_future = n_total - n_past
 
@@ -248,20 +242,10 @@ class CommodityAsian(Instrument):
         # Effective strike adjusted for any past fixings
         # ------------------------------------------------------------------
         if n_past > 0:
-            S_avg_past = past_sum / n_past
-            # K_eff is the Black-76 strike that reproduces the correct payoff.
-            # K_eff is per-path (n_paths,) when S_avg_past is path-dependent.
             K_eff: float | np.ndarray = (
                 (n_total / n_future) * self.strike
-                - (n_past / n_future) * S_avg_past
+                - (n_past / n_future) * (past_sum / n_past)
             )
-            # strike_bar is used only for vol-surface moneyness lookups.
-            # It equals K - accumulated_past_weighted_avg = K - past_sum/n_total,
-            # matching RiskFlow's convention (strike_bar = Strike - average where
-            # average = Σ past_weight_i * F_i with weight = 1/n_total).
-            # K_eff = (n_total/n_future) * strike_bar, so using K_eff for vol
-            # moneyness inflates the effective moneyness by n_total/n_future and
-            # causes divergence from RiskFlow once averaging starts.
             strike_for_vol: float | np.ndarray = self.strike - past_sum / n_total
         else:
             K_eff = float(self.strike)
@@ -277,38 +261,34 @@ class CommodityAsian(Instrument):
         M1_sum = np.zeros(n_paths)
         M2_diag = np.zeros(n_paths)
         M2_cross = np.zeros(n_paths)
-        # Running sum Σᵢ<ⱼ F(i) exp(vol(i)² t(i)) — updated as j advances
         running_weighted = np.zeros(n_paths)
 
-        for avg_date, pricing_date in zip(self._averaging_dates, self._pricing_dates):
+        for avg_date in self._averaging_dates:
             if avg_date <= val_date:
                 continue
 
             t_i = float(self._dc.yearFraction(
                 to_ql_date(val_date), to_ql_date(avg_date),
             ))
-            F_i = get_forward_price_from_slice(
-                curve_serial_tenors=fwd_slice.tenors,
-                curve_values=fwd_slice.values,
-                value_date=val_date,
-                target_date=pricing_date,
-                day_counter=self._dc,
-                right_extrapolation=right_extrap,
-                left_extrapolation="flat",
-                _precomputed_tenors_yf=fwd_tenors_yf,
-            )  # (n_paths,)
+            F_i, _, _ = equity_forward_price(spot, carry_curve, div_curve, t_i)
 
             vol_i = np.asarray(
-                self.vol_surface.get_vol(strike_for_vol, F_i, t_i), dtype=np.float64,
+                self.vol_surface.get_vol(
+                    strike=strike_for_vol,
+                    tenor=t_i,
+                    forward_skew=F_i if self.sticky == "delta" else None,
+                    forward_expiry=F_i if self.sticky == "delta" else None,
+                    sticky=self.sticky,
+                ),
+                dtype=np.float64,
             )
             if vol_i.ndim == 0:
                 vol_i = np.full(n_paths, float(vol_i))
 
-            exp_var_i = np.exp(vol_i ** 2 * t_i)   # exp(σᵢ² tᵢ)
+            exp_var_i = np.exp(vol_i ** 2 * t_i)
 
-            # Cross terms: F(j) × Σᵢ<ⱼ [F(i) exp(σᵢ² tᵢ)]
             M2_cross += F_i * running_weighted
-            running_weighted += F_i * exp_var_i     # update for next j
+            running_weighted += F_i * exp_var_i
 
             M2_diag += F_i ** 2 * exp_var_i
             M1_sum += F_i
@@ -316,7 +296,6 @@ class CommodityAsian(Instrument):
         M1 = M1_sum / n_future
         M2 = (M2_diag + 2.0 * M2_cross) / (n_future ** 2)
 
-        # Adjusted vol — guard against numerical edge cases
         safe_M1 = np.maximum(M1, 1e-12)
         log_ratio = np.log(np.maximum(M2, safe_M1 ** 2)) - 2.0 * np.log(safe_M1)
         log_ratio = np.maximum(log_ratio, 0.0)
@@ -340,7 +319,7 @@ class CommodityAsian(Instrument):
         return pv
 
     # ------------------------------------------------------------------
-    # Commodity fixing interface (called by ExposureEngine)
+    # Fixing interface (called by ExposureEngine)
     # ------------------------------------------------------------------
 
     def compute_commodity_fixings(
@@ -349,15 +328,15 @@ class CommodityAsian(Instrument):
         sim_date: date,
         existing_fixings: dict | None = None,
     ) -> dict:
-        """Stamp realized forward prices for newly past averaging dates.
+        """Stamp realized spot prices for newly past averaging dates.
 
-        Called by ExposureEngine at each simulation step before
-        scenario_npvs.  Returns only the new fixings stamped at this step;
-        the caller merges them into its accumulator.
+        Called by ExposureEngine at each simulation step before scenario_npvs.
+        Returns only the new fixings stamped at this step; the caller merges
+        them into its accumulator.
 
         Each averaging date is stamped exactly once — at the first sim step
-        where avg_date <= sim_date — using the forward curve from that step.
-        Subsequent steps skip it, locking realized prices into the path.
+        where avg_date <= sim_date — locking the realized spot price into the
+        path.
         """
         _existing = existing_fixings or {}
         new_fixings: dict = {}
@@ -365,33 +344,17 @@ class CommodityAsian(Instrument):
         if not self._averaging_dates or self._averaging_dates[0] > sim_date:
             return {}
 
-        fwd_slice = cast(CurveSlice, market_state[self.forward_curve_name])
-        fwd_tenors_yf = excel_serials_to_year_fracs(
-            fwd_slice.tenors, sim_date, self._dc,
-        )
-        right_extrap = (
-            "flat"
-            if self.forward_interpolator is linear_interpolator
-            else "linear"
-        )
+        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
+        spot = spot_slice.values  # (n_paths,)
 
-        for avg_date, pricing_date in zip(self._averaging_dates, self._pricing_dates):
+        for avg_date in self._averaging_dates:
             if avg_date > sim_date:
                 break
 
-            key = (self.forward_curve_name, avg_date)
+            key = (self.spot_name, avg_date)
             if key in _existing:
                 continue
 
-            new_fixings[key] = get_forward_price_from_slice(
-                curve_serial_tenors=fwd_slice.tenors,
-                curve_values=fwd_slice.values,
-                value_date=sim_date,
-                target_date=pricing_date,
-                day_counter=self._dc,
-                right_extrapolation=right_extrap,
-                left_extrapolation="flat",
-                _precomputed_tenors_yf=fwd_tenors_yf,
-            )
+            new_fixings[key] = spot.copy()
 
         return new_fixings
