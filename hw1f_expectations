@@ -1,31 +1,72 @@
+        # ------------------------------------------------------------------
+        M1_sum = np.zeros(n_paths)
+        M2_diag = np.zeros(n_paths)
+        M2_cross = np.zeros(n_paths)
+        running_weighted = np.zeros(n_paths)
 
-def load_full_grid_mtm_from_results(
-    json_path: str,
-    overrides: dict,
-) -> pd.DataFrame:
-    """Extract RiskFlow GrossMTM at ALL simulation dates.
+        # DEBUG -----------------------------------------------------------
+        _debug_rows: list[dict] = []
+        # -----------------------------------------------------------------
 
-    Unlike load_mtm_dataframe_from_results (which returns the Time_grid
-    report dates only), this reads cr["GrossMTM"][0] at the full internal
-    time_grid.mtm_dates — which includes dates added via Dynamic_Scenario_Dates
-    such as Asian option averaging dates.
+        for avg_date in self._averaging_dates:
+            if avg_date < val_date:
+                continue
 
-    Returns
-    -------
-    pd.DataFrame
-        Index   : datetime.date, one row per simulation date
-        Columns : int, 0-based path index
-    """
-    cx = rf.Context()
-    cx.load_json(json_path)
-    calc, out = cx.run_job(overrides=overrides)
+            t_i = float(self._dc.yearFraction(
+                to_ql_date(val_date), to_ql_date(avg_date),
+            ))
 
-    cr        = out["Netting"].sub_structures[0].obj.Calc_res
-    all_dates = sorted(calc.time_grid.mtm_dates)
-    gross_mtm = cr["GrossMTM"][0]          # (n_all_dates, n_paths)
+            # Forward price using constant or stepped dividend yield.
+            # q is pre-dividend for dates before T_div, post-dividend after.
+            r_i = carry_curve.get_rate(t_i)
+            q_i = q_pre if (self.div_date is not None and avg_date < self.div_date) else q_post
+            F_i = spot * np.exp((r_i - q_i) * t_i)
 
-    return pd.DataFrame(
-        gross_mtm,
-        index   = [d.date() for d in all_dates],
-        columns = range(gross_mtm.shape[1]),
-    )
+            vol_i = np.asarray(
+                self.vol_surface.get_vol(
+                    strike=strike_for_vol,
+                    tenor=t_i,
+                    forward_skew=F_i if self.sticky == "delta" else None,
+                    forward_expiry=F_i if self.sticky == "delta" else None,
+                    sticky=self.sticky,
+                ),
+                dtype=np.float64,
+            )
+            if vol_i.ndim == 0:
+                vol_i = np.full(n_paths, float(vol_i))
+
+            exp_var_i = np.exp(vol_i ** 2 * t_i)
+
+            # DEBUG -----------------------------------------------------------
+            _debug_rows.append({
+                "val_date":  val_date,
+                "avg_date":  avg_date,
+                "t_i":       round(t_i, 6),
+                "spot":      float(spot[0]),
+                "r_i":       float(np.asarray(r_i).flat[0]),
+                "q_i":       float(np.asarray(q_i).flat[0]),
+                "F_i":       float(F_i[0]),
+                "vol_i":     float(vol_i[0]),
+                "exp_var_i": float(exp_var_i[0]),
+            })
+            # -----------------------------------------------------------------
+
+            M2_cross += F_i * running_weighted
+            running_weighted += F_i * exp_var_i
+
+            M2_diag += F_i ** 2 * exp_var_i
+            M1_sum += F_i
+
+        # DEBUG ---------------------------------------------------------------
+        if _debug_rows:
+            import os, pandas as _pd
+            _debug_path = os.path.join(os.path.dirname(__file__), "..", "debug_forwards.csv")
+            _debug_path = os.path.normpath(_debug_path)
+            _df = _pd.DataFrame(_debug_rows)
+            _df.to_csv(
+                _debug_path,
+                mode="a",
+                header=not os.path.exists(_debug_path),
+                index=False,
+            )
+        # ---------------------------------------------------------------------
