@@ -1,72 +1,281 @@
-        # ------------------------------------------------------------------
-        M1_sum = np.zeros(n_paths)
-        M2_diag = np.zeros(n_paths)
-        M2_cross = np.zeros(n_paths)
-        running_weighted = np.zeros(n_paths)
+from datetime import date
 
-        # DEBUG -----------------------------------------------------------
-        _debug_rows: list[dict] = []
-        # -----------------------------------------------------------------
+import pandas as pd
 
-        for avg_date in self._averaging_dates:
-            if avg_date < val_date:
+from importers.df_importer import build_cube_from_dataframes
+from instruments.equity_forward import EquityForwardDiscreteDividends
+from portfolio.netting_set import NettingSet
+from portfolio.trade import Trade
+from pricing.exposure_engine import ExposureEngine
+from utils.comparison import compare_mtm_in_excel
+from utils.extract import collect_risk_factor_dataframes, load_mtm_dataframe_from_results, strip_time_from_index
+from utils.interpolation import hermite_rt_interp
+
+json_path       = r"x"
+comparison_path = r"y"
+file_name       = "EQ-FWD-DISC-DIV-Compare.xlsx"
+
+DISC_NAME   = "InterestRate.ZAR-SWAP"
+CARRY_NAME  = "InterestRate.ZAR-SWAP"
+equity_name = "EquityPrice.ZAR_NRP"
+val_date    = date(2025, 7, 28)
+N_PATHS     = 500
+
+overrides = {
+    'Object':             "CreditMonteCarlo",
+    'Calc_Scenarios':     'Yes',
+    'Time_grid':          '0d 2d 1w(1w) 3m(1m) 2y(3m)',
+    'Batch_Size':         1,
+    'Simulation_Batches': N_PATHS,
+    'Random_Seed':        8,
+    'Percentile':         '95, 99',
+}
+
+# ── raw market data ───────────────────────────────────────────────────────────
+risk_keys    = [equity_name, DISC_NAME]
+risk_factors = collect_risk_factor_dataframes(
+    json_path=json_path, overrides=overrides, risk_keys=risk_keys,
+)
+zar_swap  = risk_factors[DISC_NAME].reset_index()
+spot_sims = risk_factors[equity_name].reset_index()
+spot_sims = spot_sims.drop(columns=["tenor"])
+
+# ── dividend schedule ─────────────────────────────────────────────────────────
+# Each entry: (ex_dividend_date, cash_dividend_amount_in_ZAR_per_share)
+# Dividends whose ex-date falls on or after end_date are ignored automatically.
+dividend_schedule = [
+    (date(2025, 9, 15),  3.50),   # interim dividend
+    (date(2026, 3, 20),  4.25),   # final dividend
+]
+
+# ── instrument ────────────────────────────────────────────────────────────────
+fwd = EquityForwardDiscreteDividends(
+    name                 = "eq_fwd_disc_div",
+    end_date             = date(2026, 6, 30),
+    agreed_forward       = 145.00,
+    nominal              = 10_000,
+    spot_name            = equity_name,
+    carry_curve_name     = CARRY_NAME,
+    discount_curve_name  = DISC_NAME,
+    carry_interpolator   = hermite_rt_interp,
+    discount_interpolator= hermite_rt_interp,
+    dividend_schedule    = dividend_schedule,
+    day_count            = "ACT/365",
+)
+
+# ── build cube ────────────────────────────────────────────────────────────────
+builder = build_cube_from_dataframes(
+    valuation_date = val_date,
+    curve_dfs      = {"ZAR-SWAP": zar_swap},
+    scalar_dfs     = {equity_name: spot_sims},
+)
+cube = builder.build()
+
+# ── portfolio ─────────────────────────────────────────────────────────────────
+trade = Trade(
+    trade_id        = "eq-fwd-disc-div-001",
+    counterparty_id = "ABC_CORP",
+    instrument      = fwd,
+    notional_scale  = 1.0,
+)
+netting_set = NettingSet(
+    netting_set_id  = "NS_ABC",
+    counterparty_id = "ABC_CORP",
+    trades          = [trade],
+    csa             = None,
+)
+
+# ── run ───────────────────────────────────────────────────────────────────────
+engine  = ExposureEngine(cube=cube)
+profile = engine.compute(netting_set)
+
+mtm_validation = pd.DataFrame(
+    profile.mtm.T,
+    index   = list(profile.dates),
+    columns = list(range(profile.n_paths)),
+)
+
+# ── compare with RiskFlow ─────────────────────────────────────────────────────
+mtm_riskflow = load_mtm_dataframe_from_results(json_path, overrides)
+mtm_riskflow = strip_time_from_index(mtm_riskflow)
+
+compare_mtm_in_excel(mtm_riskflow, mtm_validation, comparison_path, filename=file_name)
+
+
+
+
+def equity_forward_price(
+    spot: np.ndarray,
+    carry_curve: YieldCurve,
+    dividend_curve: YieldCurve | None,
+    T: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute the equity forward price, carry discount factor, and cost-of-carry rate.
+
+    Parameters
+    ----------
+    spot : np.ndarray
+        Spot prices, shape (n_paths,).  When using discrete dividends, pass
+        the dividend-adjusted spot S'(t) and set ``dividend_curve=None``.
+    carry_curve : YieldCurve
+        Carry / funding rate curve.
+    dividend_curve : YieldCurve or None
+        Continuous dividend yield curve.  Pass ``None`` when the spot has
+        already been stripped of future dividends (discrete-dividend case).
+    T : float
+        Time to maturity in years.
+
+    Returns
+    -------
+    F : np.ndarray
+        Forward price, shape (n_paths,).
+    df : np.ndarray
+        Discount factor = exp(-r * T), shape (n_paths,).
+    r : np.ndarray
+        Carry rate at tenor T, shape (n_paths,).
+    """
+    r = carry_curve.get_rate(T)      # (n_paths,)
+
+    if dividend_curve is not None:
+        q = dividend_curve.get_rate(T)
+        F = spot * np.exp((r - q) * T)
+    else:
+        F = spot * np.exp(r * T)
+
+    df = np.exp(-r * T)
+
+    return F, df, r
+
+
+
+
+class EquityForwardDiscreteDividends(Instrument):
+    """Equity forward priced with an explicit discrete-dividend schedule.
+
+    On each simulation date t the stock price is stripped of the present
+    value of all future discrete dividends whose ex-dividend date falls
+    strictly after t and strictly before end_date:
+
+        S'(t) = S(t) - Σ  div_i × DF(t → ex_date_i)
+
+    The forward price is then grown at the risk-free carry rate only:
+
+        F(T) = S'(t) × exp(r × T)
+
+    and the NPV is:
+
+        NPV = (F(T) - K) × nominal × DF(t → T)
+
+    Parameters
+    ----------
+    name : str
+        Trade identifier.
+    end_date : date
+        Maturity / delivery date of the forward.
+    agreed_forward : float
+        Forward price agreed at inception (strike).
+    nominal : float
+        Notional amount.
+    spot_name : str
+        Risk-factor name for the equity spot price.
+    carry_curve_name : str
+        Risk-factor name for the carry / funding rate curve.
+    discount_curve_name : str
+        Risk-factor name for the discount curve.
+    carry_interpolator : callable
+        Interpolator factory for the carry curve.
+    discount_interpolator : callable
+        Interpolator factory for the discount curve.
+    dividend_schedule : list of (date, float)
+        Each entry is (ex_dividend_date, dividend_amount).  Dividends whose
+        ex-date falls on or after end_date are silently ignored at
+        construction time.
+    day_count : str
+        Day-count convention key (default ``"ACT/365"``).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        end_date: date,
+        agreed_forward: float,
+        nominal: float,
+        spot_name: str,
+        carry_curve_name: str,
+        discount_curve_name: str,
+        carry_interpolator: Callable,
+        discount_interpolator: Callable,
+        dividend_schedule: list[tuple[date, float]],
+        day_count: str = "ACT/365",
+    ) -> None:
+        super().__init__(name)
+        self.end_date = end_date
+        self.agreed_forward = agreed_forward
+        self.nominal = nominal
+        self.spot_name = spot_name
+        self.carry_curve_name = carry_curve_name
+        self.discount_curve_name = discount_curve_name
+        self.carry_interpolator = carry_interpolator
+        self.discount_interpolator = discount_interpolator
+        self._dc = DAY_COUNTERS[day_count]
+        # Pre-filter: only keep dividends that fall before end_date
+        self._dividends: list[tuple[date, float]] = [
+            (ex_date, amount)
+            for ex_date, amount in dividend_schedule
+            if ex_date < end_date
+        ]
+
+    def scenario_cashflows(
+        self,
+        val_date: date,
+        market_state: dict[str, RiskFactorSlice],
+        fixings: dict | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        """Settlement cashflow on maturity date: (S(T) - K) × nominal."""
+        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
+        if val_date != self.end_date:
+            return np.zeros(spot_slice.values.shape[0])
+        return (spot_slice.values - self.agreed_forward) * self.nominal
+
+    def scenario_npvs(
+        self,
+        val_date: date,
+        market_state: dict[str, RiskFactorSlice],
+        _fixings: dict | None = None,
+        _rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        from utils.ql_helpers import to_ql_date
+
+        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
+        spot = spot_slice.values  # (n_paths,)
+        n_paths = spot.shape[0]
+
+        if val_date > self.end_date:
+            return np.zeros(n_paths)
+
+        T = float(self._dc.yearFraction(to_ql_date(val_date), to_ql_date(self.end_date)))
+
+        carry_slice = cast(CurveSlice, market_state[self.carry_curve_name])
+        carry_curve = YieldCurve(carry_slice.tenors, carry_slice.values, self.carry_interpolator)
+
+        disc_slice = cast(CurveSlice, market_state[self.discount_curve_name])
+        disc_curve = YieldCurve(disc_slice.tenors, disc_slice.values, self.discount_interpolator)
+
+        # Strip future dividends from the spot price
+        pv_divs = np.zeros(n_paths)
+        for ex_date, amount in self._dividends:
+            if ex_date <= val_date:
                 continue
+            T_div = float(self._dc.yearFraction(to_ql_date(val_date), to_ql_date(ex_date)))
+            pv_divs += amount * disc_curve.discount_factor(T_div)
 
-            t_i = float(self._dc.yearFraction(
-                to_ql_date(val_date), to_ql_date(avg_date),
-            ))
+        S_prime = spot - pv_divs
 
-            # Forward price using constant or stepped dividend yield.
-            # q is pre-dividend for dates before T_div, post-dividend after.
-            r_i = carry_curve.get_rate(t_i)
-            q_i = q_pre if (self.div_date is not None and avg_date < self.div_date) else q_post
-            F_i = spot * np.exp((r_i - q_i) * t_i)
+        # Forward: grow dividend-stripped spot at risk-free carry rate only
+        F, _, _ = equity_forward_price(S_prime, carry_curve, None, T)
 
-            vol_i = np.asarray(
-                self.vol_surface.get_vol(
-                    strike=strike_for_vol,
-                    tenor=t_i,
-                    forward_skew=F_i if self.sticky == "delta" else None,
-                    forward_expiry=F_i if self.sticky == "delta" else None,
-                    sticky=self.sticky,
-                ),
-                dtype=np.float64,
-            )
-            if vol_i.ndim == 0:
-                vol_i = np.full(n_paths, float(vol_i))
+        df = disc_curve.discount_factor(T)
 
-            exp_var_i = np.exp(vol_i ** 2 * t_i)
+        return (F - self.agreed_forward) * self.nominal * df
 
-            # DEBUG -----------------------------------------------------------
-            _debug_rows.append({
-                "val_date":  val_date,
-                "avg_date":  avg_date,
-                "t_i":       round(t_i, 6),
-                "spot":      float(spot[0]),
-                "r_i":       float(np.asarray(r_i).flat[0]),
-                "q_i":       float(np.asarray(q_i).flat[0]),
-                "F_i":       float(F_i[0]),
-                "vol_i":     float(vol_i[0]),
-                "exp_var_i": float(exp_var_i[0]),
-            })
-            # -----------------------------------------------------------------
-
-            M2_cross += F_i * running_weighted
-            running_weighted += F_i * exp_var_i
-
-            M2_diag += F_i ** 2 * exp_var_i
-            M1_sum += F_i
-
-        # DEBUG ---------------------------------------------------------------
-        if _debug_rows:
-            import os, pandas as _pd
-            _debug_path = os.path.join(os.path.dirname(__file__), "..", "debug_forwards.csv")
-            _debug_path = os.path.normpath(_debug_path)
-            _df = _pd.DataFrame(_debug_rows)
-            _df.to_csv(
-                _debug_path,
-                mode="a",
-                header=not os.path.exists(_debug_path),
-                index=False,
-            )
-        # ---------------------------------------------------------------------
