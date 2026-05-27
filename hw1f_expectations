@@ -1,43 +1,61 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Callable, TYPE_CHECKING, cast
+from typing import Callable, cast
 
 import numpy as np
 
 from instruments.instrument import Instrument
-from market_data.risk_factor import CurveSlice, ScalarSlice, RiskFactorSlice
+from market_data.risk_factor import CurveSlice, RiskFactorSlice
 from market_data.yield_curve import YieldCurve
-from models.equity_pv import fx_forward_price, black76_euro_option
+from models.equity_pv import black76_euro_option
+from utils.interpolation import (
+    forward_price_interpolator,
+    linear_interpolator,
+    get_forward_price_from_slice,
+    excel_serials_to_year_fracs,
+)
 from utils.ql_helpers import (
     DAY_COUNTERS,
+    advance_business_days,
     generate_business_days,
     to_ql_date,
 )
 
-if TYPE_CHECKING:
-    from market_data.vol_surface import MalzVol
 
-
-class FXAsian(Instrument):
-    """Arithmetically averaged Asian FX option priced via moment matching.
+class CommodityAsian(Instrument):
+    """Arithmetically averaged Asian commodity option priced via moment matching.
 
     Daily fixing dates are generated as business days in [period_start, period_end].
-    The risk-neutral FX forward for each averaging date is computed via
-    :func:`fx_forward_price` using covered-interest parity.  The arithmetic
-    average of future forwards is matched to a log-normal distribution using
-    Turnbull-Wakeman moment matching, producing a single adjusted volatility
-    for a Black-76 European option.
+    The arithmetic average of future forward prices is matched to a log-normal
+    distribution using the first two moments, producing a single adjusted
+    volatility used in a Black-76 European option formula.
 
     When some fixings have already been observed the strike is adjusted to
-    account for the realized average so far.
+    account for the realized average so far, and only the remaining m future
+    fixings enter the moment-matching calculation.
 
-    FX spot resolution
-    ------------------
-    Either pass ``fx_spot_name`` (a direct CCYPAIR scalar risk factor) or pass
-    both ``domestic_fx_name`` and ``foreign_fx_name`` (each a CCY/USD scalar).
-    When the latter pair is given, spot is triangulated as:
-        spot = domestic_fx / foreign_fx  (e.g. ZAR/USD / EUR/USD = ZAR/EUR)
+    Pricing model (m future fixings)
+    ---------------------------------
+    Let F(i) = forward price at fixing i, vol(i) = vol at (K_eff, F(i), t(i)),
+    t(i) = year fraction from val_date to averaging date i.
+
+        M1 = (1/m) Σᵢ F(i)
+
+        M2 = (1/m²) [ Σᵢ F(i)² exp(vol(i)² t(i))
+                       + 2 Σⱼ Σᵢ<ⱼ F(i) F(j) exp(vol(i)² t(i)) ]
+
+        σ_adj = sqrt( (ln M2 − 2 ln M1) / T_expiry )
+
+        PV = direction × Black76(M1, K_eff, σ_adj, df(T_settle), T_expiry, is_call)
+             × notional × (m / n_total  if past fixings exist)
+
+    Strike adjustment for past fixings (n_past past, m future, n_total = n_past + m):
+
+        K_eff = (n_total / m) × K − (n_past / m) × S̄_past
+
+    where S̄_past is the arithmetic mean of realized past prices.
+    Vol moneyness is computed using K_eff when past fixings are present.
 
     Parameters
     ----------
@@ -50,45 +68,31 @@ class FXAsian(Instrument):
     settlement_date : date
         Date on which the settled payoff is paid; used only for discounting.
     strike : float
-        Option strike (domestic per 1 foreign).
+        Option strike in the forward price currency (USD for non-composite).
     notional : float
-        Contract notional in foreign currency.
+        Contract notional (number of units).
     is_call : bool
-        True for a call (right to buy foreign at strike).
-    vol_surface : MalzVol
-        Malz FX implied-vol surface.
-    domestic_basis : str
-        Risk factor name for the domestic basis / forecast curve
-        (e.g. ``"ZAR-USD-BASIS"``).
-    domestic_curve : str
-        Risk factor name for the domestic discount curve.
-    foreign_curve : str
-        Risk factor name for the foreign discount curve.
-    discount_curve : str
-        Risk factor name for the discount curve used to present-value the
-        payoff (typically the domestic discount curve).
+        True for a call (buyer benefits when average > strike).
+    vol_surface : NonPreciousCommodityVol | MalzVol
+        Volatility surface.  Must expose
+        ``get_vol(strike, forward, tenor) → float | ndarray``.
+    forward_curve_name : str
+        Risk-factor name for the commodity forward CurveSlice.
+    discount_curve_name : str
+        Risk-factor name for the discount CurveSlice.
     averaging_calendar : str
         Calendar key used to enumerate business days in the averaging window.
-    domestic_basis_interpolator : callable
-        Interpolator factory for the domestic basis curve.
-    domestic_curve_interpolator : callable
-        Interpolator factory for the domestic discount curve.
-    foreign_curve_interpolator : callable
-        Interpolator factory for the foreign discount curve.
+    lag_calendar : str
+        Calendar key used to advance each averaging date by ``pricing_lag``
+        business days to obtain the effective forward-curve lookup date.
+    forward_interpolator : callable
+        Interpolator factory for the forward curve (default: forward-price
+        log-linear).
     discount_interpolator : callable
-        Interpolator factory for the discount curve.
-    foreign_basis : str, optional
-        Risk factor name for the foreign basis / forecast curve
-        (e.g. ``"EUR-USD-BASIS"``).  When omitted its discount factor
-        defaults to 1.
-    foreign_basis_interpolator : callable, optional
-        Interpolator factory for the foreign basis curve.
-    fx_spot_name : str, optional
-        Risk factor name for the direct FX spot (domestic per 1 foreign).
-    domestic_fx_name : str, optional
-        Risk factor name for the domestic CCY/USD spot rate (e.g. ``"Fx.ZAR"``).
-    foreign_fx_name : str, optional
-        Risk factor name for the foreign CCY/USD spot rate (e.g. ``"Fx.EUR"``).
+        Interpolator factory for the discount curve (default: linear).
+    pricing_lag : int
+        Business-day lag for forward-curve lookup (1 for ICE Brent,
+        2 for NYMEX WTI).  Default 1.
     day_count : str
         Day-count convention key (default ``"ACT/365"``).
     direction : int
@@ -104,21 +108,14 @@ class FXAsian(Instrument):
         strike: float,
         notional: float,
         is_call: bool,
-        vol_surface: MalzVol,
-        domestic_basis: str,
-        domestic_curve: str,
-        foreign_curve: str,
-        discount_curve: str,
+        vol_surface,
+        forward_curve_name: str,
+        discount_curve_name: str,
         averaging_calendar: str,
-        domestic_basis_interpolator: Callable,
-        domestic_curve_interpolator: Callable,
-        foreign_curve_interpolator: Callable,
-        discount_interpolator: Callable,
-        foreign_basis: str | None = None,
-        foreign_basis_interpolator: Callable | None = None,
-        fx_spot_name: str | None = None,
-        domestic_fx_name: str | None = None,
-        foreign_fx_name: str | None = None,
+        lag_calendar: str,
+        forward_interpolator: Callable = forward_price_interpolator,
+        discount_interpolator: Callable = linear_interpolator,
+        pricing_lag: int = 1,
         day_count: str = "ACT/365",
         direction: int = 1,
     ) -> None:
@@ -130,71 +127,21 @@ class FXAsian(Instrument):
         self.notional = notional
         self.is_call = is_call
         self.vol_surface = vol_surface
-        self.domestic_basis = domestic_basis
-        self.domestic_curve = domestic_curve
-        self.foreign_curve = foreign_curve
-        self.discount_curve = discount_curve
-        self.domestic_basis_interpolator = domestic_basis_interpolator
-        self.domestic_curve_interpolator = domestic_curve_interpolator
-        self.foreign_curve_interpolator = foreign_curve_interpolator
+        self.forward_curve_name = forward_curve_name
+        self.discount_curve_name = discount_curve_name
+        self.forward_interpolator = forward_interpolator
         self.discount_interpolator = discount_interpolator
-        self.foreign_basis = foreign_basis
-        self.foreign_basis_interpolator = foreign_basis_interpolator
-        self.fx_spot_name = fx_spot_name
-        self.domestic_fx_name = domestic_fx_name
-        self.foreign_fx_name = foreign_fx_name
+        self.pricing_lag = pricing_lag
         self.direction = direction
         self._dc = DAY_COUNTERS[day_count]
 
         self._averaging_dates: list[date] = generate_business_days(
             period_start, period_end, averaging_calendar,
         )
-
-        # Canonical key used for fixing storage
-        self._spot_key: str = fx_spot_name or domestic_fx_name or ""
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _get_fx_spot(self, market_state: dict[str, RiskFactorSlice]) -> np.ndarray:
-        """Return FX spot (domestic per 1 foreign) from market state."""
-        if self.domestic_fx_name and self.foreign_fx_name:
-            dom = cast(ScalarSlice, market_state[self.domestic_fx_name])
-            fgn = cast(ScalarSlice, market_state[self.foreign_fx_name])
-            return dom.values / fgn.values
-        spot_slice = cast(ScalarSlice, market_state[self.fx_spot_name])
-        return spot_slice.values
-
-    def _build_curves(
-        self, market_state: dict[str, RiskFactorSlice]
-    ) -> tuple[YieldCurve, YieldCurve, YieldCurve, YieldCurve | None]:
-        """Build YieldCurves for forward pricing from market state."""
-        dom_basis_slice = cast(CurveSlice, market_state[self.domestic_basis])
-        dom_basis_curve = YieldCurve(
-            dom_basis_slice.tenors, dom_basis_slice.values,
-            self.domestic_basis_interpolator,
-        )
-
-        dom_slice = cast(CurveSlice, market_state[self.domestic_curve])
-        dom_curve = YieldCurve(
-            dom_slice.tenors, dom_slice.values, self.domestic_curve_interpolator,
-        )
-
-        for_slice = cast(CurveSlice, market_state[self.foreign_curve])
-        for_curve = YieldCurve(
-            for_slice.tenors, for_slice.values, self.foreign_curve_interpolator,
-        )
-
-        for_basis_curve: YieldCurve | None = None
-        if self.foreign_basis:
-            for_basis_slice = cast(CurveSlice, market_state[self.foreign_basis])
-            for_basis_curve = YieldCurve(
-                for_basis_slice.tenors, for_basis_slice.values,
-                self.foreign_basis_interpolator,
-            )
-
-        return dom_basis_curve, dom_curve, for_curve, for_basis_curve
+        self._pricing_dates: list[date] = [
+            advance_business_days(d, pricing_lag, lag_calendar)
+            for d in self._averaging_dates
+        ]
 
     # ------------------------------------------------------------------
     # Pricing
@@ -207,7 +154,7 @@ class FXAsian(Instrument):
         fixings: dict[tuple[str, date], np.ndarray] | None = None,
         rng: np.random.Generator | None = None,
     ) -> np.ndarray:
-        """Compute per-path NPV of the Asian FX option.
+        """Compute per-path NPV of the Asian commodity option.
 
         Parameters
         ----------
@@ -216,55 +163,66 @@ class FXAsian(Instrument):
         market_state : dict
             Mapping from risk-factor name to RiskFactorSlice.
         fixings : dict or None
-            Realized FX spot prices for past averaging dates.
-            Key: ``(spot_key, averaging_date)`` → ``np.ndarray (n_paths,)``.
+            Realized forward prices for past averaging dates.
+            Key: ``(forward_curve_name, averaging_date)`` →
+            ``np.ndarray (n_paths,)`` or scalar.
         rng : ignored.
 
         Returns
         -------
         np.ndarray, shape (n_paths,)
         """
-        spot = self._get_fx_spot(market_state)  # (n_paths,)
-        n_paths = spot.shape[0]
+        disc_slice = cast(CurveSlice, market_state[self.discount_curve_name])
+        n_paths = disc_slice.values.shape[0]
 
         if val_date > self.settlement_date:
             return np.zeros(n_paths)
 
-        dom_basis_curve, dom_curve, for_curve, for_basis_curve = self._build_curves(
-            market_state,
-        )
-
-        disc_slice = cast(CurveSlice, market_state[self.discount_curve])
         disc_curve = YieldCurve(
             disc_slice.tenors, disc_slice.values, self.discount_interpolator,
         )
-
         T_settle = float(self._dc.yearFraction(
             to_ql_date(val_date), to_ql_date(self.settlement_date),
         ))
         df = disc_curve.discount_factor(T_settle)
 
-        T_expiry = float(self._dc.yearFraction(
-            to_ql_date(val_date), to_ql_date(self.period_end),
-        ))
+        fwd_slice = cast(CurveSlice, market_state[self.forward_curve_name])
+        fwd_tenors_yf = excel_serials_to_year_fracs(
+            fwd_slice.tenors, val_date, self._dc,
+        )
+        right_extrap = (
+            "flat"
+            if self.forward_interpolator is linear_interpolator
+            else "linear"
+        )
 
         _fix: dict = fixings if fixings is not None else {}
         n_total = len(self._averaging_dates)
 
-        def _get_fixing(avg_date: date) -> np.ndarray:
-            key = (self._spot_key, avg_date)
+        def _get_price(avg_date: date, pricing_date: date) -> np.ndarray:
+            key = (self.forward_curve_name, avg_date)
             if key in _fix:
                 f = np.asarray(_fix[key], dtype=np.float64)
                 return np.full(n_paths, float(f)) if f.ndim == 0 else f
-            return spot.copy()
+            return get_forward_price_from_slice(
+                curve_serial_tenors=fwd_slice.tenors,
+                curve_values=fwd_slice.values,
+                value_date=val_date,
+                target_date=pricing_date,
+                day_counter=self._dc,
+                right_extrapolation=right_extrap,
+                left_extrapolation="flat",
+                _precomputed_tenors_yf=fwd_tenors_yf,
+            )
 
         # ------------------------------------------------------------------
         # At or past period end: all fixings realized — intrinsic payoff
+        # Uses full average and original strike K (no adjusted-strike formula).
         # ------------------------------------------------------------------
         if val_date >= self.period_end:
             price_sum = np.zeros(n_paths)
-            for avg_date in self._averaging_dates:
-                price_sum += _get_fixing(avg_date)
+            for avg_date, pricing_date in zip(self._averaging_dates, self._pricing_dates):
+                price_sum += _get_price(avg_date, pricing_date)
             S_avg = price_sum / n_total
             if self.is_call:
                 payoff = np.maximum(S_avg - self.strike, 0.0)
@@ -273,16 +231,16 @@ class FXAsian(Instrument):
             return self.direction * payoff * self.notional * df
 
         # ------------------------------------------------------------------
-        # Accumulate realized fixings for past averaging dates
+        # Accumulate realized prices for past averaging dates (pre-expiry)
         # ------------------------------------------------------------------
         past_sum = np.zeros(n_paths)
         n_past = 0
 
-        for avg_date in self._averaging_dates:
+        for avg_date, pricing_date in zip(self._averaging_dates, self._pricing_dates):
             if avg_date >= val_date:
                 break
             n_past += 1
-            past_sum += _get_fixing(avg_date)
+            past_sum += _get_price(avg_date, pricing_date)
 
         n_future = n_total - n_past
 
@@ -290,16 +248,28 @@ class FXAsian(Instrument):
         # Effective strike adjusted for any past fixings
         # ------------------------------------------------------------------
         if n_past > 0:
+            S_avg_past = past_sum / n_past
+            # K_eff is the Black-76 strike that reproduces the correct payoff.
+            # K_eff is per-path (n_paths,) when S_avg_past is path-dependent.
             K_eff: float | np.ndarray = (
                 (n_total / n_future) * self.strike
-                - (n_past / n_future) * (past_sum / n_past)
+                - (n_past / n_future) * S_avg_past
             )
-            strike_for_vol: float | np.ndarray = K_eff
+            # strike_bar is used only for vol-surface moneyness lookups.
+            # It equals K - accumulated_past_weighted_avg = K - past_sum/n_total,
+            # matching RiskFlow's convention (strike_bar = Strike - average where
+            # average = Σ past_weight_i * F_i with weight = 1/n_total).
+            # K_eff = (n_total/n_future) * strike_bar, so using K_eff for vol
+            # moneyness inflates the effective moneyness by n_total/n_future and
+            # causes divergence from RiskFlow once averaging starts.
+            strike_for_vol: float | np.ndarray = self.strike - past_sum / n_total
         else:
             K_eff = float(self.strike)
-            strike_for_vol = float(self.strike)
+            strike_for_vol = K_eff
 
-        strike_for_vol = np.maximum(strike_for_vol, 1e-12)
+        T_expiry = float(self._dc.yearFraction(
+            to_ql_date(val_date), to_ql_date(self.period_end),
+        ))
 
         # ------------------------------------------------------------------
         # Moment matching over future fixing dates
@@ -307,36 +277,38 @@ class FXAsian(Instrument):
         M1_sum = np.zeros(n_paths)
         M2_diag = np.zeros(n_paths)
         M2_cross = np.zeros(n_paths)
+        # Running sum Σᵢ<ⱼ F(i) exp(vol(i)² t(i)) — updated as j advances
         running_weighted = np.zeros(n_paths)
 
-        for avg_date in self._averaging_dates:
+        for avg_date, pricing_date in zip(self._averaging_dates, self._pricing_dates):
             if avg_date < val_date:
                 continue
 
             t_i = float(self._dc.yearFraction(
                 to_ql_date(val_date), to_ql_date(avg_date),
             ))
-
-            F_i, _ = fx_forward_price(
-                spot, dom_basis_curve, dom_curve, for_curve, t_i,
-                foreign_forecast_curve=for_basis_curve,
-            )
+            F_i = get_forward_price_from_slice(
+                curve_serial_tenors=fwd_slice.tenors,
+                curve_values=fwd_slice.values,
+                value_date=val_date,
+                target_date=pricing_date,
+                day_counter=self._dc,
+                right_extrapolation=right_extrap,
+                left_extrapolation="flat",
+                _precomputed_tenors_yf=fwd_tenors_yf,
+            )  # (n_paths,)
 
             vol_i = np.asarray(
-                self.vol_surface.get_vol(
-                    strike=strike_for_vol,
-                    forward=F_i,
-                    tenor=t_i,
-                ),
-                dtype=np.float64,
+                self.vol_surface.get_vol(strike_for_vol, F_i, t_i), dtype=np.float64,
             )
             if vol_i.ndim == 0:
                 vol_i = np.full(n_paths, float(vol_i))
 
-            exp_var_i = np.exp(vol_i ** 2 * t_i)
+            exp_var_i = np.exp(vol_i ** 2 * t_i)   # exp(σᵢ² tᵢ)
 
+            # Cross terms: F(j) × Σᵢ<ⱼ [F(i) exp(σᵢ² tᵢ)]
             M2_cross += F_i * running_weighted
-            running_weighted += F_i * exp_var_i
+            running_weighted += F_i * exp_var_i     # update for next j
 
             M2_diag += F_i ** 2 * exp_var_i
             M1_sum += F_i
@@ -344,6 +316,7 @@ class FXAsian(Instrument):
         M1 = M1_sum / n_future
         M2 = (M2_diag + 2.0 * M2_cross) / (n_future ** 2)
 
+        # Adjusted vol — guard against numerical edge cases
         safe_M1 = np.maximum(M1, 1e-12)
         log_ratio = np.log(np.maximum(M2, safe_M1 ** 2)) - 2.0 * np.log(safe_M1)
         log_ratio = np.maximum(log_ratio, 0.0)
@@ -375,7 +348,7 @@ class FXAsian(Instrument):
         return list(self._averaging_dates)
 
     # ------------------------------------------------------------------
-    # Fixing interface (called by ExposureEngine)
+    # Commodity fixing interface (called by ExposureEngine)
     # ------------------------------------------------------------------
 
     def compute_commodity_fixings(
@@ -384,178 +357,49 @@ class FXAsian(Instrument):
         sim_date: date,
         existing_fixings: dict | None = None,
     ) -> dict:
-        """Stamp realized FX spot prices for newly past averaging dates."""
+        """Stamp realized forward prices for newly past averaging dates.
+
+        Called by ExposureEngine at each simulation step before
+        scenario_npvs.  Returns only the new fixings stamped at this step;
+        the caller merges them into its accumulator.
+
+        Each averaging date is stamped exactly once — at the first sim step
+        where avg_date <= sim_date — using the forward curve from that step.
+        Subsequent steps skip it, locking realized prices into the path.
+        """
         _existing = existing_fixings or {}
         new_fixings: dict = {}
 
         if not self._averaging_dates or self._averaging_dates[0] > sim_date:
             return {}
 
-        spot = self._get_fx_spot(market_state)
+        fwd_slice = cast(CurveSlice, market_state[self.forward_curve_name])
+        fwd_tenors_yf = excel_serials_to_year_fracs(
+            fwd_slice.tenors, sim_date, self._dc,
+        )
+        right_extrap = (
+            "flat"
+            if self.forward_interpolator is linear_interpolator
+            else "linear"
+        )
 
-        for avg_date in self._averaging_dates:
+        for avg_date, pricing_date in zip(self._averaging_dates, self._pricing_dates):
             if avg_date > sim_date:
                 break
 
-            key = (self._spot_key, avg_date)
+            key = (self.forward_curve_name, avg_date)
             if key in _existing:
                 continue
 
-            new_fixings[key] = spot.copy()
+            new_fixings[key] = get_forward_price_from_slice(
+                curve_serial_tenors=fwd_slice.tenors,
+                curve_values=fwd_slice.values,
+                value_date=sim_date,
+                target_date=pricing_date,
+                day_counter=self._dc,
+                right_extrapolation=right_extrap,
+                left_extrapolation="flat",
+                _precomputed_tenors_yf=fwd_tenors_yf,
+            )
 
         return new_fixings
-
-
-
-
-from datetime import date
-
-import pandas as pd
-
-from importers.df_importer import build_cube_from_dataframes
-from instruments.fx_asian import FXAsian
-from market_data.vol_surface import MalzVol
-from portfolio.netting_set import NettingSet
-from portfolio.trade import Trade
-from pricing.exposure_engine import ExposureEngine
-from utils.comparison import compare_mtm_in_excel
-from utils.extract import (
-    collect_risk_factor_dataframes,
-    load_full_grid_mtm_from_results,
-)
-from utils.interpolation import hermite_rt_interp
-from utils.json_handling import pull_3d_fx_vol_surface
-
-
-json_path       = r"x"
-comparison_path = r"y"
-file_name       = "FX-ASIAN-EURZAR-Compare.xlsx"
-
-DOM_BASIS_NAME  = "InterestRate.ZAR-USD-BASIS"   # ZAR basis / forecast curve
-DOM_CURVE_NAME  = "InterestRate.ZAR-SWAP"        # ZAR discount curve
-FOR_BASIS_NAME  = "InterestRate.EUR-USD-BASIS"   # EUR basis / forecast curve
-FOR_CURVE_NAME  = "InterestRate.EUR-EURIBOR"     # EUR discount curve
-DOM_FX_NAME     = "FxRate.USD-ZAR"              # ZAR/USD spot scalar
-FOR_FX_NAME     = "FxRate.USD-EUR"              # EUR/USD spot scalar
-VOL_NAME        = "FXVol.USD-ZAR"               # Malz delta-quoted vol surface
-val_date        = date(2025, 7, 28)
-N_PATHS         = 500
-
-overrides = {
-    'Object':                 "CreditMonteCarlo",
-    'Calc_Scenarios':         'Yes',
-    'Time_grid':              '0d 2d 1w(1w) 3m(1m) 2y(3m)',
-    'Batch_Size':             1,
-    'Simulation_Batches':     N_PATHS,
-    'Random_Seed':            8,
-    'Percentile':             '95, 99',
-    'Dynamic_Scenario_Dates': 'Yes',
-}
-
-# ── vol surface ───────────────────────────────────────────────────────────────
-vol_data    = pull_3d_fx_vol_surface(json_path, VOL_NAME)
-vol_surface = MalzVol(vol_data)
-
-# ── instrument ────────────────────────────────────────────────────────────────
-# Build before collecting risk factors so required_sim_dates() is available
-# when constructing extra_dates for the cube injection.
-fx_asian = FXAsian(
-    name                        = "fx_asian_eurzar",
-    period_start                = date(2026, 3, 6),
-    period_end                  = date(2026, 3, 26),
-    settlement_date             = date(2026, 3, 26),
-    strike                      = 20.50,            # EURZAR strike
-    notional                    = 1_000_000,        # EUR notional
-    is_call                     = True,
-    vol_surface                 = vol_surface,
-    domestic_basis              = DOM_BASIS_NAME,
-    domestic_curve              = DOM_CURVE_NAME,
-    foreign_curve               = FOR_CURVE_NAME,
-    discount_curve              = DOM_CURVE_NAME,
-    averaging_calendar          = "ZAR",
-    domestic_basis_interpolator = hermite_rt_interp,
-    domestic_curve_interpolator = hermite_rt_interp,
-    foreign_curve_interpolator  = hermite_rt_interp,
-    discount_interpolator       = hermite_rt_interp,
-    foreign_basis               = FOR_BASIS_NAME,
-    foreign_basis_interpolator  = hermite_rt_interp,
-    domestic_fx_name            = DOM_FX_NAME,
-    foreign_fx_name             = FOR_FX_NAME,
-    day_count                   = "ACT/365",
-    direction                   = 1,
-)
-
-# ── extra dates — averaging dates injected into the ScenarioCube ──────────────
-instruments = [fx_asian]
-extra_dates: list[date] = sorted({
-    d
-    for inst in instruments
-    if hasattr(inst, "required_sim_dates")
-    for d in inst.required_sim_dates()
-})
-
-# ── raw market data ───────────────────────────────────────────────────────────
-risk_keys = [
-    DOM_FX_NAME,
-    FOR_FX_NAME,
-    DOM_BASIS_NAME,
-    DOM_CURVE_NAME,
-    FOR_BASIS_NAME,
-    FOR_CURVE_NAME,
-]
-risk_factors = collect_risk_factor_dataframes(
-    json_path=json_path, overrides=overrides, risk_keys=risk_keys,
-)
-
-dom_basis_df = risk_factors[DOM_BASIS_NAME].reset_index()
-dom_curve_df = risk_factors[DOM_CURVE_NAME].reset_index()
-for_basis_df = risk_factors[FOR_BASIS_NAME].reset_index()
-for_curve_df = risk_factors[FOR_CURVE_NAME].reset_index()
-dom_fx_df    = risk_factors[DOM_FX_NAME].reset_index().drop(columns=["tenor"])
-for_fx_df    = risk_factors[FOR_FX_NAME].reset_index().drop(columns=["tenor"])
-
-# ── build cube ────────────────────────────────────────────────────────────────
-builder = build_cube_from_dataframes(
-    valuation_date = val_date,
-    curve_dfs = {
-        DOM_BASIS_NAME: dom_basis_df,
-        DOM_CURVE_NAME: dom_curve_df,
-        FOR_BASIS_NAME: for_basis_df,
-        FOR_CURVE_NAME: for_curve_df,
-    },
-    scalar_dfs = {
-        DOM_FX_NAME: dom_fx_df,
-        FOR_FX_NAME: for_fx_df,
-    },
-    extra_dates = extra_dates,
-)
-cube = builder.build()
-
-# ── portfolio ─────────────────────────────────────────────────────────────────
-trade = Trade(
-    trade_id        = "fx-asian-eurzar-001",
-    counterparty_id = "ABC_CORP",
-    instrument      = fx_asian,
-    notional_scale  = 1.0,
-)
-netting_set = NettingSet(
-    netting_set_id  = "NS_ABC",
-    counterparty_id = "ABC_CORP",
-    trades          = [trade],
-    csa             = None,
-)
-
-# ── run ───────────────────────────────────────────────────────────────────────
-engine  = ExposureEngine(cube=cube)
-profile = engine.compute(netting_set)
-
-mtm_validation = pd.DataFrame(
-    profile.mtm.T,
-    index   = list(profile.dates),
-    columns = list(range(profile.n_paths)),
-)
-
-# ── compare with RiskFlow ─────────────────────────────────────────────────────
-mtm_riskflow = load_full_grid_mtm_from_results(json_path, overrides)
-
-compare_mtm_in_excel(mtm_riskflow, mtm_validation, comparison_path, filename=file_name)
