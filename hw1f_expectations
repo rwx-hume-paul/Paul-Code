@@ -6,9 +6,9 @@ from typing import Callable, cast
 import numpy as np
 
 from instruments.instrument import Instrument
-from market_data.risk_factor import CurveSlice, RiskFactorSlice
+from market_data.risk_factor import CurveSlice, ScalarSlice, RiskFactorSlice
 from market_data.yield_curve import YieldCurve
-from models.equity_pv import black76_euro_option
+from models.equity_pv import black76_euro_option, fx_forward_price
 from utils.interpolation import (
     forward_price_interpolator,
     linear_interpolator,
@@ -57,6 +57,21 @@ class CommodityAsian(Instrument):
     where S̄_past is the arithmetic mean of realized past prices.
     Vol moneyness is computed using K_eff when past fixings are present.
 
+    Composite (USDZAR) mode
+    -----------------------
+    When ``quanto=True`` each averaging-date forward is:
+
+        F(i) = F_commodity(i) × F_USDZAR(i)
+
+    where F_USDZAR is computed via :func:`fx_forward_price` using basis-adjusted
+    covered interest parity.  The per-date volatility is:
+
+        σ(i) = sqrt(σ_comm(i)² + σ_fx_atm(i)² + 2 ρ σ_comm(i) σ_fx_atm(i))
+
+    where σ_fx_atm is the Malz ATM vol (strike = forward) at tenor t(i) and ρ
+    is the constant commodity/FX correlation.  All fixings, K_eff, and the
+    Black-76 payoff are expressed in the domestic (ZAR) currency.
+
     Parameters
     ----------
     name : str
@@ -68,18 +83,17 @@ class CommodityAsian(Instrument):
     settlement_date : date
         Date on which the settled payoff is paid; used only for discounting.
     strike : float
-        Option strike in the forward price currency (USD for non-composite).
+        Option strike.  In domestic (ZAR) currency when ``quanto=True``.
     notional : float
         Contract notional (number of units).
     is_call : bool
         True for a call (buyer benefits when average > strike).
     vol_surface : NonPreciousCommodityVol | MalzVol
-        Volatility surface.  Must expose
-        ``get_vol(strike, forward, tenor) → float | ndarray``.
+        Commodity volatility surface.
     forward_curve_name : str
         Risk-factor name for the commodity forward CurveSlice.
     discount_curve_name : str
-        Risk-factor name for the discount CurveSlice.
+        Risk-factor name for the discount CurveSlice (domestic ZAR when composite).
     averaging_calendar : str
         Calendar key used to enumerate business days in the averaging window.
     lag_calendar : str
@@ -97,6 +111,27 @@ class CommodityAsian(Instrument):
         Day-count convention key (default ``"ACT/365"``).
     direction : int
         ``+1`` for long, ``-1`` for short.  Default ``+1``.
+    quanto : bool
+        When ``True`` apply composite (USDZAR) pricing.  Default ``False``.
+    fx_spot_name : str, optional
+        Risk-factor name for the domestic/USD FX scalar (e.g. ``"FxRate.USD-ZAR"``
+        in USD-per-ZAR convention so that 1/fx_spot gives the USDZAR rate).
+    domestic_basis : str, optional
+        Risk-factor name for the domestic (ZAR) basis / forecast curve.
+    domestic_basis_interpolator : callable, optional
+        Interpolator factory for the domestic basis curve.
+    domestic_curve : str, optional
+        Risk-factor name for the domestic (ZAR) discount curve.
+    domestic_curve_interpolator : callable, optional
+        Interpolator factory for the domestic discount curve.
+    foreign_curve : str, optional
+        Risk-factor name for the foreign (USD) discount curve.
+    foreign_curve_interpolator : callable, optional
+        Interpolator factory for the foreign discount curve.
+    correlation : float, optional
+        Constant commodity / FX return correlation ρ.  Default 0.
+    fx_vol_surface : MalzVol, optional
+        Malz FX vol surface for the USDZAR pair.
     """
 
     def __init__(
@@ -118,6 +153,16 @@ class CommodityAsian(Instrument):
         pricing_lag: int = 1,
         day_count: str = "ACT/365",
         direction: int = 1,
+        quanto: bool = False,
+        fx_spot_name: str | None = None,
+        domestic_basis: str | None = None,
+        domestic_basis_interpolator: Callable | None = None,
+        domestic_curve: str | None = None,
+        domestic_curve_interpolator: Callable | None = None,
+        foreign_curve: str | None = None,
+        foreign_curve_interpolator: Callable | None = None,
+        correlation: float = 0.0,
+        fx_vol_surface=None,
     ) -> None:
         super().__init__(name)
         self.period_start = period_start
@@ -134,6 +179,16 @@ class CommodityAsian(Instrument):
         self.pricing_lag = pricing_lag
         self.direction = direction
         self._dc = DAY_COUNTERS[day_count]
+        self.quanto = quanto
+        self.fx_spot_name = fx_spot_name
+        self.domestic_basis = domestic_basis
+        self.domestic_basis_interpolator = domestic_basis_interpolator
+        self.domestic_curve = domestic_curve
+        self.domestic_curve_interpolator = domestic_curve_interpolator
+        self.foreign_curve = foreign_curve
+        self.foreign_curve_interpolator = foreign_curve_interpolator
+        self.correlation = correlation
+        self.fx_vol_surface = fx_vol_surface
 
         self._averaging_dates: list[date] = generate_business_days(
             period_start, period_end, averaging_calendar,
@@ -195,6 +250,29 @@ class CommodityAsian(Instrument):
             if self.forward_interpolator is linear_interpolator
             else "linear"
         )
+
+        # ------------------------------------------------------------------
+        # Composite: build FX curves once for the whole pricing call
+        # ------------------------------------------------------------------
+        if self.quanto:
+            fx_spot_slice = cast(ScalarSlice, market_state[self.fx_spot_name])
+            fx_spot = fx_spot_slice.values  # USD/ZAR — 1/fx_spot = USDZAR
+
+            dom_basis_slice = cast(CurveSlice, market_state[self.domestic_basis])
+            dom_basis_curve = YieldCurve(
+                dom_basis_slice.tenors, dom_basis_slice.values,
+                self.domestic_basis_interpolator,
+            )
+            dom_slice = cast(CurveSlice, market_state[self.domestic_curve])
+            dom_curve = YieldCurve(
+                dom_slice.tenors, dom_slice.values,
+                self.domestic_curve_interpolator,
+            )
+            for_slice_q = cast(CurveSlice, market_state[self.foreign_curve])
+            for_curve = YieldCurve(
+                for_slice_q.tenors, for_slice_q.values,
+                self.foreign_curve_interpolator,
+            )
 
         _fix: dict = fixings if fixings is not None else {}
         n_total = len(self._averaging_dates)
@@ -287,7 +365,7 @@ class CommodityAsian(Instrument):
             t_i = float(self._dc.yearFraction(
                 to_ql_date(val_date), to_ql_date(avg_date),
             ))
-            F_i = get_forward_price_from_slice(
+            F_comm = get_forward_price_from_slice(
                 curve_serial_tenors=fwd_slice.tenors,
                 curve_values=fwd_slice.values,
                 value_date=val_date,
@@ -298,11 +376,36 @@ class CommodityAsian(Instrument):
                 _precomputed_tenors_yf=fwd_tenors_yf,
             )  # (n_paths,)
 
-            vol_i = np.asarray(
-                self.vol_surface.get_vol(strike_for_vol, F_i, t_i), dtype=np.float64,
-            )
-            if vol_i.ndim == 0:
-                vol_i = np.full(n_paths, float(vol_i))
+            if self.quanto:
+                F_fx, _ = fx_forward_price(
+                    fx_spot, dom_basis_curve, dom_curve, for_curve, t_i,
+                )
+                F_i = F_comm * F_fx
+
+                vol_comm = np.asarray(
+                    self.vol_surface.get_vol(strike_for_vol, F_i, t_i),
+                    dtype=np.float64,
+                )
+                if vol_comm.ndim == 0:
+                    vol_comm = np.full(n_paths, float(vol_comm))
+
+                # ATM FX vol: strike == forward → moneyness = 0
+                vol_fx_atm = float(self.fx_vol_surface.get_vol(
+                    strike=1.0, forward=1.0, tenor=t_i,
+                ))
+                vol_i = np.sqrt(
+                    vol_comm ** 2
+                    + vol_fx_atm ** 2
+                    + 2.0 * self.correlation * vol_comm * vol_fx_atm
+                )
+            else:
+                F_i = F_comm
+                vol_i = np.asarray(
+                    self.vol_surface.get_vol(strike_for_vol, F_i, t_i),
+                    dtype=np.float64,
+                )
+                if vol_i.ndim == 0:
+                    vol_i = np.full(n_paths, float(vol_i))
 
             exp_var_i = np.exp(vol_i ** 2 * t_i)   # exp(σᵢ² tᵢ)
 
@@ -383,6 +486,13 @@ class CommodityAsian(Instrument):
             else "linear"
         )
 
+        # For composite deals, also resolve the spot USDZAR = 1 / fx_spot so
+        # that realized fixings are stored in the domestic (ZAR) currency.
+        # At T=0 all discount factors are 1, so USDZAR = 1 / (USD/ZAR scalar).
+        if self.quanto:
+            fx_spot_slice = cast(ScalarSlice, market_state[self.fx_spot_name])
+            usdzar = 1.0 / np.maximum(fx_spot_slice.values, 1e-12)
+
         for avg_date, pricing_date in zip(self._averaging_dates, self._pricing_dates):
             if avg_date > sim_date:
                 break
@@ -391,7 +501,7 @@ class CommodityAsian(Instrument):
             if key in _existing:
                 continue
 
-            new_fixings[key] = get_forward_price_from_slice(
+            F_comm = get_forward_price_from_slice(
                 curve_serial_tenors=fwd_slice.tenors,
                 curve_values=fwd_slice.values,
                 value_date=sim_date,
@@ -401,5 +511,6 @@ class CommodityAsian(Instrument):
                 left_extrapolation="flat",
                 _precomputed_tenors_yf=fwd_tenors_yf,
             )
+            new_fixings[key] = F_comm * usdzar if self.quanto else F_comm
 
         return new_fixings
