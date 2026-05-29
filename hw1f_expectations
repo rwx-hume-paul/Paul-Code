@@ -1,275 +1,781 @@
-from __future__ import annotations
-
-from datetime import date
-from typing import Callable
-
-import numpy as np
-
-from instruments.instrument import Instrument
-from utils.ql_helpers import DAY_COUNTERS
-from market_data.yield_curve import YieldCurve
-from typing import cast
-from market_data.risk_factor import CurveSlice, ScalarSlice, RiskFactorSlice
-from models.equity_pv import equity_forward_price
-
-
-class EquityForward(Instrument):
-    """Equity forward valued as (F_current - K) * nominal * DF(T).
-
-    The current forward is computed as:
-        F_current = Spot * exp((r - q) * T)
-
-    where r is the carry (funding) rate and q is the continuous
-    dividend yield, both read from their respective curves at tenor T.
-
-    Parameters
-    ----------
-    name : str
-        Trade identifier.
-    end_date : date
-        Maturity / delivery date of the forward.
-    agreed_forward : float
-        The forward price agreed at inception (strike).
-    nominal : float
-        Notional amount.
-    spot_name : str
-        Risk factor name for the equity spot price (scalar).
-    carry_curve_name : str
-        Risk factor name for the carry / funding curve (used to build the
-        forward price).
-    dividend_curve_name : str
-        Risk factor name for the continuous dividend yield curve.
-    carry_interpolator : callable
-        Interpolator factory for the carry curve.
-    dividend_interpolator : callable
-        Interpolator factory for the dividend yield curve
-        (typically reciprocal_time_interp).
-    discount_curve_name : str, optional
-        Risk factor name for the discount curve.  When omitted the carry
-        curve is used for discounting (original behaviour).
-    discount_interpolator : callable, optional
-        Interpolator factory for the discount curve.  Required when
-        *discount_curve_name* is provided.
-    day_count : str
-        Day count convention for year fractions (default "ACT/365").
-    """
-
-    def __init__(
-        self,
-        name: str,
-        end_date: date,
-        agreed_forward: float,
-        nominal: float,
-        spot_name: str,
-        carry_curve_name: str,
-        dividend_curve_name: str,
-        carry_interpolator: Callable,
-        dividend_interpolator: Callable,
-        discount_curve_name: str = "",
-        discount_interpolator: Callable = None,
-        day_count: str = "ACT/365",
-    ):
-        super().__init__(name)
-        self.end_date = end_date
-        self.agreed_forward = agreed_forward
-        self.nominal = nominal
-        self.spot_name = spot_name
-        self.carry_curve_name = carry_curve_name
-        self.dividend_curve_name = dividend_curve_name
-        self.carry_interpolator = carry_interpolator
-        self.dividend_interpolator = dividend_interpolator
-        self.discount_curve_name = discount_curve_name
-        self.discount_interpolator = discount_interpolator
-        self._dc = DAY_COUNTERS[day_count]
-
-    def scenario_cashflows(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict[tuple[str, date], np.ndarray] | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        """Settlement cashflow on maturity date: (S(T) - K) * nominal."""
-        spot_slice = market_state[self.spot_name]
-        if val_date != self.end_date:
-            return np.zeros(spot_slice.values.shape[0])
-        return (spot_slice.values - self.agreed_forward) * self.nominal
-
-    def scenario_npvs(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict[tuple[str, date], np.ndarray] | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        # Past maturity: worth nothing (settlement already captured via cashflows)
-        if val_date > self.end_date:
-            spot_slice = market_state[self.spot_name]
-            n_paths = spot_slice.values.shape[0]
-            return np.zeros(n_paths)
-
-        # Time to maturity
-        from utils.ql_helpers import to_ql_date
-        T = self._dc.yearFraction(to_ql_date(val_date), to_ql_date(self.end_date))
-
-        # Spot
-        spot_slice = market_state[self.spot_name]
-        spot = spot_slice.values  # (n_paths,)
-
-        # Carry curve
-        carry_slice: CurveSlice = market_state[self.carry_curve_name]
-        carry_curve = YieldCurve(
-            carry_slice.tenors, carry_slice.values, self.carry_interpolator,
-        )
-
-        # Dividend yield curve
-        div_slice: CurveSlice = market_state[self.dividend_curve_name]
-        div_curve = YieldCurve(
-            div_slice.tenors, div_slice.values, self.dividend_interpolator,
-        )
-
-        F_current, carry_df, _ = equity_forward_price(spot, carry_curve, div_curve, T)
-
-        # Discount factor
-        if self.discount_curve_name:
-            disc_slice: CurveSlice = market_state[self.discount_curve_name]
-            disc_curve = YieldCurve(
-                disc_slice.tenors, disc_slice.values, self.discount_interpolator,
-            )
-            df = disc_curve.discount_factor(T)
-        else:
-            df = carry_df
-
-        return (F_current - self.agreed_forward) * self.nominal * df
-
-
-class EquityForwardDiscreteDividends(Instrument):
-    """Equity forward priced with an explicit discrete-dividend schedule.
-
-    On each simulation date t the stock price is stripped of the present
-    value of all future discrete dividends whose ex-dividend date falls
-    strictly after t and strictly before end_date:
-
-        S'(t) = S(t) - Σ  div_i × DF(t → ex_date_i)
-
-    The forward price is then grown at the risk-free carry rate only:
-
-        F(T) = S'(t) × exp(r × T)
-
-    and the NPV is:
-
-        NPV = (F(T) - K) × nominal × DF(t → T)
-
-    Parameters
-    ----------
-    name : str
-        Trade identifier.
-    end_date : date
-        Maturity / delivery date of the forward.
-    agreed_forward : float
-        Forward price agreed at inception (strike).
-    nominal : float
-        Notional amount.
-    spot_name : str
-        Risk-factor name for the equity spot price.
-    carry_curve_name : str
-        Risk-factor name for the carry / funding rate curve.
-    discount_curve_name : str
-        Risk-factor name for the discount curve.
-    carry_interpolator : callable
-        Interpolator factory for the carry curve.
-    discount_interpolator : callable
-        Interpolator factory for the discount curve.
-    dividend_schedule : list of (date, float)
-        Each entry is (ex_dividend_date, dividend_amount).  Dividends whose
-        ex-date falls on or after end_date are silently ignored at
-        construction time.
-    day_count : str
-        Day-count convention key (default ``"ACT/365"``).
-    """
-
-    def __init__(
-        self,
-        name: str,
-        end_date: date,
-        agreed_forward: float,
-        nominal: float,
-        spot_name: str,
-        carry_curve_name: str,
-        discount_curve_name: str,
-        carry_interpolator: Callable,
-        discount_interpolator: Callable,
-        dividend_schedule: list[tuple[date, float]],
-        day_count: str = "ACT/365",
-    ) -> None:
-        super().__init__(name)
-        self.end_date = end_date
-        self.agreed_forward = agreed_forward
-        self.nominal = nominal
-        self.spot_name = spot_name
-        self.carry_curve_name = carry_curve_name
-        self.discount_curve_name = discount_curve_name
-        self.carry_interpolator = carry_interpolator
-        self.discount_interpolator = discount_interpolator
-        self._dc = DAY_COUNTERS[day_count]
-        # Pre-filter: only keep dividends that fall before end_date
-        self._dividends: list[tuple[date, float]] = [
-            (ex_date, amount)
-            for ex_date, amount in dividend_schedule
-            if ex_date < end_date
-        ]
-
-    def scenario_cashflows(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        """Settlement cashflow on maturity date: (S(T) - K) × nominal."""
-        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
-        if val_date != self.end_date:
-            return np.zeros(spot_slice.values.shape[0])
-        return (spot_slice.values - self.agreed_forward) * self.nominal
-
-    def scenario_npvs(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        from utils.ql_helpers import to_ql_date
-
-        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
-        spot = spot_slice.values  # (n_paths,)
-        n_paths = spot.shape[0]
-
-        if val_date > self.end_date:
-            return np.zeros(n_paths)
-
-        T = float(self._dc.yearFraction(to_ql_date(val_date), to_ql_date(self.end_date)))
-
-        carry_slice = cast(CurveSlice, market_state[self.carry_curve_name])
-        carry_curve = YieldCurve(carry_slice.tenors, carry_slice.values, self.carry_interpolator)
-
-        disc_slice = cast(CurveSlice, market_state[self.discount_curve_name])
-        disc_curve = YieldCurve(disc_slice.tenors, disc_slice.values, self.discount_interpolator)
-
-        # Strip future dividends from the spot price
-        pv_divs = np.zeros(n_paths)
-        for ex_date, amount in self._dividends:
-            if ex_date <= val_date:
-                continue
-            T_div = float(self._dc.yearFraction(to_ql_date(val_date), to_ql_date(ex_date)))
-            pv_divs += amount * disc_curve.discount_factor(T_div)
-
-        S_prime = spot - pv_divs
-
-        # Forward: grow dividend-stripped spot at risk-free carry rate only
-        F, _, _ = equity_forward_price(S_prime, carry_curve, None, T)
-
-        df = disc_curve.discount_factor(T)
-
-        return (F - self.agreed_forward) * self.nominal * df
-
+{
+    "Calc": {
+        "Calculation": {
+            "Object": "CreditMonteCarlo",
+            "Base_Date": {
+                ".Timestamp": "2026-05-27"
+            },
+            "Currency": "ZAR",
+            "Random_Seed": 139,
+			"NoModel": "RiskNeutral",
+            "MCMC_Simulations": 8192,
+            "Calculate_MtM": "Yes"
+        },
+        "Deals": {
+            "Properties": {
+                "Object": "NettingCollateralSet",
+                "Reference": "ZAR/F/STK/OCT26_TEST_GBM",
+                "MtM": "&lt;undefined&gt;",
+                "Netted": "True",
+                "Tags": [
+                    ",,,"
+                ],
+                "Collateralized": "False",
+                "Apply_Closeout_When_Uncollateralized": "No"
+            },
+            "Deals": {
+                "Children": [
+                    {
+                        "Instrument": {
+                            ".Deal": {
+                                "Object": "NettingCollateralSet",
+                                "Reference": "ZAR/F/STK/OCT26_TEST_GBM",
+                                "MtM": "&lt;undefined&gt;",
+                                "Netted": "True",
+                                "Tags": [
+                                    ",,,"
+                                ],
+                                "Collateralized": "False",
+                                "Apply_Closeout_When_Uncollateralized": "No"
+                            }
+                        },
+                        "Children": [
+                            {
+                                "Instrument": {
+                                    ".Deal": {
+                                        "Object": "EquityForwardDeal",
+                                        "Reference": 223088704,
+                                        "MtM": 1686.7106743332115,
+                                        "Tags": [
+                                            "Acc IB Sponsor,150_1509466_Call,Future/Forward,None"
+                                        ],
+                                        "Currency": "ZAR",
+                                        "Discount_Rate": "ZAR-SWAP",
+                                        "Buy_Sell": "Buy",
+                                        "Equity": "ZAR_SBK",
+                                        "Equity_Volatility": "",
+                                        "Payoff_Currency": "ZAR",
+                                        "Payoff_Type": "Standard",
+                                        "Maturity_Date": {
+                                            ".Timestamp": "2026-10-12"
+                                        },
+                                        "Units": 1000.0,
+                                        "Forward_Price": 320.0
+                                    }
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        },
+        "MergeMarketData": {
+            "MarketDataFile": "\\\\ICMJHBMVDROPUAT\\AdaptiveAnalytics\\Inbound\\MarketData\\CVAMarketData_SBK.json",
+            "ExplicitMarketData": {
+                "System Parameters": {
+                    "Base_Currency": "USD"
+                },
+                "Price Factors": {
+                    "InterestRate.ZAR-SWAP": {
+                        "Day_Count": "ACT_365",
+                        "Currency": "ZAR",
+                        "Curve": {
+                            ".Curve": {
+                                "meta": [],
+                                "data": [
+                                    [
+                                        0.0027397260273972603,
+                                        0.06702384592973298
+                                    ],
+                                    [
+                                        0.09041095890410959,
+                                        0.06697912822151231
+                                    ],
+                                    [
+                                        0.25205479452054796,
+                                        0.06750247481413255
+                                    ],
+                                    [
+                                        0.3424657534246575,
+                                        0.06918821677960961
+                                    ],
+                                    [
+                                        0.4191780821917808,
+                                        0.07002494490310375
+                                    ],
+                                    [
+                                        0.5041095890410959,
+                                        0.06999314409945616
+                                    ],
+                                    [
+                                        0.589041095890411,
+                                        0.0711174437067848
+                                    ],
+                                    [
+                                        0.6712328767123288,
+                                        0.07149364595691478
+                                    ],
+                                    [
+                                        0.7534246575342466,
+                                        0.07147780256705202
+                                    ],
+                                    [
+                                        0.8410958904109589,
+                                        0.07214133667920242
+                                    ],
+                                    [
+                                        0.9205479452054794,
+                                        0.07244942153042058
+                                    ],
+                                    [
+                                        0.9972602739726028,
+                                        0.07235100769394147
+                                    ],
+                                    [
+                                        1.252054794520548,
+                                        0.07287176122610069
+                                    ],
+                                    [
+                                        1.5095890410958903,
+                                        0.07314397874919197
+                                    ],
+                                    [
+                                        1.7616438356164383,
+                                        0.07326056753536248
+                                    ],
+                                    [
+                                        2.0082191780821916,
+                                        0.07328689670161394
+                                    ],
+                                    [
+                                        3.0054794520547947,
+                                        0.07357932203070873
+                                    ],
+                                    [
+                                        4.002739726027397,
+                                        0.07433905369219229
+                                    ],
+                                    [
+                                        5.002739726027397,
+                                        0.07535018733546367
+                                    ],
+                                    [
+                                        6.005479452054795,
+                                        0.07645078017538937
+                                    ],
+                                    [
+                                        7.013698630136986,
+                                        0.07766281647478075
+                                    ],
+                                    [
+                                        8.01095890410959,
+                                        0.07883712367639019
+                                    ],
+                                    [
+                                        9.008219178082191,
+                                        0.08019192531207917
+                                    ],
+                                    [
+                                        10.008219178082191,
+                                        0.08132244468575994
+                                    ],
+                                    [
+                                        12.008219178082191,
+                                        0.08351064950926004
+                                    ],
+                                    [
+                                        15.01095890410959,
+                                        0.08528204430839423
+                                    ],
+                                    [
+                                        20.016438356164382,
+                                        0.08527385011211089
+                                    ],
+                                    [
+                                        25.02191780821918,
+                                        0.083781456419
+                                    ],
+                                    [
+                                        30.027397260273972,
+                                        0.0819573417772714
+                                    ]
+                                ]
+                            }
+                        },
+                        "Sub_Type": null
+                    },
+                    "InterestRate.ZAR-SWAP.ZAR-USD-BASIS": {
+                        "Day_Count": "ACT_365",
+                        "Currency": "ZAR",
+                        "Curve": {
+                            ".Curve": {
+                                "meta": [],
+                                "data": [
+                                    [
+                                        0.0027397260273972603,
+                                        -0.004291495369415171
+                                    ],
+                                    [
+                                        0.005479452054794521,
+                                        -0.004032573038331419
+                                    ],
+                                    [
+                                        0.0136986301369863,
+                                        -0.0038889315136362984
+                                    ],
+                                    [
+                                        0.024657534246575342,
+                                        -0.0022445505355540157
+                                    ],
+                                    [
+                                        0.043835616438356165,
+                                        -0.0020568550563382637
+                                    ],
+                                    [
+                                        0.09041095890410959,
+                                        -0.0020255858528477055
+                                    ],
+                                    [
+                                        0.09315068493150686,
+                                        -0.00201874682598871
+                                    ],
+                                    [
+                                        0.1780821917808219,
+                                        -0.001418772296014989
+                                    ],
+                                    [
+                                        0.25205479452054796,
+                                        -0.0018372734641763783
+                                    ],
+                                    [
+                                        0.26301369863013696,
+                                        -0.0019265023039100465
+                                    ],
+                                    [
+                                        0.3424657534246575,
+                                        -0.0027042188088255287
+                                    ],
+                                    [
+                                        0.3452054794520548,
+                                        -0.002723990334408899
+                                    ],
+                                    [
+                                        0.4191780821917808,
+                                        -0.0030680694028725752
+                                    ],
+                                    [
+                                        0.4273972602739726,
+                                        -0.0030739571443251373
+                                    ],
+                                    [
+                                        0.5041095890410959,
+                                        -0.00272715851029183
+                                    ],
+                                    [
+                                        0.5123287671232877,
+                                        -0.0027309837479152083
+                                    ],
+                                    [
+                                        0.589041095890411,
+                                        -0.003360028384571112
+                                    ],
+                                    [
+                                        0.5972602739726027,
+                                        -0.003404166178045606
+                                    ],
+                                    [
+                                        0.6712328767123288,
+                                        -0.0034611524423687617
+                                    ],
+                                    [
+                                        0.6767123287671233,
+                                        -0.003452895085636551
+                                    ],
+                                    [
+                                        0.7534246575342466,
+                                        -0.003170309992768322
+                                    ],
+                                    [
+                                        0.8410958904109589,
+                                        -0.0035508302899678046
+                                    ],
+                                    [
+                                        0.8438356164383561,
+                                        -0.0035585430964515663
+                                    ],
+                                    [
+                                        0.9205479452054794,
+                                        -0.0036509831784942437
+                                    ],
+                                    [
+                                        0.9260273972602739,
+                                        -0.003643529764387393
+                                    ],
+                                    [
+                                        0.9972602739726028,
+                                        -0.003353173256915823
+                                    ],
+                                    [
+                                        1.0027397260273974,
+                                        -0.003331299010742181
+                                    ],
+                                    [
+                                        1.252054794520548,
+                                        -0.002789288982949098
+                                    ],
+                                    [
+                                        1.5095890410958903,
+                                        -0.0028356537936286147
+                                    ],
+                                    [
+                                        1.7616438356164383,
+                                        -0.0031194379742651712
+                                    ],
+                                    [
+                                        2.0082191780821916,
+                                        -0.003284371748211168
+                                    ],
+                                    [
+                                        2.010958904109589,
+                                        -0.0032843206590984497
+                                    ],
+                                    [
+                                        3.0054794520547947,
+                                        -0.003270547284808731
+                                    ],
+                                    [
+                                        3.0082191780821916,
+                                        -0.003270373994254852
+                                    ],
+                                    [
+                                        4.002739726027397,
+                                        -0.003158317301822089
+                                    ],
+                                    [
+                                        4.008219178082192,
+                                        -0.003157699119296753
+                                    ],
+                                    [
+                                        5.002739726027397,
+                                        -0.0030458040851635837
+                                    ],
+                                    [
+                                        5.008219178082192,
+                                        -0.0030455013284576005
+                                    ],
+                                    [
+                                        6.005479452054795,
+                                        -0.0030489935478448527
+                                    ],
+                                    [
+                                        6.019178082191781,
+                                        -0.003049039734161499
+                                    ],
+                                    [
+                                        7.013698630136986,
+                                        -0.003050748396688757
+                                    ],
+                                    [
+                                        7.016438356164383,
+                                        -0.003050751685950065
+                                    ],
+                                    [
+                                        8.01095890410959,
+                                        -0.003051511588287717
+                                    ],
+                                    [
+                                        8.013698630136986,
+                                        -0.0030514176124256526
+                                    ],
+                                    [
+                                        9.008219178082191,
+                                        -0.0029823235839249035
+                                    ],
+                                    [
+                                        9.01095890410959,
+                                        -0.0029821291268061906
+                                    ],
+                                    [
+                                        10.008219178082191,
+                                        -0.0029097779738976454
+                                    ],
+                                    [
+                                        10.013698630136986,
+                                        -0.002909528740985101
+                                    ],
+                                    [
+                                        12.008219178082191,
+                                        -0.0029270200199453256
+                                    ],
+                                    [
+                                        15.01095890410959,
+                                        -0.0033617142230739083
+                                    ],
+                                    [
+                                        15.016438356164384,
+                                        -0.0033629556199811367
+                                    ],
+                                    [
+                                        20.016438356164382,
+                                        -0.0035891738077132446
+                                    ],
+                                    [
+                                        25.02191780821918,
+                                        -0.003596070451140368
+                                    ],
+                                    [
+                                        30.027397260273972,
+                                        -0.0036026581716264716
+                                    ]
+                                ]
+                            }
+                        },
+                        "Sub_Type": "BasisSpread"
+                    },
+                    "InterestRate.USD-SOFR": {
+                        "Day_Count": "ACT_365",
+                        "Currency": "USD",
+                        "Curve": {
+                            ".Curve": {
+                                "meta": [],
+                                "data": [
+                                    [
+                                        0.0027397260273972603,
+                                        0.035991280982067754
+                                    ],
+                                    [
+                                        0.03561643835616438,
+                                        0.03666119080395354
+                                    ],
+                                    [
+                                        0.0547945205479452,
+                                        0.03638717602225198
+                                    ],
+                                    [
+                                        0.07671232876712329,
+                                        0.036847842808755915
+                                    ],
+                                    [
+                                        0.0958904109589041,
+                                        0.036546168086509005
+                                    ],
+                                    [
+                                        0.1780821917808219,
+                                        0.03680041248554403
+                                    ],
+                                    [
+                                        0.2684931506849315,
+                                        0.03699431801914283
+                                    ],
+                                    [
+                                        0.34794520547945207,
+                                        0.03713456125639697
+                                    ],
+                                    [
+                                        0.43561643835616437,
+                                        0.03729717177952292
+                                    ],
+                                    [
+                                        0.5178082191780822,
+                                        0.03747319257005381
+                                    ],
+                                    [
+                                        0.5972602739726027,
+                                        0.03764551050855812
+                                    ],
+                                    [
+                                        0.6876712328767123,
+                                        0.037851630273583806
+                                    ],
+                                    [
+                                        0.7643835616438356,
+                                        0.03801318754624823
+                                    ],
+                                    [
+                                        0.8438356164383561,
+                                        0.03816625472252327
+                                    ],
+                                    [
+                                        0.9342465753424658,
+                                        0.038328469093627714
+                                    ],
+                                    [
+                                        1.0164383561643835,
+                                        0.038494212006979465
+                                    ],
+                                    [
+                                        1.515068493150685,
+                                        0.03902548496893215
+                                    ],
+                                    [
+                                        2.0164383561643837,
+                                        0.03905248519268155
+                                    ],
+                                    [
+                                        3.0136986301369864,
+                                        0.038944498635123594
+                                    ],
+                                    [
+                                        4.013698630136986,
+                                        0.03893900543866595
+                                    ],
+                                    [
+                                        5.019178082191781,
+                                        0.03909046112190642
+                                    ],
+                                    [
+                                        6.021917808219178,
+                                        0.039405003684647846
+                                    ],
+                                    [
+                                        7.021917808219178,
+                                        0.039767365140842115
+                                    ],
+                                    [
+                                        8.01917808219178,
+                                        0.040151106099142006
+                                    ],
+                                    [
+                                        9.016438356164384,
+                                        0.04054710031055802
+                                    ],
+                                    [
+                                        10.024657534246575,
+                                        0.040963992136390966
+                                    ],
+                                    [
+                                        12.024657534246575,
+                                        0.04182744229578998
+                                    ],
+                                    [
+                                        15.021917808219179,
+                                        0.04297078545553118
+                                    ],
+                                    [
+                                        20.024657534246575,
+                                        0.04389509301746283
+                                    ],
+                                    [
+                                        25.03013698630137,
+                                        0.04367652569233968
+                                    ],
+                                    [
+                                        30.035616438356165,
+                                        0.04291535113328376
+                                    ]
+                                ]
+                            }
+                        },
+                        "Sub_Type": null
+                    },
+                    "FxRate.USD": {
+                        "Domestic_Currency": "",
+                        "Interest_Rate": "USD-SOFR",
+                        "Spot": 1.0
+                    },
+                    "FxRate.ZAR": {
+                        "Domestic_Currency": "USD",
+                        "Interest_Rate": "ZAR-SWAP.ZAR-USD-BASIS",
+                        "Spot": 0.06105490224872793
+                    },
+                    "EquityPrice.ZAR_SBK": {
+                        "Issuer": "",
+                        "Respect_Default": "Yes",
+                        "Jump_Level": {
+                            ".Percent": 0.0
+                        },
+                        "Currency": "ZAR",
+                        "Interest_Rate": "ZAR-SWAP",
+                        "Spot": 321.28000000000003
+                    },
+                    "DividendRate.ZAR_SBK": {
+                        "Currency": "ZAR",
+                        "Curve": {
+                            ".Curve": {
+                                "meta": [],
+                                "data": [
+                                    [
+                                        0.28493150684931506,
+                                        0.0
+                                    ],
+                                    [
+                                        0.2876712328767123,
+                                        0.08596671481543272
+                                    ],
+                                    [
+                                        0.8602739726027397,
+                                        0.028746831387326227
+                                    ],
+                                    [
+                                        0.863013698630137,
+                                        0.05821754038878347
+                                    ],
+                                    [
+                                        1.2821917808219179,
+                                        0.03918488295398888
+                                    ],
+                                    [
+                                        1.284931506849315,
+                                        0.05884012317880678
+                                    ],
+                                    [
+                                        1.8575342465753424,
+                                        0.04070209110746368
+                                    ],
+                                    [
+                                        1.8602739726027397,
+                                        0.05471898344797596
+                                    ],
+                                    [
+                                        2.2794520547945205,
+                                        0.04465647807833615
+                                    ],
+                                    [
+                                        2.282191780821918,
+                                        0.05602095762675906
+                                    ],
+                                    [
+                                        2.873972602739726,
+                                        0.044485660346129934
+                                    ],
+                                    [
+                                        2.8767123287671232,
+                                        0.05378804410836759
+                                    ],
+                                    [
+                                        3.2958904109589042,
+                                        0.046947170668151274
+                                    ],
+                                    [
+                                        3.2986301369863016,
+                                        0.0550163796074201
+                                    ],
+                                    [
+                                        3.871232876712329,
+                                        0.04687878347298924
+                                    ],
+                                    [
+                                        3.873972602739726,
+                                        0.05397233010303185
+                                    ],
+                                    [
+                                        4.293150684931507,
+                                        0.0487025365447907
+                                    ],
+                                    [
+                                        4.295890410958904,
+                                        0.05506298886899068
+                                    ],
+                                    [
+                                        4.868493150684931,
+                                        0.04858681291309926
+                                    ],
+                                    [
+                                        4.8712328767123285,
+                                        0.054370044912827334
+                                    ],
+                                    [
+                                        5.2904109589041095,
+                                        0.05006211281978613
+                                    ],
+                                    [
+                                        5.293150684931507,
+                                        0.05535450492655671
+                                    ],
+                                    [
+                                        5.865753424657535,
+                                        0.04995091243255841
+                                    ],
+                                    [
+                                        5.868493150684931,
+                                        0.054871066086278876
+                                    ],
+                                    [
+                                        6.287671232876712,
+                                        0.05121299501386028
+                                    ],
+                                    [
+                                        6.2904109589041095,
+                                        0.055773163029857915
+                                    ],
+                                    [
+                                        6.863013698630137,
+                                        0.051119833260101305
+                                    ],
+                                    [
+                                        6.865753424657535,
+                                        0.055421655303103466
+                                    ],
+                                    [
+                                        7.284931506849315,
+                                        0.05223266949589218
+                                    ],
+                                    [
+                                        7.287671232876712,
+                                        0.05625770286859244
+                                    ],
+                                    [
+                                        7.86027397260274,
+                                        0.05215945961326451
+                                    ],
+                                    [
+                                        7.863013698630137,
+                                        0.055996560823982564
+                                    ],
+                                    [
+                                        8.282191780821918,
+                                        0.05316246429534567
+                                    ],
+                                    [
+                                        8.284931506849315,
+                                        0.056777883619737846
+                                    ],
+                                    [
+                                        8.876712328767123,
+                                        0.05299269137842198
+                                    ],
+                                    [
+                                        8.87945205479452,
+                                        0.056451421341658245
+                                    ],
+                                    [
+                                        9.2986301369863,
+                                        0.053906616549297105
+                                    ],
+                                    [
+                                        9.301369863013699,
+                                        0.05718251919966504
+                                    ],
+                                    [
+                                        9.873972602739727,
+                                        0.05386644081100522
+                                    ],
+                                    [
+                                        9.876712328767123,
+                                        0.0570352973564328
+                                    ],
+                                    [
+                                        10.876712328767123,
+                                        0.05179149797731493
+                                    ]
+                                ]
+                            }
+                        },
+                        "Property_Aliases": ""
+                    },
+                    "ForwardPriceSample.ZAR": {
+                        "Offset": 0,
+                        "Holiday_Calendar": "Johannesburg",
+                        "Sampling_Convention": "ForwardPriceSampleDaily"
+                    },
+                    "ForwardPriceSample.USD": {
+                        "Offset": 0,
+                        "Holiday_Calendar": "New York",
+                        "Sampling_Convention": "ForwardPriceSampleDaily"
+                    }
+                }
+            }
+        },
+        "CalendDataFile": "\\\\ICMJHBMVDROPPRD\\AdaptiveAnalytics\\Inbound\\MarketData\\AACalendars.cal"
+    }
+}
