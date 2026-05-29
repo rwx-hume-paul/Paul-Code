@@ -1,43 +1,275 @@
+from __future__ import annotations
+
+from datetime import date
+from typing import Callable
+
 import numpy as np
-import matplotlib.pyplot as plt
 
-# ── input data ────────────────────────────────────────────────────────────────
-tenors = np.array([0.25, 0.5, 1.0, 2.0, 3.0, 5.0])   # years
-rates  = np.array([0.03, 0.032, 0.035, 0.038, 0.040, 0.042])  # dividend yield
+from instruments.instrument import Instrument
+from utils.ql_helpers import DAY_COUNTERS
+from market_data.yield_curve import YieldCurve
+from typing import cast
+from market_data.risk_factor import CurveSlice, ScalarSlice, RiskFactorSlice
+from models.equity_pv import equity_forward_price
 
 
-def interp_reciprocal_time(tenors: np.ndarray, rates: np.ndarray,
-                           query: np.ndarray) -> np.ndarray:
-    """Interpolate rates linearly in reciprocal-time space (1/t).
+class EquityForward(Instrument):
+    """Equity forward valued as (F_current - K) * nominal * DF(T).
 
-    Transforms tenors to x = 1/t, performs linear interpolation on (x, rate),
-    then maps back.  Outside the knot range the nearest rate is used (flat
-    extrapolation), consistent with the reciprocal_time_interp convention used
-    in yield-curve bootstrapping.
+    The current forward is computed as:
+        F_current = Spot * exp((r - q) * T)
+
+    where r is the carry (funding) rate and q is the continuous
+    dividend yield, both read from their respective curves at tenor T.
+
+    Parameters
+    ----------
+    name : str
+        Trade identifier.
+    end_date : date
+        Maturity / delivery date of the forward.
+    agreed_forward : float
+        The forward price agreed at inception (strike).
+    nominal : float
+        Notional amount.
+    spot_name : str
+        Risk factor name for the equity spot price (scalar).
+    carry_curve_name : str
+        Risk factor name for the carry / funding curve (used to build the
+        forward price).
+    dividend_curve_name : str
+        Risk factor name for the continuous dividend yield curve.
+    carry_interpolator : callable
+        Interpolator factory for the carry curve.
+    dividend_interpolator : callable
+        Interpolator factory for the dividend yield curve
+        (typically reciprocal_time_interp).
+    discount_curve_name : str, optional
+        Risk factor name for the discount curve.  When omitted the carry
+        curve is used for discounting (original behaviour).
+    discount_interpolator : callable, optional
+        Interpolator factory for the discount curve.  Required when
+        *discount_curve_name* is provided.
+    day_count : str
+        Day count convention for year fractions (default "ACT/365").
     """
-    x_knots  = 1.0 / tenors          # reciprocal-time knot grid
-    x_query  = 1.0 / np.maximum(query, 1e-10)
 
-    # np.interp extrapolates flat beyond the range
-    return np.interp(x_query, x_knots[::-1], rates[::-1])
+    def __init__(
+        self,
+        name: str,
+        end_date: date,
+        agreed_forward: float,
+        nominal: float,
+        spot_name: str,
+        carry_curve_name: str,
+        dividend_curve_name: str,
+        carry_interpolator: Callable,
+        dividend_interpolator: Callable,
+        discount_curve_name: str = "",
+        discount_interpolator: Callable = None,
+        day_count: str = "ACT/365",
+    ):
+        super().__init__(name)
+        self.end_date = end_date
+        self.agreed_forward = agreed_forward
+        self.nominal = nominal
+        self.spot_name = spot_name
+        self.carry_curve_name = carry_curve_name
+        self.dividend_curve_name = dividend_curve_name
+        self.carry_interpolator = carry_interpolator
+        self.dividend_interpolator = dividend_interpolator
+        self.discount_curve_name = discount_curve_name
+        self.discount_interpolator = discount_interpolator
+        self._dc = DAY_COUNTERS[day_count]
+
+    def scenario_cashflows(
+        self,
+        val_date: date,
+        market_state: dict[str, RiskFactorSlice],
+        fixings: dict[tuple[str, date], np.ndarray] | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        """Settlement cashflow on maturity date: (S(T) - K) * nominal."""
+        spot_slice = market_state[self.spot_name]
+        if val_date != self.end_date:
+            return np.zeros(spot_slice.values.shape[0])
+        return (spot_slice.values - self.agreed_forward) * self.nominal
+
+    def scenario_npvs(
+        self,
+        val_date: date,
+        market_state: dict[str, RiskFactorSlice],
+        fixings: dict[tuple[str, date], np.ndarray] | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        # Past maturity: worth nothing (settlement already captured via cashflows)
+        if val_date > self.end_date:
+            spot_slice = market_state[self.spot_name]
+            n_paths = spot_slice.values.shape[0]
+            return np.zeros(n_paths)
+
+        # Time to maturity
+        from utils.ql_helpers import to_ql_date
+        T = self._dc.yearFraction(to_ql_date(val_date), to_ql_date(self.end_date))
+
+        # Spot
+        spot_slice = market_state[self.spot_name]
+        spot = spot_slice.values  # (n_paths,)
+
+        # Carry curve
+        carry_slice: CurveSlice = market_state[self.carry_curve_name]
+        carry_curve = YieldCurve(
+            carry_slice.tenors, carry_slice.values, self.carry_interpolator,
+        )
+
+        # Dividend yield curve
+        div_slice: CurveSlice = market_state[self.dividend_curve_name]
+        div_curve = YieldCurve(
+            div_slice.tenors, div_slice.values, self.dividend_interpolator,
+        )
+
+        F_current, carry_df, _ = equity_forward_price(spot, carry_curve, div_curve, T)
+
+        # Discount factor
+        if self.discount_curve_name:
+            disc_slice: CurveSlice = market_state[self.discount_curve_name]
+            disc_curve = YieldCurve(
+                disc_slice.tenors, disc_slice.values, self.discount_interpolator,
+            )
+            df = disc_curve.discount_factor(T)
+        else:
+            df = carry_df
+
+        return (F_current - self.agreed_forward) * self.nominal * df
 
 
-# ── build a fine query grid and interpolate ───────────────────────────────────
-t_fine  = np.linspace(tenors[0], tenors[-1], 500)
-r_interp = interp_reciprocal_time(tenors, rates, t_fine)
+class EquityForwardDiscreteDividends(Instrument):
+    """Equity forward priced with an explicit discrete-dividend schedule.
 
-# ── plot ──────────────────────────────────────────────────────────────────────
-fig, ax = plt.subplots(figsize=(9, 5))
+    On each simulation date t the stock price is stripped of the present
+    value of all future discrete dividends whose ex-dividend date falls
+    strictly after t and strictly before end_date:
 
-ax.plot(t_fine, r_interp * 100, color="steelblue", linewidth=2,
-        label="Linear-on-reciprocal-time interpolation")
-ax.scatter(tenors, rates * 100, color="firebrick", zorder=5,
-           label="Input knot points")
+        S'(t) = S(t) - Σ  div_i × DF(t → ex_date_i)
 
-ax.set_xlabel("Tenor (years)")
-ax.set_ylabel("Dividend yield (%)")
-ax.set_title("Dividend yield curve — reciprocal-time interpolation")
-ax.legend()
-ax.grid(True, linestyle="--", alpha=0.5)
-plt.tight_layout()
-plt.show()
+    The forward price is then grown at the risk-free carry rate only:
+
+        F(T) = S'(t) × exp(r × T)
+
+    and the NPV is:
+
+        NPV = (F(T) - K) × nominal × DF(t → T)
+
+    Parameters
+    ----------
+    name : str
+        Trade identifier.
+    end_date : date
+        Maturity / delivery date of the forward.
+    agreed_forward : float
+        Forward price agreed at inception (strike).
+    nominal : float
+        Notional amount.
+    spot_name : str
+        Risk-factor name for the equity spot price.
+    carry_curve_name : str
+        Risk-factor name for the carry / funding rate curve.
+    discount_curve_name : str
+        Risk-factor name for the discount curve.
+    carry_interpolator : callable
+        Interpolator factory for the carry curve.
+    discount_interpolator : callable
+        Interpolator factory for the discount curve.
+    dividend_schedule : list of (date, float)
+        Each entry is (ex_dividend_date, dividend_amount).  Dividends whose
+        ex-date falls on or after end_date are silently ignored at
+        construction time.
+    day_count : str
+        Day-count convention key (default ``"ACT/365"``).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        end_date: date,
+        agreed_forward: float,
+        nominal: float,
+        spot_name: str,
+        carry_curve_name: str,
+        discount_curve_name: str,
+        carry_interpolator: Callable,
+        discount_interpolator: Callable,
+        dividend_schedule: list[tuple[date, float]],
+        day_count: str = "ACT/365",
+    ) -> None:
+        super().__init__(name)
+        self.end_date = end_date
+        self.agreed_forward = agreed_forward
+        self.nominal = nominal
+        self.spot_name = spot_name
+        self.carry_curve_name = carry_curve_name
+        self.discount_curve_name = discount_curve_name
+        self.carry_interpolator = carry_interpolator
+        self.discount_interpolator = discount_interpolator
+        self._dc = DAY_COUNTERS[day_count]
+        # Pre-filter: only keep dividends that fall before end_date
+        self._dividends: list[tuple[date, float]] = [
+            (ex_date, amount)
+            for ex_date, amount in dividend_schedule
+            if ex_date < end_date
+        ]
+
+    def scenario_cashflows(
+        self,
+        val_date: date,
+        market_state: dict[str, RiskFactorSlice],
+        fixings: dict | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        """Settlement cashflow on maturity date: (S(T) - K) × nominal."""
+        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
+        if val_date != self.end_date:
+            return np.zeros(spot_slice.values.shape[0])
+        return (spot_slice.values - self.agreed_forward) * self.nominal
+
+    def scenario_npvs(
+        self,
+        val_date: date,
+        market_state: dict[str, RiskFactorSlice],
+        fixings: dict | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        from utils.ql_helpers import to_ql_date
+
+        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
+        spot = spot_slice.values  # (n_paths,)
+        n_paths = spot.shape[0]
+
+        if val_date > self.end_date:
+            return np.zeros(n_paths)
+
+        T = float(self._dc.yearFraction(to_ql_date(val_date), to_ql_date(self.end_date)))
+
+        carry_slice = cast(CurveSlice, market_state[self.carry_curve_name])
+        carry_curve = YieldCurve(carry_slice.tenors, carry_slice.values, self.carry_interpolator)
+
+        disc_slice = cast(CurveSlice, market_state[self.discount_curve_name])
+        disc_curve = YieldCurve(disc_slice.tenors, disc_slice.values, self.discount_interpolator)
+
+        # Strip future dividends from the spot price
+        pv_divs = np.zeros(n_paths)
+        for ex_date, amount in self._dividends:
+            if ex_date <= val_date:
+                continue
+            T_div = float(self._dc.yearFraction(to_ql_date(val_date), to_ql_date(ex_date)))
+            pv_divs += amount * disc_curve.discount_factor(T_div)
+
+        S_prime = spot - pv_divs
+
+        # Forward: grow dividend-stripped spot at risk-free carry rate only
+        F, _, _ = equity_forward_price(S_prime, carry_curve, None, T)
+
+        df = disc_curve.discount_factor(T)
+
+        return (F - self.agreed_forward) * self.nominal * df
+
