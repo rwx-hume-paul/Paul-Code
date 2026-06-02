@@ -1,275 +1,157 @@
 from __future__ import annotations
 
-from datetime import date
-from typing import Callable
-
-import numpy as np
-
-from instruments.instrument import Instrument
-from utils.ql_helpers import DAY_COUNTERS
-from market_data.yield_curve import YieldCurve
-from typing import cast
-from market_data.risk_factor import CurveSlice, ScalarSlice, RiskFactorSlice
-from models.equity_pv import equity_forward_price
+from dataclasses import dataclass
+from enum import Enum
 
 
-class EquityForward(Instrument):
-    """Equity forward valued as (F_current - K) * nominal * DF(T).
+class LegType(Enum):
+    FIXED = "fixed"
+    FLOATING = "floating"
 
-    The current forward is computed as:
-        F_current = Spot * exp((r - q) * T)
 
-    where r is the carry (funding) rate and q is the continuous
-    dividend yield, both read from their respective curves at tenor T.
+_VALID_COMPOUNDING_METHODS = frozenset(
+    {"None", "Flat", "Include_Margin", "Exclude_Margin", "Exponential"}
+)
+_VALID_AVERAGING_METHODS = frozenset({"None", "Average_Rate", "Average_Interest"})
+
+
+@dataclass
+class CashflowLeg:
+    """Definition of a single cashflow leg.
+
+    A generic leg definition that can be used across multiple instrument
+    types (IR swaps, cross-currency swaps, etc.).
 
     Parameters
     ----------
-    name : str
-        Trade identifier.
-    end_date : date
-        Maturity / delivery date of the forward.
-    agreed_forward : float
-        The forward price agreed at inception (strike).
-    nominal : float
-        Notional amount.
-    spot_name : str
-        Risk factor name for the equity spot price (scalar).
-    carry_curve_name : str
-        Risk factor name for the carry / funding curve (used to build the
-        forward price).
-    dividend_curve_name : str
-        Risk factor name for the continuous dividend yield curve.
-    carry_interpolator : callable
-        Interpolator factory for the carry curve.
-    dividend_interpolator : callable
-        Interpolator factory for the dividend yield curve
-        (typically reciprocal_time_interp).
-    discount_curve_name : str, optional
-        Risk factor name for the discount curve.  When omitted the carry
-        curve is used for discounting (original behaviour).
-    discount_interpolator : callable, optional
-        Interpolator factory for the discount curve.  Required when
-        *discount_curve_name* is provided.
-    day_count : str
-        Day count convention for year fractions (default "ACT/365").
+    leg_type : LegType
+        Whether the leg pays a fixed rate or a floating rate.
+    frequency : int
+        Payment frequency in months (e.g. 3 for quarterly, 6 for semi-annual,
+        12 for annual). Use ``0`` for a zero-coupon leg: a single payment
+        at maturity covering the full effective-to-maturity accrual period.
+    spread : float
+        Additive spread applied to the rate.
+    fixed_rate : float or None
+        The fixed coupon rate (annualised). Required when leg_type is FIXED.
+    curve_name : str or None
+        Scenario-cube factor name for the floating reference curve.
+        Required when leg_type is FLOATING.
+    fixing_tenor_months : int or None
+        Tenor (in months) used to look up the LIBOR fixing rate from the
+        projection curve.  When set, BOTH valuation and the in-progress
+        fixing use this tenor instead of the schedule period length.
+        Required whenever the schedule period length can differ from the
+        index tenor — e.g. a JIBAR-3m leg on a trade whose maturity is
+        less than 3 months, or any leg with front/back stub periods.
+        Has no effect on overnight-compounding legs.
+    forward_business_convention : str or None
+        If the forward index uses a different business convention from
+        the leg schedule, specify it here.
+    overnight_compounding : bool
+        When True, the floating rate for each period is computed by
+        compounding daily overnight forward factors (e.g. SOFR, ESTR).
+        Each business day's one-day forward factor DF(t_i)/DF(t_{i+1}) is
+        multiplied together, then converted to a simply-compounded rate over
+        the full accrual period tau.  Has no effect on FIXED legs.
+    include_notional_exchange : bool
+        If True, the fixed notional is repaid at maturity alongside the
+        final coupon cashflow.  On the nominal leg of an index-linked swap
+        this mirrors the inflation-adjusted notional returned on the
+        inflation leg.  Defaults to False (no principal exchange).
+    reset_frequency_months : int
+        Sub-period reset frequency in months.  When non-zero AND less than
+        ``frequency``, each payment period is split into multiple sub-periods
+        of this length (the last may be shorter if the division is uneven).
+        A separate floating rate is fixed at the start of each sub-period,
+        and the sub-period rates are combined via ``compounding_method`` or
+        ``averaging_method``.  Mirrors RiskFlow's per-cashflow ``Resets``
+        list (e.g. JIBAR-3m resets inside a 6-month payment period).
+        Set to ``0`` (default) for the standard single-reset-per-period
+        behaviour.
+    compounding_period_months : int
+        Sub-period compounding interval in months for **FIXED** legs (default 0 =
+        simple accrual).  When non-zero, the coupon interest for each payment
+        period is computed as:
+
+            interest = ∏_j (1 + rate × τ_j) − 1
+
+        where the sub-periods advance ``compounding_period_months`` at a time from
+        the period start (with a possible short stub at the end), exactly mirroring
+        RiskFlow's ``YieldCashflowListDeal`` / ``YieldInflationCashflowListDeal``
+        ``Compound`` field.  Has no effect on ``FLOATING`` legs; use
+        ``reset_frequency_months`` with ``compounding_method`` for those.
+    compounding_method : str
+        How sub-period rates are combined when ``reset_frequency_months > 0``.
+        Mirrors RiskFlow's ``Compounding_Method`` on ``CFFloatingInterestListDeal``:
+
+        - ``"None"``          — no compounding; only the first sub-period
+                                rate is used (effectively falls back to
+                                single-reset behaviour).
+        - ``"Include_Margin"``— compound ``(r_i + spread) * tau_i`` for
+                                each sub-period (ISDA "Straight" compounding):
+                                ``prod(1 + (r_i+m)*tau_i) - 1``.
+        - ``"Flat"``          — compound ``r_i * tau_i`` without the spread;
+                                spread is added linearly on the original notional:
+                                ``prod(1 + r_i*tau_i) - 1 + m*tau_total``
+                                (ISDA "Flat" compounding).
+        - ``"Exclude_Margin"``— same as ``"Flat"``: compound rates, spread
+                                applied linearly.
+        - ``"Exponential"``   — ``exp(sum(r_i*tau_i)) - 1 + m*tau_total``.
+
+        Mutually exclusive with ``averaging_method``.
+    averaging_method : str
+        How sub-period rates are combined when ``reset_frequency_months > 0``.
+        Mirrors RiskFlow's ``Averaging_Method``:
+
+        - ``"None"``              — no averaging (use ``compounding_method``).
+        - ``"Average_Rate"``      — arithmetic mean of sub-period rates applied
+                                    to the full payment period:
+                                    ``(mean(r_i) + m) * tau_total``.
+        - ``"Average_Interest"``  — sum individual sub-period interest amounts:
+                                    ``sum(r_i * tau_i) + m * tau_total``.
+
+        Mutually exclusive with ``compounding_method``.
     """
 
-    def __init__(
-        self,
-        name: str,
-        end_date: date,
-        agreed_forward: float,
-        nominal: float,
-        spot_name: str,
-        carry_curve_name: str,
-        dividend_curve_name: str,
-        carry_interpolator: Callable,
-        dividend_interpolator: Callable,
-        discount_curve_name: str = "",
-        discount_interpolator: Callable = None,
-        day_count: str = "ACT/365",
-    ):
-        super().__init__(name)
-        self.end_date = end_date
-        self.agreed_forward = agreed_forward
-        self.nominal = nominal
-        self.spot_name = spot_name
-        self.carry_curve_name = carry_curve_name
-        self.dividend_curve_name = dividend_curve_name
-        self.carry_interpolator = carry_interpolator
-        self.dividend_interpolator = dividend_interpolator
-        self.discount_curve_name = discount_curve_name
-        self.discount_interpolator = discount_interpolator
-        self._dc = DAY_COUNTERS[day_count]
+    leg_type: LegType
+    frequency: int
+    spread: float = 0.0
+    fixed_rate: float | None = None
+    curve_name: str | None = None
+    fixing_tenor_months: int | None = None
+    forward_business_convention: str | None = None
+    overnight_compounding: bool = False
+    include_notional_exchange: bool = False
+    compounding_period_months: int = 0
+    reset_frequency_months: int = 0
+    compounding_method: str = "None"
+    averaging_method: str = "None"
 
-    def scenario_cashflows(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict[tuple[str, date], np.ndarray] | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        """Settlement cashflow on maturity date: (S(T) - K) * nominal."""
-        spot_slice = market_state[self.spot_name]
-        if val_date != self.end_date:
-            return np.zeros(spot_slice.values.shape[0])
-        return (spot_slice.values - self.agreed_forward) * self.nominal
-
-    def scenario_npvs(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict[tuple[str, date], np.ndarray] | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        # Past maturity: worth nothing (settlement already captured via cashflows)
-        if val_date > self.end_date:
-            spot_slice = market_state[self.spot_name]
-            n_paths = spot_slice.values.shape[0]
-            return np.zeros(n_paths)
-
-        # Time to maturity
-        from utils.ql_helpers import to_ql_date
-        T = self._dc.yearFraction(to_ql_date(val_date), to_ql_date(self.end_date))
-
-        # Spot
-        spot_slice = market_state[self.spot_name]
-        spot = spot_slice.values  # (n_paths,)
-
-        # Carry curve
-        carry_slice: CurveSlice = market_state[self.carry_curve_name]
-        carry_curve = YieldCurve(
-            carry_slice.tenors, carry_slice.values, self.carry_interpolator,
-        )
-
-        # Dividend yield curve
-        div_slice: CurveSlice = market_state[self.dividend_curve_name]
-        div_curve = YieldCurve(
-            div_slice.tenors, div_slice.values, self.dividend_interpolator,
-        )
-
-        F_current, carry_df, _ = equity_forward_price(spot, carry_curve, div_curve, T)
-
-        # Discount factor
-        if self.discount_curve_name:
-            disc_slice: CurveSlice = market_state[self.discount_curve_name]
-            disc_curve = YieldCurve(
-                disc_slice.tenors, disc_slice.values, self.discount_interpolator,
+    def __post_init__(self):
+        if self.leg_type == LegType.FIXED and self.fixed_rate is None:
+            raise ValueError("fixed_rate is required for a FIXED leg")
+        if self.leg_type == LegType.FLOATING and self.curve_name is None:
+            raise ValueError("curve_name is required for a FLOATING leg")
+        if self.overnight_compounding and self.leg_type != LegType.FLOATING:
+            raise ValueError("overnight_compounding requires leg_type=FLOATING")
+        if self.compounding_period_months < 0:
+            raise ValueError("compounding_period_months must be non-negative")
+        if self.compounding_method not in _VALID_COMPOUNDING_METHODS:
+            raise ValueError(
+                f"compounding_method must be one of {sorted(_VALID_COMPOUNDING_METHODS)}, "
+                f"got {self.compounding_method!r}"
             )
-            df = disc_curve.discount_factor(T)
-        else:
-            df = carry_df
+        if self.averaging_method not in _VALID_AVERAGING_METHODS:
+            raise ValueError(
+                f"averaging_method must be one of {sorted(_VALID_AVERAGING_METHODS)}, "
+                f"got {self.averaging_method!r}"
+            )
+        # Both may be set simultaneously — this is valid in RiskFlow deal JSON.
+        # When compounding_method != "None", it takes precedence and averaging_method
+        # is silently ignored, exactly matching RiskFlow's pricing engine which never
+        # reads Averaging_Method when Compounding_Method is active.
 
-        return (F_current - self.agreed_forward) * self.nominal * df
 
-
-class EquityForwardDiscreteDividends(Instrument):
-    """Equity forward priced with an explicit discrete-dividend schedule.
-
-    On each simulation date t the stock price is stripped of the present
-    value of all future discrete dividends whose ex-dividend date falls
-    strictly after t and strictly before end_date:
-
-        S'(t) = S(t) - Σ  div_i × DF(t → ex_date_i)
-
-    The forward price is then grown at the risk-free carry rate only:
-
-        F(T) = S'(t) × exp(r × T)
-
-    and the NPV is:
-
-        NPV = (F(T) - K) × nominal × DF(t → T)
-
-    Parameters
-    ----------
-    name : str
-        Trade identifier.
-    end_date : date
-        Maturity / delivery date of the forward.
-    agreed_forward : float
-        Forward price agreed at inception (strike).
-    nominal : float
-        Notional amount.
-    spot_name : str
-        Risk-factor name for the equity spot price.
-    carry_curve_name : str
-        Risk-factor name for the carry / funding rate curve.
-    discount_curve_name : str
-        Risk-factor name for the discount curve.
-    carry_interpolator : callable
-        Interpolator factory for the carry curve.
-    discount_interpolator : callable
-        Interpolator factory for the discount curve.
-    dividend_schedule : list of (date, float)
-        Each entry is (ex_dividend_date, dividend_amount).  Dividends whose
-        ex-date falls on or after end_date are silently ignored at
-        construction time.
-    day_count : str
-        Day-count convention key (default ``"ACT/365"``).
-    """
-
-    def __init__(
-        self,
-        name: str,
-        end_date: date,
-        agreed_forward: float,
-        nominal: float,
-        spot_name: str,
-        carry_curve_name: str,
-        discount_curve_name: str,
-        carry_interpolator: Callable,
-        discount_interpolator: Callable,
-        dividend_schedule: list[tuple[date, float]],
-        day_count: str = "ACT/365",
-    ) -> None:
-        super().__init__(name)
-        self.end_date = end_date
-        self.agreed_forward = agreed_forward
-        self.nominal = nominal
-        self.spot_name = spot_name
-        self.carry_curve_name = carry_curve_name
-        self.discount_curve_name = discount_curve_name
-        self.carry_interpolator = carry_interpolator
-        self.discount_interpolator = discount_interpolator
-        self._dc = DAY_COUNTERS[day_count]
-        # Pre-filter: only keep dividends that fall before end_date
-        self._dividends: list[tuple[date, float]] = [
-            (ex_date, amount)
-            for ex_date, amount in dividend_schedule
-            if ex_date < end_date
-        ]
-
-    def scenario_cashflows(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        """Settlement cashflow on maturity date: (S(T) - K) × nominal."""
-        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
-        if val_date != self.end_date:
-            return np.zeros(spot_slice.values.shape[0])
-        return (spot_slice.values - self.agreed_forward) * self.nominal
-
-    def scenario_npvs(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        from utils.ql_helpers import to_ql_date
-
-        spot_slice = cast(ScalarSlice, market_state[self.spot_name])
-        spot = spot_slice.values  # (n_paths,)
-        n_paths = spot.shape[0]
-
-        if val_date > self.end_date:
-            return np.zeros(n_paths)
-
-        T = float(self._dc.yearFraction(to_ql_date(val_date), to_ql_date(self.end_date)))
-
-        carry_slice = cast(CurveSlice, market_state[self.carry_curve_name])
-        carry_curve = YieldCurve(carry_slice.tenors, carry_slice.values, self.carry_interpolator)
-
-        disc_slice = cast(CurveSlice, market_state[self.discount_curve_name])
-        disc_curve = YieldCurve(disc_slice.tenors, disc_slice.values, self.discount_interpolator)
-
-        # Strip future dividends from the spot price
-        pv_divs = np.zeros(n_paths)
-        for ex_date, amount in self._dividends:
-            if ex_date <= val_date:
-                continue
-            T_div = float(self._dc.yearFraction(to_ql_date(val_date), to_ql_date(ex_date)))
-            pv_divs += amount * disc_curve.discount_factor(T_div)
-
-        S_prime = spot - pv_divs
-
-        # Forward: grow dividend-stripped spot at risk-free carry rate only
-        F, _, _ = equity_forward_price(S_prime, carry_curve, None, T)
-
-        df = disc_curve.discount_factor(T)
-
-        return (F - self.agreed_forward) * self.nominal * df
-
+# Backwards-compatible alias
+SwapLeg = CashflowLeg
