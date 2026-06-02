@@ -3,650 +3,314 @@ from __future__ import annotations
 from datetime import date
 from typing import Callable
 
-import numpy as np
 import QuantLib as ql
+import numpy as np
 
-from instruments.components.cashflow_leg import CashflowLeg, LegType
-from utils.ql_helpers import to_ql_date, BUSINESS_CONVENTIONS, generate_sub_periods
+from instruments.components.cashflow_leg import CashflowLeg, LegType, SwapLeg  # noqa: F401 — re-export
+from instruments.components.schedule_config import ScheduleConfig
+from instruments.instrument import Instrument
+from utils.ql_helpers import to_ql_date, generate_sub_periods, BUSINESS_CONVENTIONS
 from market_data.yield_curve import YieldCurve
 from market_data.risk_factor import CurveSlice, RiskFactorSlice
+from models.cashflow_pv import leg_pv
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# IRSwap
 # ---------------------------------------------------------------------------
 
-def filter_future_periods(
-    schedule: list[tuple[date, date, float]],
-    val_date: date,
-    include_on_val_date: bool = False,
-) -> list[tuple[date, date, float]]:
-    """Return only periods whose end date is after val_date.
+class IRSwap(Instrument):
+    """Interest-rate swap priced against a ScenarioCube.
 
-    If *include_on_val_date* is True, periods whose end date equals
-    val_date are also included (i.e. ``end >= val_date``).
+    Schedules are generated once at construction via QuantLib.
+    On each call to :meth:`scenario_npvs`, a yield curve is built per path
+    from the simulated curve factor in *market_state*, forward rates are
+    computed for each accrual period, and cashflows are discounted.
+
+    Supports LIBOR-style legs, overnight-compounded (OIS) legs such as
+    ZARONIA or SOFR, sub-period resets with compounding/averaging, and
+    fixed legs with optional sub-period compounding.
     """
-    if include_on_val_date:
-        return [(s, e, a) for s, e, a in schedule if e >= val_date]
-    return [(s, e, a) for s, e, a in schedule if e > val_date]
 
+    def __init__(
+        self,
+        name: str,
+        effective_date: date,
+        maturity_date: date,
+        notional: float,
+        receive_leg: SwapLeg,
+        pay_leg: SwapLeg,
+        discount_curve_name: str,
+        interpolator: Callable,
+        schedule_config: ScheduleConfig | None = None,
+        # legacy flat params — used only when schedule_config is not supplied
+        calendar: str = "ZAR",
+        business_convention: str = "ModifiedFollowing",
+        termination_business_convention: str = "ModifiedFollowing",
+        date_generation: str = "Backward",
+        day_count: str = "ACT/365",
+        curve_day_count: str = "ACT/365",
+        end_of_month: bool = False,
+        include_sim_date_cashflows: bool = False,
+    ):
+        super().__init__(name)
+        self.effective_date = effective_date
+        self.maturity_date = maturity_date
+        self.notional = notional
+        self.receive_leg = receive_leg
+        self.pay_leg = pay_leg
+        self.discount_curve_name = discount_curve_name
+        self.interpolator = interpolator
+        self.include_sim_date_cashflows = include_sim_date_cashflows
 
-def compute_period_year_fractions(
-    future: list[tuple[date, date, float]],
-    val_date: date,
-    curve_day_counter: ql.DayCounter,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Year fractions from val_date to period start/end, plus accruals.
-
-    Returns (t_starts, t_ends, accruals) each of shape (n_periods,).
-    """
-    ql_val = to_ql_date(val_date)
-    t_starts = np.array([
-        curve_day_counter.yearFraction(ql_val, to_ql_date(s))
-        for s, _, _ in future
-    ])
-    t_ends = np.array([
-        curve_day_counter.yearFraction(ql_val, to_ql_date(e))
-        for _, e, _ in future
-    ])
-    accruals = np.array([a for _, _, a in future])
-    return t_starts, t_ends, accruals
-
-
-def apply_fixings(
-    forward_rates: np.ndarray,
-    future: list[tuple[date, date, float]],
-    curve_name: str,
-    fixings: dict[tuple[str, date], np.ndarray] | None,
-) -> np.ndarray:
-    """Apply fixings to forward rates in-place.
-
-    For LIBOR-style legs: ``fixings[(curve_name, period_start)]`` is the
-    simply-compounded rate R for that period (shape ``(n_paths,)`` or scalar).
-
-    For OIS in-progress periods the caller handles CF_realized directly in
-    ``leg_pv`` before calling this function, so only future periods are
-    updated here.
-
-    Parameters
-    ----------
-    forward_rates : np.ndarray, shape (n_paths, n_periods)
-        Forward rates to be modified.
-    future : list of (start, end, accrual)
-        Future schedule periods.
-    curve_name : str
-        Risk factor name for the floating reference curve.
-    fixings : dict or None
-        Fixings keyed by ``(curve_name, period_start)``.
-
-    Returns
-    -------
-    np.ndarray
-        The modified forward_rates array.
-    """
-    if fixings:
-        for i, (s, _e, _a) in enumerate(future):
-            key = (curve_name, s)
-            if key in fixings:
-                forward_rates[:, i] = fixings[key]
-
-    return forward_rates
-
-
-# ---------------------------------------------------------------------------
-# Leg PV
-# ---------------------------------------------------------------------------
-
-def leg_pv(
-    schedule: list[tuple[date, date, float]],
-    leg: CashflowLeg,
-    notional: float,
-    val_date: date,
-    market_state: dict[str, RiskFactorSlice],
-    discount_curve: YieldCurve,
-    n_paths: int,
-    interpolator: Callable,
-    day_counter: ql.DayCounter,
-    curve_day_counter: ql.DayCounter,
-    calendar: ql.Calendar,
-    fixings: dict[tuple[str, date], np.ndarray] | None = None,
-    include_on_val_date: bool = False,
-    notional_schedule: np.ndarray | None = None,
-) -> np.ndarray:
-    """Compute PV of a single cashflow leg, vectorised over paths.
-
-    Works with n_paths=1 for deterministic base valuation or
-    n_paths=N for Monte Carlo simulation.
-
-    Parameters
-    ----------
-    schedule : list of (accrual_start, accrual_end, accrual_fraction)
-        The leg's payment schedule.
-    leg : CashflowLeg
-        Leg definition (type, rate, spread, etc.).
-    notional : float
-        Scalar notional amount.  Ignored when *notional_schedule* is provided.
-    val_date : date
-        Valuation date.
-    market_state : dict[str, RiskFactorSlice]
-        Current market state with curve data.
-    discount_curve : YieldCurve
-        Pre-built discount curve for discounting cashflows.
-    n_paths : int
-        Number of simulation paths (1 for base valuation).
-    interpolator : callable
-        Interpolator factory for building forward curves.
-    day_counter : ql.DayCounter
-        Day count convention for accrual / forward rate computation.
-    curve_day_counter : ql.DayCounter
-        Day count convention for year fractions on the curve.
-    calendar : ql.Calendar
-        Calendar for business day adjustments.
-    fixings : dict or None
-        Pre-computed Category B fixings keyed by (curve_name, period_start).
-    notional_schedule : np.ndarray or None
-        Per-path, per-period notional array of shape (n_paths, n_future_periods).
-        When provided, overrides the scalar *notional* for each period so that
-        each path can have a different notional (e.g. equity-forward-scaled
-        notionals for an equity TRS interest leg with ``nominal_scaling="Price"``).
-
-    Returns
-    -------
-    np.ndarray, shape (n_paths,)
-        Present value of the leg per path.
-    """
-    future = filter_future_periods(schedule, val_date, include_on_val_date)
-    if not future:
-        return np.zeros(n_paths)
-
-    t_starts, t_ends, accruals = compute_period_year_fractions(
-        future, val_date, curve_day_counter,
-    )
-
-    # discount factors to each payment date: (n_paths, n_periods)
-    dfs = discount_curve.discount_factor(t_ends)
-
-    if leg.leg_type == LegType.FIXED:
-        rate = leg.fixed_rate + leg.spread
-        if leg.compounding_period_months > 0:
-            # Sub-period compounding for fixed legs
-            # (mirrors RiskFlow YieldCashflowListDeal / YieldInflationCashflowListDeal
-            # Compound field).  Advancing from period start with ModifiedFollowing;
-            # a possible short stub lands at the period end.
-            # interest_i = ∏_j (1 + rate × τ_j) − 1
-            interest_factors = np.empty(len(future))
-            for idx, (start, end, _) in enumerate(future):
-                subs = generate_sub_periods(
-                    start, end, leg.compounding_period_months,
-                    calendar, ql.ModifiedFollowing, day_counter,
-                    direction="Forward",
-                )
-                cf = 1.0
-                for _, _, tau_i in subs:
-                    cf *= (1.0 + rate * tau_i)
-                interest_factors[idx] = cf - 1.0
-            last_end = max(e for _, e, _ in schedule)
-            if notional_schedule is not None:
-                period_cfs = notional_schedule * interest_factors
-                if leg.include_notional_exchange:
-                    for i, (_, end_date, _) in enumerate(future):
-                        if end_date == last_end:
-                            period_cfs[:, i] += notional
-                            break
-                return np.sum(period_cfs * dfs, axis=1)
-            period_cfs = notional * interest_factors   # (n_periods,)
-            if leg.include_notional_exchange:
-                for i, (_, end_date, _) in enumerate(future):
-                    if end_date == last_end:
-                        period_cfs[i] += notional
-                        break
-            return dfs @ period_cfs                    # (n_paths,)
-        if notional_schedule is not None:
-            period_cfs = notional_schedule * rate * accruals  # (n_paths, n_periods)
-            if leg.include_notional_exchange:
-                last_end = max(e for _, e, _ in schedule)
-                for i, (_, end_date, _) in enumerate(future):
-                    if end_date == last_end:
-                        period_cfs[:, i] = period_cfs[:, i] + notional
-                        break
-            return np.sum(period_cfs * dfs, axis=1)           # (n_paths,)
-        period_cfs = notional * rate * accruals  # (n_periods,)
-        if leg.include_notional_exchange:
-            last_end = max(e for _, e, _ in schedule)
-            for i, (_, end_date, _) in enumerate(future):
-                if end_date == last_end:
-                    period_cfs[i] += notional
-                    break
-        return dfs @ period_cfs                   # (n_paths,)
-
-    # Sub-period compounding / averaging: dispatch to dedicated function.
-    # Triggered when there are genuine sub-period resets (reset_frequency_months
-    # set to a value less than the payment frequency) AND either a compounding
-    # or averaging method has been specified.
-    use_compounding = (
-        leg.reset_frequency_months > 0
-        and (leg.compounding_method != "None" or leg.averaging_method != "None")
-    )
-    if use_compounding:
-        return _leg_pv_compounded(
-            future, leg, notional, val_date, market_state, discount_curve,
-            n_paths, interpolator, day_counter, curve_day_counter, calendar, fixings,
+        self.schedule_config = schedule_config or ScheduleConfig(
+            calendar=calendar,
+            business_convention=business_convention,
+            termination_business_convention=termination_business_convention,
+            date_generation=date_generation,
+            day_count=day_count,
+            curve_day_count=curve_day_count,
+            end_of_month=end_of_month,
         )
 
-    # floating: compute forward rates from the projection curve
-    fwd_slice: CurveSlice = market_state[leg.curve_name]
-    fwd_curve = YieldCurve(
-        year_fracs=fwd_slice.tenors,
-        rates=fwd_slice.values,
-        interpolator=interpolator,
-    )
+        self._generate_schedules()
 
-    fwd_t_ends, fwd_tau = _compute_forward_tenors(
-        future, leg, t_ends, val_date,
-        day_counter, curve_day_counter, calendar,
-    )
+        # Quick curve_name → leg lookup used by compute_fixings / compute_cf_increment
+        self._curve_to_leg: dict[str, CashflowLeg] = {}
+        for leg in (self.receive_leg, self.pay_leg):
+            if leg.leg_type == LegType.FLOATING and leg.curve_name:
+                self._curve_to_leg[leg.curve_name] = leg
 
-    in_progress = t_starts[0] < 0
+    # ------------------------------------------------------------------
+    # schedule generation
+    # ------------------------------------------------------------------
 
-    if in_progress and leg.overnight_compounding:
-        # OIS in-progress: combine CF_realized (from fixings) with CF_forward
-        # (from the stochastic discount curve).
-        #
-        #   MTM = Notional * (CF_realized * CF_forward - 1) * DF(T_end)
-        #
-        # Expressing this through the standard cashflow framework:
-        #   CF_forward = 1 / DF(T_end)   (risk-neutral identity for a single period)
-        #   r_eff = (CF_realized / DF(T_end) - 1) / tau_full
-        #
-        # so that  notional * r_eff * tau * DF(T_end) = notional * (CF_realized - DF(T_end))
-        #
-        # fixings[(curve_name, period_start)] = CF_realized  (compound factor so far,
-        # ndarray shape (n_paths,) or scalar).  Defaults to 1.0 if absent (no days
-        # have compounded yet — period just started on val_date).
-        period_start = future[0][0]
-        key = (leg.curve_name, period_start)
-        if fixings and key in fixings:
-            cf_realized = np.asarray(fixings[key], dtype=np.float64)
-            if cf_realized.ndim == 0:
-                cf_realized = np.full(n_paths, float(cf_realized))
-        else:
-            cf_realized = np.ones(n_paths)
-
-        df_end_fwd = fwd_curve.discount_factor(fwd_t_ends[0])  # (n_paths,)
-        r_eff = (cf_realized / df_end_fwd - 1.0) / fwd_tau[0]  # (n_paths,)
-        first_col = r_eff.reshape(n_paths, 1)
-
-        if len(future) > 1:
-            rest = _calc_forward_rates(
-                fwd_curve, future[1:], t_starts[1:], fwd_t_ends[1:], fwd_tau[1:],
-                leg, val_date, calendar, curve_day_counter,
-            )
-            forward_rates = np.hstack([first_col, rest])
-        else:
-            forward_rates = first_col
-        # OIS in-progress period is fully handled above; no apply_fixings needed.
-
-    elif in_progress:
-        # LIBOR-style in-progress: rate was fixed at period start (in the past).
-        # Zero the first column; apply_fixings will fill it from the fixings dict
-        # keyed by (curve_name, period_start) → simply-compounded rate R.
-        first_col = np.zeros((n_paths, 1))
-        if len(future) > 1:
-            rest = _calc_forward_rates(
-                fwd_curve, future[1:], t_starts[1:], fwd_t_ends[1:], fwd_tau[1:],
-                leg, val_date, calendar, curve_day_counter,
-            )
-            forward_rates = np.hstack([first_col, rest])
-        else:
-            forward_rates = first_col
-        forward_rates = apply_fixings(forward_rates, future, leg.curve_name, fixings)
-
-    else:
-        forward_rates = _calc_forward_rates(
-            fwd_curve, future, t_starts, fwd_t_ends, fwd_tau,
-            leg, val_date, calendar, curve_day_counter,
+    def _generate_schedules(self):
+        """Build QuantLib schedules and store accrual info for both legs."""
+        self.receive_schedule = self.schedule_config.build(
+            self.effective_date, self.maturity_date, self.receive_leg.frequency,
         )
-        forward_rates = apply_fixings(forward_rates, future, leg.curve_name, fixings)
-
-    forward_rates = forward_rates + leg.spread
-
-    if notional_schedule is not None:
-        cashflows = notional_schedule * forward_rates * accruals
-    else:
-        cashflows = notional * forward_rates * accruals  # (n_paths, n_periods)
-
-    if leg.include_notional_exchange:
-        last_end = max(e for _, e, _ in schedule)
-        for i, (_, end_date, _) in enumerate(future):
-            if end_date == last_end:
-                cashflows[:, i] = cashflows[:, i] + notional
-                break
-
-    return np.sum(cashflows * dfs, axis=1)  # (n_paths,)
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _build_overnight_tenors(
-    period_start: date,
-    period_end: date,
-    val_date: date,
-    calendar: ql.Calendar,
-    curve_day_counter: ql.DayCounter,
-) -> np.ndarray:
-    """Year fracs from val_date to each business day in [period_start, period_end].
-
-    Iterates every calendar day and keeps only business days (as determined by
-    *calendar*).  Including both endpoints means that for a Friday, the
-    next entry is Monday — so ``DF(t_fri) / DF(t_mon)`` captures the
-    three-day weekend accrual automatically.
-
-    Parameters
-    ----------
-    period_start, period_end : date
-        Inclusive endpoints of the accrual period (both must be business days).
-    val_date : date
-        Scenario valuation date; used as the origin for year fractions.
-    calendar : ql.Calendar
-        Determines which days are business days.
-    curve_day_counter : ql.DayCounter
-        Day count convention used for year-fraction computation.
-
-    Returns
-    -------
-    np.ndarray, shape (n_business_days + 1,)
-        Year fractions to each business day from period_start to period_end,
-        inclusive of both endpoints.
-    """
-    ql_val = to_ql_date(val_date)
-    ql_start = to_ql_date(period_start)
-    ql_end = to_ql_date(period_end)
-
-    tenors = []
-    d = ql_start
-    while d <= ql_end:
-        if calendar.isBusinessDay(d):
-            tenors.append(curve_day_counter.yearFraction(ql_val, d))
-        d = d + 1  # advance one calendar day; weekend/holiday days are skipped above
-
-    return np.array(tenors, dtype=np.float64)
-
-
-def _calc_forward_rates(
-    fwd_curve: YieldCurve,
-    periods: list[tuple[date, date, float]],
-    t_starts: np.ndarray,
-    fwd_t_ends: np.ndarray,
-    fwd_tau: np.ndarray,
-    leg: CashflowLeg,
-    val_date: date,
-    calendar: ql.Calendar,
-    curve_day_counter: ql.DayCounter,
-) -> np.ndarray:
-    """Forward rates for *periods*, shape (n_paths, n_periods).
-
-    For overnight compounding (e.g. SOFR), each period's rate is derived from
-    two cumulative compound factors measured from val_date:
-
-        CF(val_date → t_start)  and  CF(val_date → t_end)
-
-    The forward compounded rate = (CF_end / CF_start - 1) / tau.  For the
-    first period where t_start = val_date, CF_start = 1 (empty product) and
-    the result reduces to a standard spot compounded overnight rate.
-
-    For non-overnight legs the standard simply-compounded ``forward_rate``
-    is used.
-    """
-    if leg.overnight_compounding:
-        rates = []
-        for i, (s, e, _) in enumerate(periods):
-            # Schedules from val_date to each boundary (period_start = val_date
-            # produces a single-element array; its forward-factor product = 1).
-            t_sched_to_s = _build_overnight_tenors(
-                val_date, s, val_date, calendar, curve_day_counter,
-            )
-            t_sched_to_e = _build_overnight_tenors(
-                val_date, e, val_date, calendar, curve_day_counter,
-            )
-            rates.append(
-                fwd_curve.forward_compounded_overnight_rate(
-                    t_sched_to_s, t_sched_to_e, tau=fwd_tau[i],
-                )
-            )
-        return np.column_stack(rates)
-    return fwd_curve.forward_rate(t_starts, fwd_t_ends, tau=fwd_tau)
-
-
-def _compute_forward_tenors(
-    future: list[tuple[date, date, float]],
-    leg: CashflowLeg,
-    t_ends: np.ndarray,
-    val_date: date,
-    day_counter: ql.DayCounter,
-    curve_day_counter: ql.DayCounter,
-    calendar: ql.Calendar,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute forward period end year-fractions and accrual day-count fractions.
-
-    When *fixing_tenor_months* is set on the leg the forward end date is
-    always computed as ``calendar.advance(period_start, fixing_tenor_months)``,
-    irrespective of the schedule period length.  This correctly handles stub
-    periods and short-maturity trades where the schedule end date is earlier
-    than the index natural tenor end (e.g. JIBAR-3m on a 2-month trade).
-
-    When *forward_business_convention* is set (but not *fixing_tenor_months*)
-    the forward end date is computed using ``leg.frequency`` with that
-    convention — the original behaviour for non-standard index conventions.
-
-    Returns (fwd_t_ends, fwd_tau) each of shape (n_periods,).
-    """
-    ql_val = to_ql_date(val_date)
-
-    fixing_tenor = leg.fixing_tenor_months
-    fwd_conv_str = leg.forward_business_convention
-
-    if fixing_tenor is not None or fwd_conv_str is not None:
-        tenor_months = fixing_tenor if fixing_tenor is not None else leg.frequency
-        fwd_convention = (
-            BUSINESS_CONVENTIONS[fwd_conv_str]
-            if fwd_conv_str is not None
-            else ql.ModifiedFollowing
-        )
-        fwd_end_dates = []
-        fwd_taus = []
-        for s, _e, _a in future:
-            ql_s = to_ql_date(s)
-            ql_fwd_end = calendar.advance(
-                ql_s,
-                ql.Period(tenor_months, ql.Months),
-                fwd_convention,
-            )
-            fwd_end_dates.append(
-                curve_day_counter.yearFraction(ql_val, ql_fwd_end)
-            )
-            # fwd_tau uses the coupon accrual day count (day_counter), not the
-            # curve day count, so that the extracted rate R = (DF_s/DF_e - 1)/tau
-            # is quoted in the same convention as the schedule accruals.
-            # For USD: day_counter=ACT/360, curve_day_counter=ACT/365.
-            fwd_taus.append(
-                day_counter.yearFraction(ql_s, ql_fwd_end)
-            )
-        return np.array(fwd_end_dates), np.array(fwd_taus)
-
-    # Default path: fwd_tau in the coupon accrual convention (day_counter).
-    # t_ends (used for DF lookup) stays in curve_day_counter.
-    fwd_tau = np.array([
-        day_counter.yearFraction(to_ql_date(s), to_ql_date(e))
-        for s, e, _ in future
-    ])
-    return t_ends, fwd_tau
-
-
-# ---------------------------------------------------------------------------
-# Sub-period compounding / averaging (RiskFlow CFFloatingInterestListDeal)
-# ---------------------------------------------------------------------------
-
-def _apply_compounding_method(
-    sub_rates: np.ndarray,
-    sub_accruals: np.ndarray,
-    tau_total: float,
-    margin: float,
-    compounding_method: str,
-    averaging_method: str,
-) -> np.ndarray:
-    """Combine sub-period rates into a single interest amount (not yet × notional).
-
-    Parameters
-    ----------
-    sub_rates : (n_paths, n_sub)
-        Simply-compounded rate for each sub-period.
-    sub_accruals : (n_sub,)
-        Accrual fractions for each sub-period (sum = tau_total).
-    tau_total : float
-        Sum of sub_accruals (the full payment-period year fraction).
-    margin : float
-        Additive spread from the leg definition.
-    compounding_method, averaging_method : str
-        Exactly one must be non-``"None"``.
-
-    Returns
-    -------
-    np.ndarray, shape (n_paths,)
-        Interest amount per path (multiply by notional and discount factor
-        to get the discounted cashflow).
-    """
-    tau = sub_accruals  # shape (n_sub,)
-
-    # Compounding takes precedence over averaging — matches RiskFlow's
-    # pv_float_cashflow_list which reads Compounding_Method exclusively and never
-    # consults Averaging_Method when a compounding method is active.
-
-    if compounding_method == "Include_Margin":
-        # Straight compounding: compound (r_i + margin) together
-        #   CF = prod_i(1 + (r_i + m) * tau_i) - 1
-        cf = np.ones(sub_rates.shape[0])
-        for j in range(sub_rates.shape[1]):
-            cf = cf * (1.0 + (sub_rates[:, j] + margin) * tau[j])
-        return cf - 1.0
-
-    if compounding_method in ("Flat", "Exclude_Margin"):
-        # RiskFlow exact recurrence (mirrors pv_float_cashflow_list):
-        #   total_new = total_old * (1 + r_j*tau_j) + (r_j + m)*tau_j
-        total = np.zeros(sub_rates.shape[0])
-        for j in range(sub_rates.shape[1]):
-            r_j = sub_rates[:, j]
-            total = total * (1.0 + r_j * tau[j]) + (r_j + margin) * tau[j]
-        return total
-
-    if compounding_method == "Exponential":
-        # exp(sum(r_i * tau_i)) - 1 + m * tau_total
-        exponent = np.sum(sub_rates * tau, axis=1)
-        return (np.exp(exponent) - 1.0) + margin * tau_total
-
-    # compounding_method == "None" — fall through to averaging methods.
-    if averaging_method == "Average_Rate":
-        # Arithmetic mean of sub-period rates, applied to full period
-        return (sub_rates.mean(axis=1) + margin) * tau_total
-
-    if averaging_method == "Average_Interest":
-        # Sum individual sub-period interest amounts; spread on full period
-        return np.sum(sub_rates * tau, axis=1) + margin * tau_total
-
-    # Both "None" with sub-periods active: simple sum of sub-period interest.
-    return np.sum(sub_rates * tau, axis=1) + margin * tau_total
-
-
-def _leg_pv_compounded(
-    future: list[tuple[date, date, float]],
-    leg: CashflowLeg,
-    notional: float,
-    val_date: date,
-    market_state: dict[str, RiskFactorSlice],
-    discount_curve: "YieldCurve",
-    n_paths: int,
-    interpolator: Callable,
-    day_counter: ql.DayCounter,
-    curve_day_counter: ql.DayCounter,
-    calendar: ql.Calendar,
-    fixings: dict[tuple[str, date], np.ndarray] | None,
-) -> np.ndarray:
-    """PV for floating legs with sub-period compounding or averaging.
-
-    Called by :func:`leg_pv` when ``leg.reset_frequency_months > 0`` and
-    either ``compounding_method`` or ``averaging_method`` is not ``"None"``.
-
-    For each payment period the function:
-    1. Slices the period into sub-periods of ``leg.reset_frequency_months``.
-    2. For each sub-period looks up the rate from *fixings* (past resets) or
-       computes it from the forward curve (future resets).
-    3. Applies the compounding / averaging formula.
-    4. Discounts the resulting interest amount to the valuation date.
-
-    The *fixings* dict is keyed by ``(curve_name, sub_period_start)`` — the
-    same key structure used for standard LIBOR fixings — so the ExposureEngine
-    fixing cache works without modification.
-    """
-    fwd_slice: CurveSlice = market_state[leg.curve_name]
-    fwd_curve = YieldCurve(
-        year_fracs=fwd_slice.tenors,
-        rates=fwd_slice.values,
-        interpolator=interpolator,
-    )
-    ql_val = to_ql_date(val_date)
-    # Use ModifiedFollowing for sub-period end advances; can be exposed as a
-    # leg parameter if a different convention is ever needed.
-    biz_conv = ql.ModifiedFollowing
-
-    pv = np.zeros(n_paths)
-
-    for pay_start, pay_end, _accrual in future:
-        sub_periods = generate_sub_periods(
-            pay_start, pay_end, leg.reset_frequency_months,
-            calendar, biz_conv, day_counter, direction="Backward",
+        self.pay_schedule = self.schedule_config.build(
+            self.effective_date, self.maturity_date, self.pay_leg.frequency,
         )
 
-        # Discount factor to payment date (= accrual end date)
-        t_pay = float(curve_day_counter.yearFraction(ql_val, to_ql_date(pay_end)))
-        df_pay = discount_curve.discount_factor(t_pay)  # (n_paths,)
+    # ------------------------------------------------------------------
+    # reset / fixing interface
+    # ------------------------------------------------------------------
 
-        n_sub = len(sub_periods)
-        sub_rates = np.empty((n_paths, n_sub))
-        sub_accruals = np.empty(n_sub)
+    def get_reset_dates(self) -> list[tuple]:
+        """Return reset tuples for all floating resets.
 
-        for j, (sub_start, sub_end, sub_accrual) in enumerate(sub_periods):
-            sub_accruals[j] = sub_accrual
-            key = (leg.curve_name, sub_start)
+        For standard LIBOR legs returns 4-tuples:
+            (reset_date, curve_name, period_start, period_end)
 
-            if fixings and key in fixings:
-                rate = np.asarray(fixings[key], dtype=np.float64)
-                if rate.ndim == 0:
-                    rate = np.full(n_paths, float(rate))
+        For overnight-compounded (OIS) legs returns 5-tuples:
+            (reset_date, curve_name, period_start, period_end, True)
+
+        The ExposureEngine reads the optional 5th element to route the reset
+        through the overnight compounding accumulator rather than the standard
+        LIBOR fixing path.
+
+        When ``reset_frequency_months`` is set, sub-period start dates are
+        returned instead of payment-period start dates so that each sub-period
+        rate is computed and cached separately.
+        """
+        resets: list[tuple] = []
+        sc = self.schedule_config
+
+        for schedule, leg in [
+            (self.receive_schedule, self.receive_leg),
+            (self.pay_schedule, self.pay_leg),
+        ]:
+            if leg.leg_type != LegType.FLOATING:
+                continue
+
+            if leg.overnight_compounding:
+                # OIS: one reset per payment period (or per sub-period when
+                # reset_frequency_months is set).  The engine accumulates the
+                # overnight compound factor from period_start to sim_date.
+                if leg.reset_frequency_months > 0:
+                    for start, end, _ in schedule:
+                        for sub_start, sub_end, _ in generate_sub_periods(
+                            start, end, leg.reset_frequency_months,
+                            sc.ql_calendar, ql.ModifiedFollowing,
+                            sc.day_counter, direction="Backward",
+                        ):
+                            resets.append(
+                                (sub_start, leg.curve_name, sub_start, sub_end, True)
+                            )
+                else:
+                    for start, end, _ in schedule:
+                        resets.append(
+                            (start, leg.curve_name, start, end, True)
+                        )
+
+            elif leg.reset_frequency_months > 0:
+                # Sub-period LIBOR: generate one fixing per sub-period so that
+                # _leg_pv_compounded can read realized rates from the fixings dict.
+                for start, end, _ in schedule:
+                    for sub_start, sub_end, _ in generate_sub_periods(
+                        start, end, leg.reset_frequency_months,
+                        sc.ql_calendar, ql.ModifiedFollowing,
+                        sc.day_counter, direction="Backward",
+                    ):
+                        resets.append((sub_start, leg.curve_name, sub_start, sub_end))
+
             else:
-                t_sub_s = float(curve_day_counter.yearFraction(ql_val, to_ql_date(sub_start)))
-                t_sub_e = float(curve_day_counter.yearFraction(ql_val, to_ql_date(sub_end)))
-                fwd_tau_sub = float(day_counter.yearFraction(
-                    to_ql_date(sub_start), to_ql_date(sub_end)
-                ))
-                rate = fwd_curve.forward_rate(t_sub_s, t_sub_e, tau=fwd_tau_sub)
-                if np.ndim(rate) == 0:
-                    rate = np.full(n_paths, float(rate))
+                # Standard LIBOR: one reset per payment period
+                for start, end, _ in schedule:
+                    resets.append((start, leg.curve_name, start, end))
 
-            sub_rates[:, j] = rate
+        return resets
 
-        tau_total = float(sub_accruals.sum())
-        interest = _apply_compounding_method(
-            sub_rates, sub_accruals, tau_total,
-            leg.spread, leg.compounding_method, leg.averaging_method,
+    def compute_fixings(
+        self,
+        resets: list[tuple[date, str, date, date]],
+        time_slice: dict[str, RiskFactorSlice],
+        scenario_date: date,
+    ) -> dict[tuple[str, date], np.ndarray]:
+        """Compute forward rates for the given resets from an earlier scenario's curve.
+
+        Respects ``fixing_tenor_months`` and ``forward_business_convention`` on
+        the leg so that stub periods and non-standard index tenors are handled
+        consistently with :func:`leg_pv`.  The forward rate tau uses the coupon
+        day-count convention (``day_counter``) while the discount-factor end
+        tenor uses the curve day-count convention (``curve_day_counter``),
+        matching the split used in ``_compute_forward_tenors``.
+        """
+        fixings: dict[tuple[str, date], np.ndarray] = {}
+        ql_scenario = to_ql_date(scenario_date)
+        sc = self.schedule_config
+
+        for _reset_date, curve_name, p_start, p_end in resets:
+            fwd_slice: CurveSlice = time_slice[curve_name]
+            fwd_curve = YieldCurve(
+                year_fracs=fwd_slice.tenors,
+                rates=fwd_slice.values,
+                interpolator=self.interpolator,
+            )
+            t_start = sc.curve_day_counter.yearFraction(
+                ql_scenario, to_ql_date(p_start),
+            )
+
+            leg = self._curve_to_leg.get(curve_name)
+            ql_start = to_ql_date(p_start)
+
+            if leg is not None and leg.fixing_tenor_months is not None:
+                # Fixed-tenor index (e.g. JIBAR-3m): advance from period start
+                # by the index tenor regardless of the schedule period length.
+                fwd_conv = (
+                    BUSINESS_CONVENTIONS[leg.forward_business_convention]
+                    if leg.forward_business_convention
+                    else ql.ModifiedFollowing
+                )
+                ql_fwd_end = sc.ql_calendar.advance(
+                    ql_start,
+                    ql.Period(leg.fixing_tenor_months, ql.Months),
+                    fwd_conv,
+                )
+                t_end = sc.curve_day_counter.yearFraction(ql_scenario, ql_fwd_end)
+                fwd_tau = sc.day_counter.yearFraction(ql_start, ql_fwd_end)
+
+            elif leg is not None and leg.forward_business_convention is not None:
+                # Non-standard business convention for the forward end date
+                fwd_conv = BUSINESS_CONVENTIONS[leg.forward_business_convention]
+                ql_fwd_end = sc.ql_calendar.advance(
+                    ql_start,
+                    ql.Period(leg.frequency, ql.Months),
+                    fwd_conv,
+                )
+                t_end = sc.curve_day_counter.yearFraction(ql_scenario, ql_fwd_end)
+                fwd_tau = sc.day_counter.yearFraction(ql_start, ql_fwd_end)
+
+            else:
+                ql_end = to_ql_date(p_end)
+                t_end = sc.curve_day_counter.yearFraction(ql_scenario, ql_end)
+                fwd_tau = sc.day_counter.yearFraction(ql_start, ql_end)
+
+            rate = fwd_curve.forward_rate(t_start, t_end, tau=fwd_tau)
+            fixings[(curve_name, p_start)] = rate
+
+        return fixings
+
+    def compute_cf_increment(
+        self,
+        curve_name: str,
+        t_j: date,
+        t_j1: date,
+        fix_slice: dict[str, RiskFactorSlice],
+    ) -> np.ndarray:
+        """Overnight compound factor for the interval [t_j, t_j1].
+
+        Called by the ExposureEngine at each simulation step for OIS legs.
+        Uses the forward (OIS) curve from the scenario state at t_j to
+        compute DF(t_j→t_j1) = 1 / discount_factor(Δt), giving the
+        single-period compound factor that accumulates into CF_realized.
+
+        Parameters
+        ----------
+        curve_name : str
+            The OIS curve risk-factor name (e.g. ``"InterestRate.ZARONIA"``).
+        t_j, t_j1 : date
+            Start and end of the overnight interval (consecutive scenario dates).
+        fix_slice : dict
+            Market state at t_j (from the scenario cube at that step).
+
+        Returns
+        -------
+        np.ndarray, shape (n_paths,)
+            Compound factor = 1 / DF(t_j → t_j1) per path.
+        """
+        fwd_slice: CurveSlice = fix_slice[curve_name]
+        fwd_curve = YieldCurve(
+            year_fracs=fwd_slice.tenors,
+            rates=fwd_slice.values,
+            interpolator=self.interpolator,
+        )
+        dt = float(self.schedule_config.curve_day_counter.yearFraction(
+            to_ql_date(t_j), to_ql_date(t_j1),
+        ))
+        return 1.0 / fwd_curve.discount_factor(dt)
+
+    # ------------------------------------------------------------------
+    # pricing
+    # ------------------------------------------------------------------
+
+    def scenario_npvs(
+        self,
+        val_date: date,
+        market_state: dict[str, RiskFactorSlice],
+        fixings: dict[tuple[str, date], np.ndarray] | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        disc_slice: CurveSlice = market_state[self.discount_curve_name]
+        n_paths = disc_slice.values.shape[0]
+
+        if val_date > self.maturity_date:
+            return np.zeros(n_paths)
+
+        discount_curve = YieldCurve(
+            year_fracs=disc_slice.tenors,
+            rates=disc_slice.values,
+            interpolator=self.interpolator,
         )
 
-        pv += notional * interest * df_pay
+        sc = self.schedule_config
+        common_kwargs = dict(
+            notional=self.notional,
+            val_date=val_date,
+            market_state=market_state,
+            discount_curve=discount_curve,
+            n_paths=n_paths,
+            interpolator=self.interpolator,
+            day_counter=sc.day_counter,
+            curve_day_counter=sc.curve_day_counter,
+            calendar=sc.ql_calendar,
+            fixings=fixings,
+            include_on_val_date=self.include_sim_date_cashflows,
+        )
 
-    if leg.include_notional_exchange:
-        last_end = max(e for _, e, _ in future)
-        t_last = float(curve_day_counter.yearFraction(ql_val, to_ql_date(last_end)))
-        df_last = discount_curve.discount_factor(t_last)
-        pv += notional * df_last
+        rec_pv = leg_pv(self.receive_schedule, self.receive_leg, **common_kwargs)
+        pay_pv = leg_pv(self.pay_schedule, self.pay_leg, **common_kwargs)
 
-    return pv
+        return rec_pv - pay_pv
