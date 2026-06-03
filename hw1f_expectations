@@ -1,23 +1,29 @@
+        self.scen_grid = time_grid.scenario_grid
+        # Lagged scenario grid: row k holds the scenario from t_{k-1} rather
+        # than t_k.  This makes the drift for each period [t_{k-1}, t_k] use
+        # the rate curve that was known at the START of the period, which is
+        # equivalent to the standard explicit (forward-Euler) GBM discretisation:
+        #
+        #   S(t_k) = S(t_{k-1}) * F(t_{k-1}, t_k) * exp(vol correction)
+        #
+        # Without the lag, the rate for period [t_{k-1}, t_k] is read from the
+        # scenario at t_k (end of period).  For short steps this makes no
+        # difference, but for a coarse grid the end-of-period long rate is a
+        # proxy for the NEXT period's forward rate rather than the current
+        # period's, introducing a systematic upward bias in E[S(T)].  The lag
+        # eliminates this: the 2-step case reverts to the initial (T=0) zero
+        # curve for the full horizon, restoring E[S(T)] = F(0,T).
+        self.lagged_scen_grid = np.concatenate(
+            [self.scen_grid[:1], self.scen_grid[:-1]], axis=0
+        )
 
-    # ---- Terminal distribution plots (penultimate date) ----
-    # The final simulation date is always 0 (past maturity), so we use [-2].
-    terminal_date = mean1.index[-2]
-    rf_terminal   = d1.loc[terminal_date].dropna().values
-    val_terminal  = d2.loc[terminal_date].dropna().values
 
-    for values, label, colour, fname in [
-        (rf_terminal,  f"RiskFlow — {terminal_date}",   "steelblue",  "terminal_dist_riskflow.png"),
-        (val_terminal, f"Validation — {terminal_date}", "darkorange", "terminal_dist_validation.png"),
-    ]:
-        fig, ax = plt.subplots(figsize=(9, 5))
-        ax.hist(values, bins=50, color=colour, edgecolor="white", linewidth=0.4)
-        ax.axvline(values.mean(), color="black", linestyle="--", linewidth=1.2,
-                   label=f"Mean: {values.mean():,.0f}")
-        ax.set_xlabel("MTM Value")
-        ax.set_ylabel("Path Count")
-        ax.set_title(f"Terminal MTM Distribution — {label}")
-        ax.legend()
-        ax.grid(axis="y", alpha=0.4)
-        fig.tight_layout()
-        fig.savefig(folder / fname)
-        plt.close(fig)
+
+
+
+    def generate(self, shared_mem):
+        f1 = torch.cumsum(
+            self.delta_vol * shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], dim=0)
+
+        rt = utils.calc_time_grid_curve_rate(self.r_t, self.lagged_scen_grid, shared_mem)
+        qt = utils.calc_time_grid_curve_rate(self.q_t, self.lagged_scen_grid, shared_mem)
