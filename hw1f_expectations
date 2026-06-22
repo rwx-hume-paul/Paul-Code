@@ -1,29 +1,41 @@
-        self.scen_grid = time_grid.scenario_grid
-        # Lagged scenario grid: row k holds the scenario from t_{k-1} rather
-        # than t_k.  This makes the drift for each period [t_{k-1}, t_k] use
-        # the rate curve that was known at the START of the period, which is
-        # equivalent to the standard explicit (forward-Euler) GBM discretisation:
-        #
-        #   S(t_k) = S(t_{k-1}) * F(t_{k-1}, t_k) * exp(vol correction)
-        #
-        # Without the lag, the rate for period [t_{k-1}, t_k] is read from the
-        # scenario at t_k (end of period).  For short steps this makes no
-        # difference, but for a coarse grid the end-of-period long rate is a
-        # proxy for the NEXT period's forward rate rather than the current
-        # period's, introducing a systematic upward bias in E[S(T)].  The lag
-        # eliminates this: the 2-step case reverts to the initial (T=0) zero
-        # curve for the full horizon, restoring E[S(T)] = F(0,T).
-        self.lagged_scen_grid = np.concatenate(
-            [self.scen_grid[:1], self.scen_grid[:-1]], axis=0
-        )
 
+    def get_ois_compounded_cashflow_factor(self, start_date: date, end_date: date) -> float:
+        """
+        Returns the OIS compounded growth factor (DF(t1)/DF(t2) - 1) for a period.
 
+        Represents the total compounded return from daily overnight fixings,
+        derived from the discount curve rather than stepping through individual days.
+        Multiply by notional to get the raw compounded cashflow.
 
+        Parameters:
+            start_date: Start date of the compounding period.
+            end_date: End date of the compounding period.
 
+        Returns:
+            Compounded cashflow factor: DF(t1)/DF(t2) - 1.
+        """
+        if end_date <= start_date:
+            raise ValueError("end_date must be greater than start_date")
+        df1 = self.get_discount_factor_for_date(start_date)
+        df2 = self.get_discount_factor_for_date(end_date)
+        return df1 / df2 - 1.0
 
-    def generate(self, shared_mem):
-        f1 = torch.cumsum(
-            self.delta_vol * shared_mem.t_random_numbers[self.z_offset, :self.scenario_horizon], dim=0)
+    def get_ois_compounded_rate(self, start_date: date, end_date: date) -> float:
+        """
+        Returns the OIS compounded rate (annualized) for a period.
 
-        rt = utils.calc_time_grid_curve_rate(self.r_t, self.lagged_scen_grid, shared_mem)
-        qt = utils.calc_time_grid_curve_rate(self.q_t, self.lagged_scen_grid, shared_mem)
+        Equivalent to daily-compounded overnight rates expressed as an annualized
+        simple rate: (DF(t1)/DF(t2) - 1) / tau. Compatible with add_floating_cashflows
+        so that cashflow = N * tau * rate = N * (DF1/DF2 - 1).
+
+        Parameters:
+            start_date: Start date of the compounding period.
+            end_date: End date of the compounding period.
+
+        Returns:
+            Annualized OIS compounded rate.
+        """
+        if end_date <= start_date:
+            raise ValueError("end_date must be greater than start_date")
+        tau = self.day_count_convention(start_date, end_date)
+        return self.get_ois_compounded_cashflow_factor(start_date, end_date) / tau
