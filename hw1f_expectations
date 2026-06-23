@@ -46,7 +46,6 @@ class IRSwap:
         pay_fixed: bool = True,
         compounding: bool = False,
         current_compounded_rate: float = None,
-        accrual_fraction: float = None,
         current_period_end_date: date = None,
     ):
         """
@@ -75,11 +74,9 @@ class IRSwap:
             current_compounded_rate: For in-motion OIS trades, the annualized compounded rate
                 realized from effective_date to valuation_date (in the curve's rate day count
                 convention, e.g. ACT/360 for SOFR). Requires compounding=True.
-            accrual_fraction: Year fraction of the already-elapsed portion (effective_date to
-                valuation_date). If None, computed from the floating leg curve's
-                rate_day_count_convention.
             current_period_end_date: End date of the in-motion payment period. Required when
-                current_compounded_rate is provided.
+                current_compounded_rate is provided. The elapsed accrual fraction is derived
+                internally from effective_date and valuation_date.
         """
 
 
@@ -113,7 +110,6 @@ class IRSwap:
         self.pay_fixed = pay_fixed
         self.compounding = compounding
         self.current_compounded_rate = current_compounded_rate
-        self.accrual_fraction = accrual_fraction
         self.current_period_end_date = current_period_end_date
 
         # Validation: ensure either curve or fixed rate is provided for each leg
@@ -173,12 +169,9 @@ class IRSwap:
         """
         schedule = schedule.copy()
 
-        # Year fraction of the already-elapsed portion (effective_date → valuation_date)
-        if self.accrual_fraction is not None:
-            elapsed_tau = self.accrual_fraction
-        else:
-            elapsed_tau = curve.rate_day_count_convention(self.effective_date, self.valuation_date)
-
+        # Year fraction of the already-elapsed portion (effective_date → valuation_date),
+        # derived from the curve's rate day count convention (e.g. ACT/360 for SOFR)
+        elapsed_tau = curve.rate_day_count_convention(self.effective_date, self.valuation_date)
         elapsed_factor = self.current_compounded_rate * elapsed_tau
 
         # Forward compounding factor for the remaining portion (valuation_date → period end).
@@ -294,9 +287,9 @@ class IRSwap:
     def calculate_fair_rate(self):
         """Calculate fair fixed rate of the swap (also used for swaptions)"""
         if self.pay_fixed == True:
-            fair_rate = (self.receive_schedule['YearFrac'] * self.receive_schedule['DiscountFator'] * self.receive_schedule['ForwardRate']).values.sum()/(self.pay_schedule['YearFrac'] * self.pay_schedule['DiscountFactor']).values.sum()
-        else:        
-            fair_rate = (self.pay_schedule['YearFrac'] * self.pay_schedule['DiscountFator'] * self.pay_schedule['ForwardRate']).values.sum()/(self.receive_schedule['YearFrac'] * self.receive_schedule['DiscountFactor']).values.sum()
+            fair_rate = (self.receive_schedule['YearFrac'] * self.receive_schedule['DiscountFactor'] * self.receive_schedule['ForwardRate']).values.sum()/(self.pay_schedule['YearFrac'] * self.pay_schedule['DiscountFactor']).values.sum()
+        else:
+            fair_rate = (self.pay_schedule['YearFrac'] * self.pay_schedule['DiscountFactor'] * self.pay_schedule['ForwardRate']).values.sum()/(self.receive_schedule['YearFrac'] * self.receive_schedule['DiscountFactor']).values.sum()
         return fair_rate
     
 
