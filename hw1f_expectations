@@ -3,9 +3,10 @@ class FRA:
     """
     Forward Rate Agreement pricer.
 
-    A single-period instrument: one party pays a fixed rate and receives a floating
-    IBOR rate (or vice versa). Settlement occurs on the start date of the reference
-    period (the fixing date), unlike a swap where payment is on the end date.
+    Net PV = notional × YearFrac × (ForwardRate - fixed_rate) × DF(start_date).
+    Sign convention: positive notional = pay fixed / receive IBOR (long rate).
+                     negative notional = receive fixed / pay IBOR (short rate).
+    Settlement occurs on the start date of the reference period.
     """
 
     def __init__(
@@ -13,57 +14,37 @@ class FRA:
         effective_date: date,
         maturity_date: date,
         notional: float,
-        receive_curve: DiscountYieldCurveHandler = None,
-        pay_curve: DiscountYieldCurveHandler = None,
-        discount_curve: DiscountYieldCurveHandler = None,
+        reference_rate_curve: DiscountYieldCurveHandler,
+        discount_curve: DiscountYieldCurveHandler,
+        fixed_rate: float,
         valuation_date: date = None,
-        receive_fixed_rate: float = None,
-        pay_fixed_rate: float = None,
-        receive_spread: float = 0.0,
-        pay_spread: float = 0.0,
         calendar: str = "TARGET",
         business_convention: str = "ModifiedFollowing",
         day_count: str = "ACT/365",
-        pay_fixed: bool = True,
     ):
         """
         Parameters:
             effective_date: Start of the FRA reference period (also the settlement date).
             maturity_date: End of the FRA reference period.
-            notional: Notional amount.
-            receive_curve: Curve for the floating receive leg.
-            pay_curve: Curve for the floating pay leg.
+            notional: Signed notional. Positive = pay fixed; negative = receive fixed.
+            reference_rate_curve: IBOR forward curve.
             discount_curve: Curve for discounting to the settlement date.
+            fixed_rate: The agreed fixed rate.
             valuation_date: Valuation date.
-            receive_fixed_rate: Fixed rate for the receive leg (if receive leg is fixed).
-            pay_fixed_rate: Fixed rate for the pay leg (if pay leg is fixed).
-            receive_spread: Spread added to receive leg forward rate (default 0.0).
-            pay_spread: Spread added to pay leg forward rate (default 0.0).
             calendar: QuantLib calendar name (default 'TARGET').
             business_convention: Business day convention (default 'ModifiedFollowing').
             day_count: Day count convention (default 'ACT/365').
-            pay_fixed: True = pay fixed / receive IBOR; False = receive fixed / pay IBOR.
         """
-        if receive_fixed_rate is None and receive_curve is None:
-            raise ValueError("Either receive_curve or receive_fixed_rate must be provided")
-        if pay_fixed_rate is None and pay_curve is None:
-            raise ValueError("Either pay_curve or pay_fixed_rate must be provided")
-
         self.effective_date = effective_date
         self.maturity_date = maturity_date
         self.notional = notional
-        self.receive_curve = receive_curve
-        self.pay_curve = pay_curve
+        self.reference_rate_curve = reference_rate_curve
         self.discount_curve = discount_curve
+        self.fixed_rate = fixed_rate
         self.valuation_date = valuation_date
-        self.receive_fixed_rate = receive_fixed_rate
-        self.pay_fixed_rate = pay_fixed_rate
-        self.receive_spread = receive_spread
-        self.pay_spread = pay_spread
         self.calendar = calendar
         self.business_convention = business_convention
         self.day_count = day_count
-        self.pay_fixed = pay_fixed
 
         self._build_schedule()
         self._calculate_cashflows()
@@ -109,62 +90,35 @@ class FRA:
         }])
 
     def _calculate_cashflows(self):
-        """Computes forward IBOR rates and cashflows for each leg."""
+        """Computes the net cashflow: notional × YearFrac × (ForwardRate - fixed_rate)."""
         row = self.schedule.iloc[0]
-        start_date = row["StartDate"]
-        end_date = row["EndDate"]
-        year_frac = row["YearFrac"]
-
-        receive_fwd = (
-            self.receive_fixed_rate
-            if self.receive_fixed_rate is not None
-            else self.receive_curve.get_simple_forward(start_date, end_date)
-        )
-        receive_fwd += self.receive_spread
-
-        pay_fwd = (
-            self.pay_fixed_rate
-            if self.pay_fixed_rate is not None
-            else self.pay_curve.get_simple_forward(start_date, end_date)
-        )
-        pay_fwd += self.pay_spread
-
-        self.schedule["ReceiveForwardRate"] = receive_fwd
-        self.schedule["PayForwardRate"] = pay_fwd
-        self.schedule["ReceiveCashflow"] = self.notional * year_frac * receive_fwd
-        self.schedule["PayCashflow"] = self.notional * year_frac * pay_fwd
+        forward_rate = self.reference_rate_curve.get_simple_forward(row["StartDate"], row["EndDate"])
+        self.schedule["ForwardRate"] = forward_rate
+        self.schedule["FixedRate"] = self.fixed_rate
+        self.schedule["NetCashflow"] = self.notional * row["YearFrac"] * (forward_rate - self.fixed_rate)
 
     def _calculate_present_values(self):
-        """Discounts cashflows to valuation date using the DF at the settlement (start) date."""
-        pay_date = self.schedule.iloc[0]["PayDate"]
-        df = self.discount_curve.get_discount_factor_for_date(pay_date)
+        """Discounts the net cashflow to valuation date using DF at the settlement date."""
+        df = self.discount_curve.get_discount_factor_for_date(self.schedule.iloc[0]["PayDate"])
         self.schedule["DiscountFactor"] = df
-        self.schedule["ReceivePV"] = self.schedule["ReceiveCashflow"] * df
-        self.schedule["PayPV"] = self.schedule["PayCashflow"] * df
-
-    def receive_leg_pv(self) -> float:
-        return float(self.schedule["ReceivePV"].sum())
-
-    def pay_leg_pv(self) -> float:
-        return float(self.schedule["PayPV"].sum())
+        self.schedule["PV"] = self.schedule["NetCashflow"] * df
 
     def net_pv(self) -> float:
-        return self.receive_leg_pv() - self.pay_leg_pv()
+        return float(self.schedule["PV"].sum())
 
     def calculate_fair_rate(self) -> float:
-        """Returns the par FRA rate (the forward IBOR over the reference period)."""
+        """Returns the par FRA rate (the IBOR forward over the reference period)."""
         row = self.schedule.iloc[0]
-        curve = self.receive_curve if not self.pay_fixed else self.pay_curve
-        return curve.get_simple_forward(row["StartDate"], row["EndDate"])
+        return self.reference_rate_curve.get_simple_forward(row["StartDate"], row["EndDate"])
 
     def get_schedule(self) -> pd.DataFrame:
         return self.schedule.copy()
 
     def summary(self) -> dict:
         return {
-            "receive_leg_pv": self.receive_leg_pv(),
-            "pay_leg_pv": self.pay_leg_pv(),
             "net_pv": self.net_pv(),
+            "forward_rate": float(self.schedule["ForwardRate"].iloc[0]),
+            "fixed_rate": self.fixed_rate,
             "notional": self.notional,
             "effective_date": self.effective_date,
             "maturity_date": self.maturity_date,
