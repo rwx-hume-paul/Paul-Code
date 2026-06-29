@@ -1,125 +1,19 @@
+import json
 
-class FRA:
-    """
-    Forward Rate Agreement pricer.
+def pull_4d_IR_vol_surface(filepath, surface_name):
+    #pulls data from trade json file
+    with open(filepath) as f:
+        data = json.load(f)
 
-    Net PV = notional × YearFrac × (ForwardRate - fixed_rate) × DF(start_date).
-    Sign convention: positive notional = pay fixed / receive IBOR (long rate).
-                     negative notional = receive fixed / pay IBOR (short rate).
-    Settlement occurs on the start date of the reference period.
-    """
+    # Navigate to Price Factors and pick the curve by its name
+    factors = (data.get('Calc', {})
+                   .get('MergeMarketData', {})
+                   .get('ExplicitMarketData', {})
+                   .get('Price Factors', {}))
 
-    def __init__(
-        self,
-        effective_date: date,
-        maturity_date: date,
-        notional: float,
-        reference_rate_curve: DiscountYieldCurveHandler,
-        discount_curve: DiscountYieldCurveHandler,
-        fixed_rate: float,
-        valuation_date: date = None,
-        calendar: str = "TARGET",
-        business_convention: str = "ModifiedFollowing",
-        day_count: str = "ACT/365",
-    ):
-        """
-        Parameters:
-            effective_date: Start of the FRA reference period (also the settlement date).
-            maturity_date: End of the FRA reference period.
-            notional: Signed notional. Positive = pay fixed; negative = receive fixed.
-            reference_rate_curve: IBOR forward curve.
-            discount_curve: Curve for discounting to the settlement date.
-            fixed_rate: The agreed fixed rate.
-            valuation_date: Valuation date.
-            calendar: QuantLib calendar name (default 'TARGET').
-            business_convention: Business day convention (default 'ModifiedFollowing').
-            day_count: Day count convention (default 'ACT/365').
-        """
-        self.effective_date = effective_date
-        self.maturity_date = maturity_date
-        self.notional = notional
-        self.reference_rate_curve = reference_rate_curve
-        self.discount_curve = discount_curve
-        self.fixed_rate = fixed_rate
-        self.valuation_date = valuation_date
-        self.calendar = calendar
-        self.business_convention = business_convention
-        self.day_count = day_count
-
-        self._build_schedule()
-        self._calculate_cashflows()
-        self._calculate_present_values()
-
-    def _build_schedule(self):
-        """Builds the single-period schedule. PayDate = StartDate (FRA settles on fixing date)."""
-        import QuantLib as ql
-
-        if "." in self.calendar:
-            parts = self.calendar.split(".")
-            calendar_class = getattr(ql, parts[0])
-            market = getattr(calendar_class, parts[1])
-            ql_calendar = calendar_class(market)
-        else:
-            ql_calendar = getattr(ql, self.calendar)()
-
-        ql_convention = getattr(ql, self.business_convention)
-
-        ql_start = ql.Date(self.effective_date.day, self.effective_date.month, self.effective_date.year)
-        ql_end = ql.Date(self.maturity_date.day, self.maturity_date.month, self.maturity_date.year)
-        ql_start = ql_calendar.adjust(ql_start, ql_convention)
-        ql_end = ql_calendar.adjust(ql_end, ql_convention)
-
-        daycount_map = {
-            "ACT/360": ql.Actual360(),
-            "ACT/365": ql.Actual365Fixed(),
-            "ACT/365F": ql.Actual365Fixed(),
-            "ACT/ACT": ql.ActualActual(ql.ActualActual.ISDA),
-            "30/360": ql.Thirty360(ql.Thirty360.BondBasis),
-        }
-        ql_daycount = daycount_map.get(self.day_count, ql.Actual365Fixed())
-
-        start_date = date(ql_start.year(), ql_start.month(), ql_start.dayOfMonth())
-        end_date = date(ql_end.year(), ql_end.month(), ql_end.dayOfMonth())
-
-        self.schedule = pd.DataFrame([{
-            "StartDate": start_date,
-            "EndDate": end_date,
-            "PayDate": start_date,
-            "DaysInPeriod": (end_date - start_date).days,
-            "YearFrac": ql_daycount.yearFraction(ql_start, ql_end),
-        }])
-
-    def _calculate_cashflows(self):
-        """Computes the net cashflow: notional × YearFrac × (ForwardRate - fixed_rate)."""
-        row = self.schedule.iloc[0]
-        forward_rate = self.reference_rate_curve.get_simple_forward(row["StartDate"], row["EndDate"])
-        self.schedule["ForwardRate"] = forward_rate
-        self.schedule["FixedRate"] = self.fixed_rate
-        self.schedule["NetCashflow"] = self.notional * row["YearFrac"] * (forward_rate - self.fixed_rate)
-
-    def _calculate_present_values(self):
-        """Discounts the net cashflow to valuation date using DF at the settlement date."""
-        df = self.discount_curve.get_discount_factor_for_date(self.schedule.iloc[0]["PayDate"])
-        self.schedule["DiscountFactor"] = df
-        self.schedule["PV"] = self.schedule["NetCashflow"] * df
-
-    def net_pv(self) -> float:
-        return float(self.schedule["PV"].sum())
-
-    def calculate_fair_rate(self) -> float:
-        """Returns the par FRA rate (the IBOR forward over the reference period)."""
-        row = self.schedule.iloc[0]
-        return self.reference_rate_curve.get_simple_forward(row["StartDate"], row["EndDate"])
-
-    def get_schedule(self) -> pd.DataFrame:
-        return self.schedule.copy()
-
-    def summary(self) -> dict:
-        return {
-            "net_pv": self.net_pv(),
-            "forward_rate": float(self.schedule["ForwardRate"].iloc[0]),
-            "fixed_rate": self.fixed_rate,
-            "notional": self.notional,
-            "effective_date": self.effective_date,
-            "maturity_date": self.maturity_date,
-        }
+    curve_item = factors.get(surface_name, {})
+    # Extract the data list: Curve -> .Curve -> meta/data
+    surface_data = (curve_item.get('Surface', {})
+                              .get('.Curve', {})
+                              .get('data', []))
+    return surface_data
