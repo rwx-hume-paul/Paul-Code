@@ -1,19 +1,91 @@
-import json
+import pandas as pd
+import numpy as np
 
-def pull_4d_IR_vol_surface(filepath, surface_name):
-    #pulls data from trade json file
-    with open(filepath) as f:
-        data = json.load(f)
 
-    # Navigate to Price Factors and pick the curve by its name
-    factors = (data.get('Calc', {})
-                   .get('MergeMarketData', {})
-                   .get('ExplicitMarketData', {})
-                   .get('Price Factors', {}))
+class IRVol:
+    """Interest rate volatility surface for swaptions and caps/floors.
 
-    curve_item = factors.get(surface_name, {})
-    # Extract the data list: Curve -> .Curve -> meta/data
-    surface_data = (curve_item.get('Surface', {})
-                              .get('.Curve', {})
-                              .get('data', []))
-    return surface_data
+    Input DataFrame must have columns: Moneyness, Expiry, Maturity, Vol.
+    Expiry and Maturity are year fractions. Moneyness convention is caller-defined
+    (absolute strike, log-moneyness, offset from ATM, etc.).
+
+    Interpolation order: Maturity → Expiry → Moneyness.
+    All interpolation is linear with flat extrapolation outside the surface range.
+    """
+
+    def __init__(self, df: pd.DataFrame) -> None:
+        arr = df[["Moneyness", "Expiry", "Maturity", "Vol"]].to_numpy(dtype=np.float64)
+        self._maturities = np.unique(arr[:, 2])
+
+        # {maturity: {expiry: (moneyness_nodes, vol_nodes)}}
+        self._surface: dict = {}
+
+        for mat in self._maturities:
+            mat_rows = arr[np.isclose(arr[:, 2], mat)]
+            expiries = np.unique(mat_rows[:, 1])
+            self._surface[float(mat)] = {}
+            for exp in expiries:
+                exp_rows = mat_rows[np.isclose(mat_rows[:, 1], exp)]
+                order = np.argsort(exp_rows[:, 0])
+                self._surface[float(mat)][float(exp)] = (
+                    exp_rows[order, 0],
+                    exp_rows[order, 3],
+                )
+
+    def _vol_at_expiry_maturity(self, moneyness: float, expiry: float, maturity: float) -> float:
+        m_nodes, v_nodes = self._surface[maturity][expiry]
+        return float(np.interp(moneyness, m_nodes, v_nodes))
+
+    def _vol_at_maturity(self, moneyness: float, swaption_expiry: float, maturity: float) -> float:
+        expiries = np.array(sorted(self._surface[maturity].keys()))
+        idx = int(np.searchsorted(expiries, swaption_expiry))
+
+        if idx == 0:
+            return self._vol_at_expiry_maturity(moneyness, float(expiries[0]), maturity)
+        if idx == len(expiries):
+            return self._vol_at_expiry_maturity(moneyness, float(expiries[-1]), maturity)
+
+        e2 = float(expiries[idx])
+        if np.isclose(swaption_expiry, e2):
+            return self._vol_at_expiry_maturity(moneyness, e2, maturity)
+
+        e1 = float(expiries[idx - 1])
+        v1 = self._vol_at_expiry_maturity(moneyness, e1, maturity)
+        v2 = self._vol_at_expiry_maturity(moneyness, e2, maturity)
+        w = (swaption_expiry - e1) / (e2 - e1)
+        return v1 + w * (v2 - v1)
+
+    def get_vol(self, moneyness: float, swaption_expiry: float, swap_maturity: float) -> float:
+        """Return interpolated swaption / cap / floor volatility.
+
+        Parameters
+        ----------
+        moneyness : float
+            Strike moneyness (convention matches the input data).
+        swaption_expiry : float
+            Time to swaption expiry in year fractions.
+        swap_maturity : float
+            Underlying swap (or caplet) maturity in year fractions.
+
+        Returns
+        -------
+        float
+            Implied volatility.
+        """
+        maturities = self._maturities
+        idx = int(np.searchsorted(maturities, swap_maturity))
+
+        if idx == 0:
+            return self._vol_at_maturity(moneyness, swaption_expiry, float(maturities[0]))
+        if idx == len(maturities):
+            return self._vol_at_maturity(moneyness, swaption_expiry, float(maturities[-1]))
+
+        m2 = float(maturities[idx])
+        if np.isclose(swap_maturity, m2):
+            return self._vol_at_maturity(moneyness, swaption_expiry, m2)
+
+        m1 = float(maturities[idx - 1])
+        v1 = self._vol_at_maturity(moneyness, swaption_expiry, m1)
+        v2 = self._vol_at_maturity(moneyness, swaption_expiry, m2)
+        w = (swap_maturity - m1) / (m2 - m1)
+        return v1 + w * (v2 - v1)
