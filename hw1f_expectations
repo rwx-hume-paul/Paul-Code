@@ -1,258 +1,3 @@
-
-class CapFloor:
-    """
-    IBOR and OIS Cap and Floor pricer.
-
-    IBOR mode (ois=False):
-        One Black caplet/floorlet per period on the simple IBOR forward rate.
-        t_exp = (StartDate − valuation_date) / 365.
-        In-motion: supply current_ibor_rate to fix the rate (intrinsic only).
-
-    OIS post-aggregation mode (ois=True, post_aggregation=True):
-        One Black caplet/floorlet per period on the compounded OIS rate.
-        t_exp = (EndDate − 1 business day − valuation_date) / 365.
-        In-motion: blend current_compounded_rate with projected remaining rate.
-        Optionality remains — d1/d2 and Black formula still applied.
-
-    OIS daily mode (ois=True, post_aggregation=False):
-        Each period decomposed into daily optionlets (one per business day).
-        All optionlets in a period share t_exp = (EndDate − 1 business day − valuation_date) / 365.
-        Days with t_exp ≤ 0 valued at intrinsic. Sum discounted at period PayDate.
-
-    Sign convention: positive notional = long; negative notional = short.
-    cap=True prices a cap; cap=False prices a floor.
-    Moneyness = (K − F) × 100 (in percent, matching vol surface input convention).
-    """
-
-    def __init__(
-        self,
-        effective_date: date,
-        maturity_date: date,
-        notional: float,
-        forward_curve: DiscountYieldCurveHandler,
-        discount_curve: DiscountYieldCurveHandler,
-        ir_vol: IRVol,
-        strike: float,
-        valuation_date: date = None,
-        payment_frequency: int = 3,
-        payment_offset: int = 0,
-        cap: bool = True,
-        forward_shift: float = 0.0,
-        current_ibor_rate: float = None,
-        ois: bool = False,
-        post_aggregation: bool = True,
-        vol_decay: bool = False,
-        current_compounded_rate: float = None,
-        current_period_end_date: date = None,
-        calendar: str = "TARGET",
-        business_convention: str = "ModifiedFollowing",
-        termination_business_convention: str = "ModifiedFollowing",
-        date_generation: str = "Backward",
-        day_count: str = "ACT/365",
-        end_of_month: bool = False,
-        use_schedule_end_date: bool = True,
-    ):
-        self.effective_date = effective_date
-        self.maturity_date = maturity_date
-        self.notional = notional
-        self.forward_curve = forward_curve
-        self.discount_curve = discount_curve
-        self.ir_vol = ir_vol
-        self.strike = strike
-        self.valuation_date = valuation_date
-        self.payment_frequency = payment_frequency
-        self.payment_offset = payment_offset
-        self.cap = cap
-        self.forward_shift = forward_shift
-        self.current_ibor_rate = current_ibor_rate
-        self.ois = ois
-        self.post_aggregation = post_aggregation
-        self.vol_decay = vol_decay
-        self.current_compounded_rate = current_compounded_rate
-        self.current_period_end_date = current_period_end_date
-        self.calendar = calendar
-        self.business_convention = business_convention
-        self.termination_business_convention = termination_business_convention
-        self.date_generation = date_generation
-        self.day_count = day_count
-        self.end_of_month = end_of_month
-        self.use_schedule_end_date = use_schedule_end_date
-
-        self._build_schedule()
-        self._calculate_caplets()
-
-    def _build_schedule(self):
-        self.schedule = generate_swap_leg_schedule(
-            effective_date=self.effective_date,
-            maturity_date=self.maturity_date,
-            valuation_date=self.valuation_date,
-            payment_frequency=self.payment_frequency,
-            payment_offset=self.payment_offset,
-            calendar=self.calendar,
-            business_convention=self.business_convention,
-            termination_business_convention=self.termination_business_convention,
-            date_generation=self.date_generation,
-            day_count=self.day_count,
-            end_of_month=self.end_of_month,
-        )
-        self.schedule = add_forward_rates_to_schedule(
-            self.schedule,
-            self.forward_curve,
-            frequency=self.payment_frequency,
-            calendar=self.calendar,
-            business_convention="Following",
-            use_schedule_end_date=self.use_schedule_end_date,
-            compounding=self.ois,
-        )
-
-    def _black_option_factor(
-        self, f: float, tau: float, t: float, moneyness: float,
-        vol_maturity: float = None,
-    ) -> float:
-        """Black factor for one caplet/floorlet. Returns tau × [payoff] or intrinsic when t≤0.
-
-        vol_maturity: maturity passed to vol surface (defaults to tau). Use the full
-        caplet period year-frac when pricing individual daily optionlets so that the
-        vol surface is queried at the same maturity as for the period-level caplet.
-        """
-        f_s = f + self.forward_shift
-        k_s = self.strike + self.forward_shift
-        if t <= 0:
-            if self.cap:
-                return max(f - self.strike, 0.0) * tau
-            return max(self.strike - f, 0.0) * tau
-        mat = vol_maturity if vol_maturity is not None else tau
-        vol = self.ir_vol.get_vol(moneyness, t, mat)
-        if vol <= 0 or f_s <= 0 or k_s <= 0:
-            return 0.0
-        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
-        d2 = d1 - vol * np.sqrt(t)
-        if self.cap:
-            return tau * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2))
-        return tau * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1))
-
-    def _black_option_factor_with_vol(
-        self, f: float, tau: float, t: float, moneyness: float,
-        vol_expiry: float = None,
-    ):
-        """Returns (option_factor, vol, d1, d2) tuple.
-
-        vol_expiry: expiry passed to the vol surface (defaults to t). Supply the
-        unmodified fixing-date time when vol_decay is active so vol interpolation
-        is unaffected while d1/d2 use the decayed t.
-        """
-        f_s = f + self.forward_shift
-        k_s = self.strike + self.forward_shift
-        if t <= 0:
-            if self.cap:
-                return max(f - self.strike, 0.0) * tau, 0.0, np.nan, np.nan
-            return max(self.strike - f, 0.0) * tau, 0.0, np.nan, np.nan
-        t_vol = vol_expiry if vol_expiry is not None else t
-        vol = self.ir_vol.get_vol(moneyness, t_vol, tau)
-        if vol <= 0 or f_s <= 0 or k_s <= 0:
-            return 0.0, vol, np.nan, np.nan
-        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
-        d2 = d1 - vol * np.sqrt(t)
-        if self.cap:
-            factor = tau * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2))
-        else:
-            factor = tau * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1))
-        return factor, vol, d1, d2
-
-    def _attach_option_columns(self, schedule: pd.DataFrame) -> None:
-        """Adds Vol, d1, d2, OptionFactor, DiscountFactor, PV to schedule in-place."""
-        vols, d1s, d2s, opt_factors = [], [], [], []
-        has_vol_expiry = "VolExpiry" in schedule.columns
-        for _, row in schedule.iterrows():
-            vol_exp = row["VolExpiry"] if has_vol_expiry else None
-            factor, vol, d1, d2 = self._black_option_factor_with_vol(
-                row["ForwardRate"], row["YearFrac"], row["t_exp"], row["Moneyness"],
-                vol_expiry=vol_exp,
-            )
-            vols.append(vol)
-            d1s.append(d1)
-            d2s.append(d2)
-            opt_factors.append(factor)
-        schedule["Vol"] = vols
-        schedule["d1"] = d1s
-        schedule["d2"] = d2s
-        schedule["OptionFactor"] = opt_factors
-        schedule["DiscountFactor"] = schedule["PayDate"].apply(
-            self.discount_curve.get_discount_factor_for_date
-        )
-        schedule["PV"] = self.notional * schedule["OptionFactor"] * schedule["DiscountFactor"]
-
-    def _ibor_caplets(self) -> None:
-        schedule = self.schedule.copy()
-        schedule["Strike"] = self.strike
-
-        if self.current_ibor_rate is not None and len(schedule) > 0:
-            first_start = schedule.iloc[0]["StartDate"]
-            if self.valuation_date is not None and first_start < self.valuation_date:
-                loc = schedule.columns.get_loc("ForwardRate")
-                schedule.iloc[0, loc] = self.current_ibor_rate
-
-        if self.valuation_date is not None:
-            schedule["t_exp"] = schedule["StartDate"].apply(
-                lambda s: (s - self.valuation_date).days / 365.0
-            )
-        else:
-            schedule["t_exp"] = 0.0
-
-        schedule["Moneyness"] = (self.strike - schedule["ForwardRate"]) * 100
-        self._attach_option_columns(schedule)
-        self.schedule = schedule
-
-    def _ois_post_agg_caplets(self) -> None:
-        schedule = self.schedule.copy()
-        schedule["Strike"] = self.strike
-
-        # In-motion: blend already-compounded portion with projected remaining.
-        if (
-            self.current_compounded_rate is not None
-            and self.current_period_end_date is not None
-            and len(schedule) > 0
-        ):
-            first_start = schedule.iloc[0]["StartDate"]
-            first_end = schedule.iloc[0]["EndDate"]
-            val = self.valuation_date
-            if val is not None and first_start <= val <= first_end:
-                tau_elapsed = self.forward_curve.rate_day_count_convention(
-                    first_start, val
-                )
-                elapsed_factor = 1.0 + self.current_compounded_rate * tau_elapsed
-                remaining_ois = compute_daily_ois_factor(
-                    self.forward_curve, val, self.current_period_end_date, self.calendar
-                )
-                remaining_factor = 1.0 + remaining_ois
-                tau_total = schedule.iloc[0]["YearFrac"]
-                blended_rate = (elapsed_factor * remaining_factor - 1.0) / tau_total
-                loc = schedule.columns.get_loc("ForwardRate")
-                schedule.iloc[0, loc] = blended_rate
-
-        # t_exp to fixing date (EndDate − 1 business day): last overnight rate fixes here.
-        if self.valuation_date is not None:
-            schedule["t_exp"] = schedule["EndDate"].apply(
-                lambda e: (
-                    prev_business_day(e, self.calendar) - self.valuation_date
-                ).days / 365.0
-            )
-        else:
-            schedule["t_exp"] = 0.0
-
-        # vol_decay: shrink t_exp used for d1/d2 by 2/3 of the period elapsed time,
-        # while keeping the original fixing-date time for vol surface lookup.
-        if self.vol_decay and self.valuation_date is not None:
-            t_start = schedule["StartDate"].apply(
-                lambda s: (s - self.valuation_date).days / 365.0
-            )
-            schedule["VolExpiry"] = schedule["t_exp"]
-            schedule["t_exp"] = schedule["t_exp"] - (2.0 / 3.0) * (schedule["t_exp"] - t_start)
-
-        schedule["Moneyness"] = (self.strike - schedule["ForwardRate"]) * 100
-        self._attach_option_columns(schedule)
-        self.schedule = schedule
-
     def _ois_daily_caplets(self) -> None:
         period_records = []
         daily_records = []
@@ -264,12 +9,6 @@ class CapFloor:
             period_tau = period["YearFrac"]
             df_pay = self.discount_curve.get_discount_factor_for_date(pay_date)
 
-            fixing_date = prev_business_day(period_end, self.calendar)
-            t_fix = (
-                (fixing_date - self.valuation_date).days / 365.0
-                if self.valuation_date else 0.0
-            )
-
             period_pv = 0.0
             for d_i, d_next in iter_overnight_periods(period_start, period_end, self.calendar):
                 tau_i = self.forward_curve.rate_day_count_convention(d_i, d_next)
@@ -277,20 +16,24 @@ class CapFloor:
                 moneyness = (self.strike - f_day) * 100
                 f_s = f_day + self.forward_shift
                 k_s = self.strike + self.forward_shift
+                t_i = (
+                    (d_i - self.valuation_date).days / 365.0
+                    if self.valuation_date else 0.0
+                )
 
-                if t_fix <= 0:
+                if t_i <= 0:
                     vol, d1, d2 = 0.0, np.nan, np.nan
                     opt_factor = (
                         max(f_day - self.strike, 0.0) * tau_i if self.cap
                         else max(self.strike - f_day, 0.0) * tau_i
                     )
                 else:
-                    vol = self.ir_vol.get_vol(moneyness, t_fix, period_tau)
+                    vol = self.ir_vol.get_vol(moneyness, t_i, period_tau)
                     if vol <= 0 or f_s <= 0 or k_s <= 0:
                         d1, d2, opt_factor = np.nan, np.nan, 0.0
                     else:
-                        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t_fix) / (vol * np.sqrt(t_fix))
-                        d2 = d1 - vol * np.sqrt(t_fix)
+                        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t_i) / (vol * np.sqrt(t_i))
+                        d2 = d1 - vol * np.sqrt(t_i)
                         if self.cap:
                             opt_factor = tau_i * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2))
                         else:
@@ -309,7 +52,7 @@ class CapFloor:
                     "ForwardRate": f_day,
                     "Strike": self.strike,
                     "Moneyness": moneyness,
-                    "t_exp": t_fix,
+                    "t_exp": t_i,
                     "Vol": vol,
                     "d1": d1,
                     "d2": d2,
@@ -317,50 +60,3 @@ class CapFloor:
                     "DiscountFactor": df_pay,
                     "PV": pv_day,
                 })
-
-            period_records.append({
-                "StartDate": period_start,
-                "EndDate": period_end,
-                "PayDate": pay_date,
-                "DaysInPeriod": period["DaysInPeriod"],
-                "YearFrac": period_tau,
-                "ForwardRate": period["ForwardRate"],
-                "Strike": self.strike,
-                "DiscountFactor": df_pay,
-                "PV": period_pv,
-            })
-
-        self.schedule = pd.DataFrame(period_records)
-        self.daily_schedule = pd.DataFrame(daily_records)
-
-    def _calculate_caplets(self) -> None:
-        if not self.ois:
-            self._ibor_caplets()
-        elif self.post_aggregation:
-            self._ois_post_agg_caplets()
-        else:
-            self._ois_daily_caplets()
-
-    def net_pv(self) -> float:
-        return float(self.schedule["PV"].sum())
-
-    def get_schedule(self) -> pd.DataFrame:
-        return self.schedule.copy()
-
-    def get_daily_schedule(self) -> pd.DataFrame:
-        """Returns the per-day optionlet detail. Only available in OIS pre-aggregation mode."""
-        if not hasattr(self, "daily_schedule"):
-            raise ValueError(
-                "Daily schedule is only available when ois=True and post_aggregation=False."
-            )
-        return self.daily_schedule.copy()
-
-    def summary(self) -> dict:
-        return {
-            "net_pv": self.net_pv(),
-            "notional": self.notional,
-            "strike": self.strike,
-            "cap": self.cap,
-            "effective_date": self.effective_date,
-            "maturity_date": self.maturity_date,
-        }
