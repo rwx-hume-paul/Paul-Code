@@ -3,20 +3,20 @@ class CapFloor:
     """
     IBOR and OIS Cap and Floor pricer.
 
-    IBOR mode (compounding=False):
+    IBOR mode (ois=False):
         One Black caplet/floorlet per period on the simple IBOR forward rate.
         t_exp = (StartDate − valuation_date) / 365.
         In-motion: supply current_ibor_rate to fix the rate (intrinsic only).
 
-    OIS post-aggregation mode (compounding=True, post_aggregation=True):
+    OIS post-aggregation mode (ois=True, post_aggregation=True):
         One Black caplet/floorlet per period on the compounded OIS rate.
-        t_exp = (EndDate − valuation_date) / 365 (rate settles at end of period).
+        t_exp = (EndDate − 1 business day − valuation_date) / 365.
         In-motion: blend current_compounded_rate with projected remaining rate.
         Optionality remains — d1/d2 and Black formula still applied.
 
-    OIS daily mode (compounding=True, post_aggregation=False):
+    OIS daily mode (ois=True, post_aggregation=False):
         Each period decomposed into daily optionlets (one per business day).
-        Each priced on the expected overnight rate; t_exp per day from StartDate.
+        All optionlets in a period share t_exp = (EndDate − 1 business day − valuation_date) / 365.
         Days with t_exp ≤ 0 valued at intrinsic. Sum discounted at period PayDate.
 
     Sign convention: positive notional = long; negative notional = short.
@@ -39,7 +39,7 @@ class CapFloor:
         cap: bool = True,
         forward_shift: float = 0.0,
         current_ibor_rate: float = None,
-        compounding: bool = False,
+        ois: bool = False,
         post_aggregation: bool = True,
         vol_decay: bool = False,
         current_compounded_rate: float = None,
@@ -65,7 +65,7 @@ class CapFloor:
         self.cap = cap
         self.forward_shift = forward_shift
         self.current_ibor_rate = current_ibor_rate
-        self.compounding = compounding
+        self.ois = ois
         self.post_aggregation = post_aggregation
         self.vol_decay = vol_decay
         self.current_compounded_rate = current_compounded_rate
@@ -102,7 +102,7 @@ class CapFloor:
             calendar=self.calendar,
             business_convention="Following",
             use_schedule_end_date=self.use_schedule_end_date,
-            compounding=self.compounding,
+            compounding=self.ois,
         )
 
     def _black_option_factor(
@@ -295,7 +295,7 @@ class CapFloor:
         self.schedule = pd.DataFrame(records)
 
     def _calculate_caplets(self) -> None:
-        if not self.compounding:
+        if not self.ois:
             self._ibor_caplets()
         elif self.post_aggregation:
             self._ois_post_agg_caplets()
