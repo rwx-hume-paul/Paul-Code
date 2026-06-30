@@ -1,13 +1,37 @@
-def prev_business_day(target_date: date, calendar: str = "TARGET") -> date:
-    """Returns the business day immediately preceding target_date."""
-    if "." in calendar:
-        parts = calendar.split(".")
-        calendar_class = getattr(ql, parts[0])
-        market = getattr(calendar_class, parts[1])
-        ql_calendar = calendar_class(market)
-    else:
-        ql_calendar = getattr(ql, calendar)()
-    ql_date = ql.Date(target_date.day, target_date.month, target_date.year)
-    prev = ql_date - 1
-    prev = ql_calendar.adjust(prev, ql.Preceding)
-    return date(prev.year(), prev.month(), prev.dayOfMonth())
+        # t_exp to fixing date (EndDate − 1 business day): last overnight rate fixes here.
+        if self.valuation_date is not None:
+            schedule["t_exp"] = schedule["EndDate"].apply(
+                lambda e: (
+                    prev_business_day(e, self.calendar) - self.valuation_date
+                ).days / 365.0
+            )
+        else:
+            schedule["t_exp"] = 0.0
+
+
+    def _ois_daily_caplets(self) -> None:
+        records = []
+        for _, period in self.schedule.iterrows():
+            period_start = period["StartDate"]
+            period_end = period["EndDate"]
+            pay_date = period["PayDate"]
+            period_tau = period["YearFrac"]
+            df_pay = self.discount_curve.get_discount_factor_for_date(pay_date)
+
+            # All daily optionlets in this period share the same fixing date
+            # (EndDate − 1 business day), consistent with post-aggregation convention.
+            fixing_date = prev_business_day(period_end, self.calendar)
+            t_fix = (
+                (fixing_date - self.valuation_date).days / 365.0
+                if self.valuation_date else 0.0
+            )
+
+            period_pv = 0.0
+            for d_i, d_next in iter_overnight_periods(period_start, period_end, self.calendar):
+                tau_i = self.forward_curve.rate_day_count_convention(d_i, d_next)
+                f_day = self.forward_curve.get_simple_forward(d_i, d_next)
+                moneyness = (self.strike - f_day) * 100
+                opt_factor = self._black_option_factor(
+                    f_day, tau_i, t_fix, moneyness, vol_maturity=period_tau
+                )
+                period_pv += self.notional * opt_factor * df_pay
