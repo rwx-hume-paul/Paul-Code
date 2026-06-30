@@ -1,91 +1,194 @@
-import pandas as pd
-import numpy as np
 
+class CapFloor:
+    """
+    IBOR Cap and Floor pricer.
 
-class IRVol:
-    """Interest rate volatility surface for swaptions and caps/floors.
+    A cap (floor) is a strip of caplets (floorlets), one per payment period, each
+    priced with Black's formula on the simple IBOR forward rate for that period.
 
-    Input DataFrame must have columns: Moneyness, Expiry, Maturity, Vol.
-    Expiry and Maturity are year fractions. Moneyness convention is caller-defined
-    (absolute strike, log-moneyness, offset from ATM, etc.).
+    Sign convention: positive notional = long; negative notional = short.
+    cap=True prices a cap; cap=False prices a floor.
 
-    Interpolation order: Maturity → Expiry → Moneyness.
-    All interpolation is linear with flat extrapolation outside the surface range.
+    Schedule columns added beyond the base schedule:
+        Strike, t_exp, Moneyness, Vol, d1, d2, OptionFactor, DiscountFactor, PV.
     """
 
-    def __init__(self, df: pd.DataFrame) -> None:
-        arr = df[["Moneyness", "Expiry", "Maturity", "Vol"]].to_numpy(dtype=np.float64)
-        self._maturities = np.unique(arr[:, 2])
-
-        # {maturity: {expiry: (moneyness_nodes, vol_nodes)}}
-        self._surface: dict = {}
-
-        for mat in self._maturities:
-            mat_rows = arr[np.isclose(arr[:, 2], mat)]
-            expiries = np.unique(mat_rows[:, 1])
-            self._surface[float(mat)] = {}
-            for exp in expiries:
-                exp_rows = mat_rows[np.isclose(mat_rows[:, 1], exp)]
-                order = np.argsort(exp_rows[:, 0])
-                self._surface[float(mat)][float(exp)] = (
-                    exp_rows[order, 0],
-                    exp_rows[order, 3],
-                )
-
-    def _vol_at_expiry_maturity(self, moneyness: float, expiry: float, maturity: float) -> float:
-        m_nodes, v_nodes = self._surface[maturity][expiry]
-        return float(np.interp(moneyness, m_nodes, v_nodes))
-
-    def _vol_at_maturity(self, moneyness: float, swaption_expiry: float, maturity: float) -> float:
-        expiries = np.array(sorted(self._surface[maturity].keys()))
-        idx = int(np.searchsorted(expiries, swaption_expiry))
-
-        if idx == 0:
-            return self._vol_at_expiry_maturity(moneyness, float(expiries[0]), maturity)
-        if idx == len(expiries):
-            return self._vol_at_expiry_maturity(moneyness, float(expiries[-1]), maturity)
-
-        e2 = float(expiries[idx])
-        if np.isclose(swaption_expiry, e2):
-            return self._vol_at_expiry_maturity(moneyness, e2, maturity)
-
-        e1 = float(expiries[idx - 1])
-        v1 = self._vol_at_expiry_maturity(moneyness, e1, maturity)
-        v2 = self._vol_at_expiry_maturity(moneyness, e2, maturity)
-        w = (swaption_expiry - e1) / (e2 - e1)
-        return v1 + w * (v2 - v1)
-
-    def get_vol(self, moneyness: float, swaption_expiry: float, swap_maturity: float) -> float:
-        """Return interpolated swaption / cap / floor volatility.
-
-        Parameters
-        ----------
-        moneyness : float
-            Strike moneyness (convention matches the input data).
-        swaption_expiry : float
-            Time to swaption expiry in year fractions.
-        swap_maturity : float
-            Underlying swap (or caplet) maturity in year fractions.
-
-        Returns
-        -------
-        float
-            Implied volatility.
+    def __init__(
+        self,
+        effective_date: date,
+        maturity_date: date,
+        notional: float,
+        forward_curve: DiscountYieldCurveHandler,
+        discount_curve: DiscountYieldCurveHandler,
+        ir_vol: IRVol,
+        strike: float,
+        valuation_date: date = None,
+        payment_frequency: int = 3,
+        payment_offset: int = 0,
+        cap: bool = True,
+        forward_shift: float = 0.0,
+        current_ibor_rate: float = None,
+        calendar: str = "TARGET",
+        business_convention: str = "ModifiedFollowing",
+        termination_business_convention: str = "ModifiedFollowing",
+        date_generation: str = "Backward",
+        day_count: str = "ACT/365",
+        end_of_month: bool = False,
+    ):
         """
-        maturities = self._maturities
-        idx = int(np.searchsorted(maturities, swap_maturity))
+        Parameters:
+            effective_date: Cap/floor start date.
+            maturity_date: Cap/floor end date.
+            notional: Signed notional. Positive = long; negative = short.
+            forward_curve: IBOR forward curve.
+            discount_curve: Discount curve for PV.
+            ir_vol: Volatility surface (moneyness, expiry, maturity).
+            strike: Cap/floor strike rate.
+            valuation_date: Valuation date for t_exp and schedule filtering.
+            payment_frequency: Period length in months (default 3).
+            payment_offset: Payment date offset in days (default 0).
+            cap: True = cap (caplets); False = floor (floorlets).
+            forward_shift: Shift applied to F and K in Black's formula (default 0).
+            current_ibor_rate: Known IBOR fixing for the current in-motion period.
+                When provided and the first period has already started, the forward
+                rate for that period is replaced with this fixing and the caplet/floorlet
+                is valued at intrinsic (no optionality remaining).
+            calendar: QuantLib calendar name (default 'TARGET').
+            business_convention: Business day convention (default 'ModifiedFollowing').
+            termination_business_convention: Termination convention (default 'ModifiedFollowing').
+            date_generation: Schedule generation rule (default 'Backward').
+            day_count: Day count convention (default 'ACT/365').
+            end_of_month: End-of-month convention (default False).
+        """
+        self.effective_date = effective_date
+        self.maturity_date = maturity_date
+        self.notional = notional
+        self.forward_curve = forward_curve
+        self.discount_curve = discount_curve
+        self.ir_vol = ir_vol
+        self.strike = strike
+        self.valuation_date = valuation_date
+        self.payment_frequency = payment_frequency
+        self.payment_offset = payment_offset
+        self.cap = cap
+        self.forward_shift = forward_shift
+        self.current_ibor_rate = current_ibor_rate
+        self.calendar = calendar
+        self.business_convention = business_convention
+        self.termination_business_convention = termination_business_convention
+        self.date_generation = date_generation
+        self.day_count = day_count
+        self.end_of_month = end_of_month
 
-        if idx == 0:
-            return self._vol_at_maturity(moneyness, swaption_expiry, float(maturities[0]))
-        if idx == len(maturities):
-            return self._vol_at_maturity(moneyness, swaption_expiry, float(maturities[-1]))
+        self._build_schedule()
+        self._calculate_caplets()
 
-        m2 = float(maturities[idx])
-        if np.isclose(swap_maturity, m2):
-            return self._vol_at_maturity(moneyness, swaption_expiry, m2)
+    def _build_schedule(self):
+        """Generates the caplet schedule and attaches IBOR forward rates."""
+        self.schedule = generate_swap_leg_schedule(
+            effective_date=self.effective_date,
+            maturity_date=self.maturity_date,
+            valuation_date=self.valuation_date,
+            payment_frequency=self.payment_frequency,
+            payment_offset=self.payment_offset,
+            calendar=self.calendar,
+            business_convention=self.business_convention,
+            termination_business_convention=self.termination_business_convention,
+            date_generation=self.date_generation,
+            day_count=self.day_count,
+            end_of_month=self.end_of_month,
+        )
+        self.schedule = add_forward_rates_to_schedule(
+            self.schedule,
+            self.forward_curve,
+            frequency=self.payment_frequency,
+            calendar=self.calendar,
+            business_convention="Following",
+            use_schedule_end_date=True,
+        )
 
-        m1 = float(maturities[idx - 1])
-        v1 = self._vol_at_maturity(moneyness, swaption_expiry, m1)
-        v2 = self._vol_at_maturity(moneyness, swaption_expiry, m2)
-        w = (swap_maturity - m1) / (m2 - m1)
-        return v1 + w * (v2 - v1)
+    def _calculate_caplets(self):
+        """Prices each caplet/floorlet using Black's formula and computes PV."""
+        schedule = self.schedule.copy()
+        schedule["Strike"] = self.strike
+
+        # Override forward rate for the in-motion period (fixing already known)
+        if self.current_ibor_rate is not None and len(schedule) > 0:
+            first_start = schedule.iloc[0]["StartDate"]
+            if self.valuation_date is not None and first_start < self.valuation_date:
+                schedule.iloc[0, schedule.columns.get_loc("ForwardRate")] = self.current_ibor_rate
+
+        # t_exp = (StartDate - valuation_date).days / 365, always /365
+        if self.valuation_date is not None:
+            schedule["t_exp"] = schedule["StartDate"].apply(
+                lambda s: (s - self.valuation_date).days / 365.0
+            )
+        else:
+            schedule["t_exp"] = 0.0
+
+        # Moneyness = K - F (consistent with Swaption convention)
+        schedule["Moneyness"] = self.strike - schedule["ForwardRate"]
+
+        # Vol, d1, d2, OptionFactor per caplet
+        vols, d1s, d2s, opt_factors = [], [], [], []
+
+        for _, row in schedule.iterrows():
+            t = row["t_exp"]
+            f = row["ForwardRate"]
+            tau = row["YearFrac"]
+            f_s = f + self.forward_shift
+            k_s = self.strike + self.forward_shift
+
+            if t <= 0:
+                # Fixing has passed: intrinsic value, no vol
+                vols.append(0.0)
+                d1s.append(np.nan)
+                d2s.append(np.nan)
+                if self.cap:
+                    opt_factors.append(max(f - self.strike, 0.0) * tau)
+                else:
+                    opt_factors.append(max(self.strike - f, 0.0) * tau)
+            else:
+                vol = self.ir_vol.get_vol(row["Moneyness"], t, tau)
+                vols.append(vol)
+                if vol <= 0 or f_s <= 0 or k_s <= 0:
+                    d1s.append(np.nan)
+                    d2s.append(np.nan)
+                    opt_factors.append(0.0)
+                else:
+                    d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
+                    d2 = d1 - vol * np.sqrt(t)
+                    d1s.append(d1)
+                    d2s.append(d2)
+                    if self.cap:
+                        opt_factors.append(tau * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2)))
+                    else:
+                        opt_factors.append(tau * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1)))
+
+        schedule["Vol"] = vols
+        schedule["d1"] = d1s
+        schedule["d2"] = d2s
+        schedule["OptionFactor"] = opt_factors
+
+        schedule["DiscountFactor"] = schedule["PayDate"].apply(
+            lambda pay_date: self.discount_curve.get_discount_factor_for_date(pay_date)
+        )
+        schedule["PV"] = self.notional * schedule["OptionFactor"] * schedule["DiscountFactor"]
+
+        self.schedule = schedule
+
+    def net_pv(self) -> float:
+        return float(self.schedule["PV"].sum())
+
+    def get_schedule(self) -> pd.DataFrame:
+        return self.schedule.copy()
+
+    def summary(self) -> dict:
+        return {
+            "net_pv": self.net_pv(),
+            "notional": self.notional,
+            "strike": self.strike,
+            "cap": self.cap,
+            "effective_date": self.effective_date,
+            "maturity_date": self.maturity_date,
+        }
