@@ -1,16 +1,569 @@
+import pandas as pd
+import numpy as np
+from datetime import date
+from scipy.stats import norm
+from curve.discount_curve import DiscountYieldCurveHandler
+from market_data.vol_surface import IRVol
+from utils.swap_schedule import (
+    generate_swap_leg_schedule,
+    add_forward_rates_to_schedule,
+    add_floating_cashflows,
+    compute_daily_ois_factor,
+    iter_overnight_periods,
+)
+
+
+class IRSwap:
+    """
+    Interest rate swap pricer.
+
+    Handles schedule creation, forward rates, cashflows, and present value calculation
+    for both receive and pay legs.
+    """
+
+
+    def __init__(
+        self,
+        effective_date: date,
+        maturity_date: date,
+        notional: float,
+        receive_curve: DiscountYieldCurveHandler = None,
+        pay_curve: DiscountYieldCurveHandler = None,
+        discount_curve: DiscountYieldCurveHandler = None,
+        valuation_date: date = None,
+        receive_payment_frequency: int = 6,
+        pay_payment_frequency: int = 6,
+        payment_offset: int=0,
+        receive_fixed_rate: float = None,
+        pay_fixed_rate: float = None,
+        receive_spread: float = 0.0,
+        pay_spread: float = 0.0,
+        use_schedule_end_date_receive: bool = True,
+        use_schedule_end_date_pay: bool = True,
+        calendar: str = "TARGET",
+        business_convention: str = "ModifiedFollowing",
+        termination_business_convention: str = "ModifiedFollowing",
+        date_generation: str = "Backward",
+        day_count: str = "ACT/365",
+        end_of_month: bool = False,
+        pay_fixed: bool = True,
+        compounding: bool = False,
+        current_compounded_rate: float = None,
+        current_period_end_date: date = None,
+    ):
+        """
+        Parameters:
+            effective_date: Swap start date. For in-motion trades, the start of the current period.
+            maturity_date: Swap end date.
+            notional: Notional amount.
+            receive_curve: Curve for receive leg forwards (not required if receive_fixed_rate provided).
+            pay_curve: Curve for pay leg forwards (not required if pay_fixed_rate provided).
+            discount_curve: Curve for discounting.
+            valuation_date: Optional valuation date for filtering.
+            receive_payment_frequency: Receive payment frequency in months (default 6).
+            pay_payment_frequency: Pay payment frequency in months (default 6).
+            receive_fixed_rate: Optional fixed rate for receive leg.
+            pay_fixed_rate: Optional fixed rate for pay leg.
+            receive_spread: Spread for receive leg (default 0.0).
+            pay_spread: Spread for pay leg (default 0.0).
+            use_schedule_end_date: Use schedule end dates for forwards (default True).
+            calendar: Calendar (default 'TARGET').
+            business_convention: Business convention (default 'ModifiedFollowing').
+            termination_business_convention: Termination convention (default 'ModifiedFollowing').
+            date_generation: Schedule rule (default 'Backward').
+            day_count: Day count convention (default 'ACT/365').
+            end_of_month: End of month convention (default False).
+            compounding: Use OIS daily compounding for the floating leg (default False).
+            current_compounded_rate: For in-motion OIS trades, the annualized compounded rate
+                realized from effective_date to valuation_date (in the curve's rate day count
+                convention, e.g. ACT/360 for SOFR). Requires compounding=True.
+            current_period_end_date: End date of the in-motion payment period. Required when
+                current_compounded_rate is provided. The elapsed accrual fraction is derived
+                internally from effective_date and valuation_date.
+        """
+
+
+
+
+
+
+
+        self.effective_date = effective_date
+        self.maturity_date = maturity_date
+        self.notional = notional
+        self.receive_curve = receive_curve
+        self.pay_curve = pay_curve
+        self.discount_curve = discount_curve
+        self.valuation_date = valuation_date
+        self.receive_payment_frequency = receive_payment_frequency
+        self.pay_payment_frequency = pay_payment_frequency
+        self.payment_offset = payment_offset
+        self.receive_fixed_rate = receive_fixed_rate
+        self.pay_fixed_rate = pay_fixed_rate
+        self.receive_spread = receive_spread
+        self.pay_spread = pay_spread
+        self.use_schedule_end_date_receive = use_schedule_end_date_receive
+        self.use_schedule_end_date_pay = use_schedule_end_date_pay
+        self.calendar = calendar
+        self.business_convention = business_convention
+        self.termination_business_convention = termination_business_convention
+        self.date_generation = date_generation
+        self.day_count = day_count
+        self.end_of_month = end_of_month
+        self.pay_fixed = pay_fixed
+        self.compounding = compounding
+        self.current_compounded_rate = current_compounded_rate
+        self.current_period_end_date = current_period_end_date
+
+        # Validation: ensure either curve or fixed rate is provided for each leg
+        if receive_fixed_rate is None and receive_curve is None:
+            raise ValueError("Either receive_curve or receive_fixed_rate must be provided")
+        if pay_fixed_rate is None and pay_curve is None:
+            raise ValueError("Either pay_curve or pay_fixed_rate must be provided")
+        if current_compounded_rate is not None and not compounding:
+            raise ValueError("compounding must be True to use current_compounded_rate")
+        if current_compounded_rate is not None and current_period_end_date is None:
+            raise ValueError("current_period_end_date must be provided with current_compounded_rate")
+
+        # Generate schedules and cashflows on initialization
+        self._generate_schedules()
+        self._calculate_cashflows()
+        self._calculate_present_values()
+
+
+    def _generate_schedules(self):
+        """Generates schedules for receive and pay legs."""
+        schedule_params = {
+            "effective_date": self.effective_date,
+            "maturity_date": self.maturity_date,
+            "valuation_date": self.valuation_date,
+            "calendar": self.calendar,
+            "business_convention": self.business_convention,
+            "termination_business_convention": self.termination_business_convention,
+            "date_generation": self.date_generation,
+            "day_count": self.day_count,
+            "end_of_month": self.end_of_month,
+            "payment_offset": self.payment_offset
+        }
+
+        self.receive_schedule = generate_swap_leg_schedule(
+            **schedule_params,
+            payment_frequency=self.receive_payment_frequency
+        )
+
+        self.pay_schedule = generate_swap_leg_schedule(
+            **schedule_params,
+            payment_frequency=self.pay_payment_frequency
+        )
+
+    def _apply_inmotion_compounding(self, schedule: pd.DataFrame, curve) -> pd.DataFrame:
+        """
+        Overrides the first period's ForwardRate for an OIS leg that is currently in motion.
+
+        Combines the already-realized compounding (effective_date → valuation_date), supplied
+        via current_compounded_rate, with the projected forward compounding
+        (valuation_date → current_period_end_date) derived from the curve.
+
+        Total factor = (1 + elapsed_factor) × (DF(val) / DF(period_end)) - 1
+        where elapsed_factor = current_compounded_rate × elapsed_tau.
+
+        The resulting ForwardRate is annualized over the full period's YearFrac so that
+        add_floating_cashflows (N × YearFrac × ForwardRate) still gives the correct cashflow.
+        """
+        schedule = schedule.copy()
+
+        # Year fraction of the already-elapsed portion (effective_date → valuation_date),
+        # derived from the curve's rate day count convention (e.g. ACT/360 for SOFR)
+        elapsed_tau = curve.rate_day_count_convention(self.effective_date, self.valuation_date)
+        elapsed_factor = self.current_compounded_rate * elapsed_tau
+
+        # Forward compounding factor for the remaining portion via daily business-day stepping.
+        remaining_factor = compute_daily_ois_factor(
+            curve, self.valuation_date, self.current_period_end_date, self.calendar
+        )
+
+        # Compound the two portions together
+        total_factor = (1 + elapsed_factor) * (1 + remaining_factor) - 1
+
+        # Express as an annualized rate over the full period so the existing cashflow
+        # formula (N × YearFrac × ForwardRate) correctly yields N × total_factor
+        full_tau = schedule.iloc[0]["YearFrac"]
+        schedule.iloc[0, schedule.columns.get_loc("ForwardRate")] = total_factor / full_tau
+
+        return schedule
+
+    def _calculate_cashflows(self):
+        """Calculates forward rates and cashflows for both legs."""
+        # Receive leg
+        if self.receive_fixed_rate is not None:
+            # Use fixed rate instead of curve
+            self.receive_schedule["ForwardRate"] = self.receive_fixed_rate
+        elif self.pay_fixed == False: # keep flat rate as act 365, hence no day_count passed in
+            self.receive_schedule = add_forward_rates_to_schedule(
+                self.receive_schedule,
+                self.receive_curve,
+                frequency=self.receive_payment_frequency,
+                calendar=self.calendar,
+                business_convention="Following",
+                use_schedule_end_date=self.use_schedule_end_date_receive
+            )
+        else:
+            # Use curve to calculate forward rates (with OIS compounding if enabled)
+            self.receive_schedule = add_forward_rates_to_schedule(
+                self.receive_schedule,
+                self.receive_curve,
+                frequency=self.receive_payment_frequency,
+                calendar=self.calendar,
+                business_convention="Following",
+                use_schedule_end_date=self.use_schedule_end_date_receive,
+                day_count=self.day_count,
+                compounding=self.compounding
+            )
+            if self.compounding and self.current_compounded_rate is not None:
+                self.receive_schedule = self._apply_inmotion_compounding(
+                    self.receive_schedule, self.receive_curve
+                )
+
+        # Add spread to receive leg forward rates
+        self.receive_schedule["ForwardRate"] = self.receive_schedule["ForwardRate"] + self.receive_spread
+
+        self.receive_schedule = add_floating_cashflows(
+            self.receive_schedule,
+            self.notional
+        )
+
+        # Pay leg
+        if self.pay_fixed_rate is not None:
+            # Use fixed rate instead of curve
+            self.pay_schedule["ForwardRate"] = self.pay_fixed_rate
+        elif self.pay_fixed == True: # keep flat rate as act 365
+            # Use curve to calculate forward rates
+            self.pay_schedule = add_forward_rates_to_schedule(
+                self.pay_schedule,
+                self.pay_curve,
+                frequency=self.pay_payment_frequency,
+                calendar=self.calendar,
+                business_convention="Following",
+                use_schedule_end_date=self.use_schedule_end_date_pay
+            )
+        else:
+            # use curve to calculate forward rates (with OIS compounding if enabled)
+            self.pay_schedule = add_forward_rates_to_schedule(
+                self.pay_schedule,
+                self.pay_curve,
+                frequency=self.pay_payment_frequency,
+                calendar=self.calendar,
+                business_convention="Following",
+                use_schedule_end_date=self.use_schedule_end_date_pay,
+                day_count=self.day_count,
+                compounding=self.compounding
+            )
+            if self.compounding and self.current_compounded_rate is not None:
+                self.pay_schedule = self._apply_inmotion_compounding(
+                    self.pay_schedule, self.pay_curve
+                )
+
+        # Add spread to pay leg forward rates
+        self.pay_schedule["ForwardRate"] = self.pay_schedule["ForwardRate"] + self.pay_spread
+
+        self.pay_schedule = add_floating_cashflows(
+            self.pay_schedule,
+            self.notional
+        )
+
+    def _calculate_present_values(self):
+        """Calculates present values using discount curve."""
+        self.receive_schedule["DiscountFactor"] = self.receive_schedule["PayDate"].apply(
+            lambda pay_date: self.discount_curve.get_discount_factor_for_date(pay_date)
+        )
+        self.receive_schedule["PV"] = (
+            self.receive_schedule["Cashflow"] * self.receive_schedule["DiscountFactor"]
+        )
+
+        self.pay_schedule["DiscountFactor"] = self.pay_schedule["PayDate"].apply(
+            lambda pay_date: self.discount_curve.get_discount_factor_for_date(pay_date)
+        )
+        self.pay_schedule["PV"] = (
+            self.pay_schedule["Cashflow"] * self.pay_schedule["DiscountFactor"]
+        )
+    def calculate_fair_rate(self):
+        """Calculate fair fixed rate of the swap (also used for swaptions)"""
+        if self.pay_fixed == True:
+            fair_rate = (self.receive_schedule['YearFrac'] * self.receive_schedule['DiscountFactor'] * self.receive_schedule['ForwardRate']).values.sum()/(self.pay_schedule['YearFrac'] * self.pay_schedule['DiscountFactor']).values.sum()
+        else:
+            fair_rate = (self.pay_schedule['YearFrac'] * self.pay_schedule['DiscountFactor'] * self.pay_schedule['ForwardRate']).values.sum()/(self.receive_schedule['YearFrac'] * self.receive_schedule['DiscountFactor']).values.sum()
+        return fair_rate
+    
+
+
+
+
+
+
+
+    def receive_leg_pv(self) -> float:
+        """Returns present value of receive leg."""
+        return self.receive_schedule["PV"].sum()
+
+    def pay_leg_pv(self) -> float:
+        """Returns present value of pay leg."""
+        return self.pay_schedule["PV"].sum()
+
+    def net_pv(self) -> float:
+        """Returns net present value (receive - pay)."""
+        return self.receive_leg_pv() - self.pay_leg_pv()
+
+    def get_receive_schedule(self) -> pd.DataFrame:
+        """Returns receive leg schedule."""
+        return self.receive_schedule.copy()
+
+    def get_pay_schedule(self) -> pd.DataFrame:
+        """Returns pay leg schedule."""
+        return self.pay_schedule.copy()
+
+    def summary(self) -> dict:
+        """Returns summary with PVs and swap details."""
+        return {
+            "receive_leg_pv": self.receive_leg_pv(),
+            "pay_leg_pv": self.pay_leg_pv(),
+            "net_pv": self.net_pv(),
+            "notional": self.notional,
+            "effective_date": self.effective_date,
+            "maturity_date": self.maturity_date,
+        }
+    
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class FRA:
+    """
+    Forward Rate Agreement pricer.
+
+    Net PV = notional × YearFrac × (ForwardRate - fixed_rate) × DF(start_date).
+    Sign convention: positive notional = pay fixed / receive IBOR (long rate).
+                     negative notional = receive fixed / pay IBOR (short rate).
+    Settlement occurs on the start date of the reference period.
+    """
+
+    def __init__(
+        self,
+        effective_date: date,
+        maturity_date: date,
+        notional: float,
+        reference_rate_curve: DiscountYieldCurveHandler,
+        discount_curve: DiscountYieldCurveHandler,
+        fixed_rate: float,
+        valuation_date: date = None,
+        calendar: str = "TARGET",
+        business_convention: str = "ModifiedFollowing",
+        day_count: str = "ACT/365",
+    ):
+        """
+        Parameters:
+            effective_date: Start of the FRA reference period (also the settlement date).
+            maturity_date: End of the FRA reference period.
+            notional: Signed notional. Positive = pay fixed; negative = receive fixed.
+            reference_rate_curve: IBOR forward curve.
+            discount_curve: Curve for discounting to the settlement date.
+            fixed_rate: The agreed fixed rate.
+            valuation_date: Valuation date.
+            calendar: QuantLib calendar name (default 'TARGET').
+            business_convention: Business day convention (default 'ModifiedFollowing').
+            day_count: Day count convention (default 'ACT/365').
+        """
+        self.effective_date = effective_date
+        self.maturity_date = maturity_date
+        self.notional = notional
+        self.reference_rate_curve = reference_rate_curve
+        self.discount_curve = discount_curve
+        self.fixed_rate = fixed_rate
+        self.valuation_date = valuation_date
+        self.calendar = calendar
+        self.business_convention = business_convention
+        self.day_count = day_count
+
+        self._build_schedule()
+        self._calculate_cashflows()
+        self._calculate_present_values()
+
+    def _build_schedule(self):
+        """Builds the single-period schedule. PayDate = StartDate (FRA settles on fixing date)."""
+        import QuantLib as ql
+
+        if "." in self.calendar:
+            parts = self.calendar.split(".")
+            calendar_class = getattr(ql, parts[0])
+            market = getattr(calendar_class, parts[1])
+            ql_calendar = calendar_class(market)
+        else:
+            ql_calendar = getattr(ql, self.calendar)()
+
+        ql_convention = getattr(ql, self.business_convention)
+
+        ql_start = ql.Date(self.effective_date.day, self.effective_date.month, self.effective_date.year)
+        ql_end = ql.Date(self.maturity_date.day, self.maturity_date.month, self.maturity_date.year)
+        ql_start = ql_calendar.adjust(ql_start, ql_convention)
+        ql_end = ql_calendar.adjust(ql_end, ql_convention)
+
+        daycount_map = {
+            "ACT/360": ql.Actual360(),
+            "ACT/365": ql.Actual365Fixed(),
+            "ACT/365F": ql.Actual365Fixed(),
+            "ACT/ACT": ql.ActualActual(ql.ActualActual.ISDA),
+            "30/360": ql.Thirty360(ql.Thirty360.BondBasis),
+        }
+        ql_daycount = daycount_map.get(self.day_count, ql.Actual365Fixed())
+
+        start_date = date(ql_start.year(), ql_start.month(), ql_start.dayOfMonth())
+        end_date = date(ql_end.year(), ql_end.month(), ql_end.dayOfMonth())
+
+        self.schedule = pd.DataFrame([{
+            "StartDate": start_date,
+            "EndDate": end_date,
+            "PayDate": end_date,
+            "DaysInPeriod": (end_date - start_date).days,
+            "YearFrac": ql_daycount.yearFraction(ql_start, ql_end),
+        }])
+
+    def _calculate_cashflows(self):
+        """Computes the net cashflow: notional × YearFrac × (ForwardRate - fixed_rate)."""
+        row = self.schedule.iloc[0]
+        forward_rate = self.reference_rate_curve.get_simple_forward(row["StartDate"], row["EndDate"])
+        self.schedule["ForwardRate"] = forward_rate
+        self.schedule["FixedRate"] = self.fixed_rate
+        self.schedule["NetCashflow"] = self.notional * row["YearFrac"] * (forward_rate - self.fixed_rate)
+
+    def _calculate_present_values(self):
+        """Discounts the net cashflow to valuation date using DF at the settlement date."""
+        df = self.discount_curve.get_discount_factor_for_date(self.schedule.iloc[0]["PayDate"])
+        self.schedule["DiscountFactor"] = df
+        self.schedule["PV"] = self.schedule["NetCashflow"] * df
+
+    def net_pv(self) -> float:
+        return float(self.schedule["PV"].sum())
+
+    def calculate_fair_rate(self) -> float:
+        """Returns the par FRA rate (the IBOR forward over the reference period)."""
+        row = self.schedule.iloc[0]
+        return self.reference_rate_curve.get_simple_forward(row["StartDate"], row["EndDate"])
+
+    def get_schedule(self) -> pd.DataFrame:
+        return self.schedule.copy()
+
+    def summary(self) -> dict:
+        return {
+            "net_pv": self.net_pv(),
+            "forward_rate": float(self.schedule["ForwardRate"].iloc[0]),
+            "fixed_rate": self.fixed_rate,
+            "notional": self.notional,
+            "effective_date": self.effective_date,
+            "maturity_date": self.maturity_date,
+        }
+
+
+class Swaption:
+    def __init__(
+        self,
+        underlying_swap: IRSwap,
+        expiry_date: date,
+        strike: float,
+        ir_vol: IRVol,
+        forward_shift: float = 0,
+    ):
+        self.underlying_swap = underlying_swap
+        self.expiry_date = expiry_date
+        self.strike = strike
+        self.ir_vol = ir_vol
+        self.forward_shift = forward_shift
+        self.fair_forward = self.underlying_swap.calculate_fair_rate()
+        self.a_factor = self._calculate_A_factor()
+        self.expiry_time = self._calculate_expiry_time()
+        self.maturity_time = self._calculate_maturity_time()
+        self.moneyness = (self.strike - self.fair_forward)
+        self.volatility = self.calculate_swaption_volatility()
+
+
+    def _calculate_A_factor(self):
+        """Calculate the A factor of the swap (used for swaptions)"""
+        if self.underlying_swap.pay_fixed == True: # then fixed_leg = payment dfs and accruals etc
+            a_factor = (self.underlying_swap.pay_schedule['YearFrac'] * self.underlying_swap.pay_schedule['DiscountFactor']).values.sum()
+        else:
+            a_factor = (self.underlying_swap.receive_schedule['YearFrac'] * self.underlying_swap.receive_schedule['DiscountFactor']).values.sum()
+        return a_factor
+    
+    def _calculate_expiry_time(self):
+        return (self.expiry_date - self.underlying_swap.valuation_date).days/365
+    
+    def _calculate_maturity_time(self):
+        if self.underlying_swap.pay_fixed:
+            last_pay_date = self.underlying_swap.pay_schedule["PayDate"].iloc[-1]
+        else:
+            last_pay_date = self.underlying_swap.receive_schedule["PayDate"].iloc[-1]
+        return (last_pay_date - self.underlying_swap.effective_date).days / 365
+
+    def _calculate_d1(self):
+        d1 = (np.log((self.fair_forward + self.forward_shift) / (self.strike + self.forward_shift)) + self.expiry_time * (self.volatility)**2/2) / (self.volatility * np.sqrt(self.expiry_time))
+        return d1
+    
+    def _calculate_d2(self):
+        d2 = (np.log((self.fair_forward + self.forward_shift) / (self.strike + self.forward_shift)) - self.expiry_time * (self.volatility)**2/2) / (self.volatility * np.sqrt(self.expiry_time))
+        return d2
+    
+
+
+    def swaption_value(self):
+        d1 = self._calculate_d1
+        d2 = self._calculate_d2
+        if self.underlying_swap.pay_fixed == True: # payer swaption
+            return self.underlying_swap.notional * self.a_factor * ((self.fair_forward + self.forward_shift) * norm.cdf(d1) - (self.strike + self.forward_shift) * norm.cdf(d2))
+        else: # receiver swaption
+            return self.underlying_swap.notional * self.a_factor * ((self.strike + self.forward_shift) * norm.cdf(-d2) - (self.fair_forward + self.forward_shift) * norm.cdf(-d1))
+        
+
+    def calculate_swaption_volatility(self) -> float:
+        return self.ir_vol.get_vol(self.moneyness, self.expiry_time, self.maturity_time)
+
 
 class CapFloor:
     """
-    IBOR Cap and Floor pricer.
+    IBOR and OIS Cap and Floor pricer.
 
-    A cap (floor) is a strip of caplets (floorlets), one per payment period, each
-    priced with Black's formula on the simple IBOR forward rate for that period.
+    IBOR mode (compounding=False):
+        One Black caplet/floorlet per period on the simple IBOR forward rate.
+        t_exp = (StartDate − valuation_date) / 365.
+        In-motion: supply current_ibor_rate to fix the rate (intrinsic only).
+
+    OIS post-aggregation mode (compounding=True, post_aggregation=True):
+        One Black caplet/floorlet per period on the compounded OIS rate.
+        t_exp = (EndDate − valuation_date) / 365 (rate settles at end of period).
+        In-motion: blend current_compounded_rate with projected remaining rate.
+        Optionality remains — d1/d2 and Black formula still applied.
+
+    OIS daily mode (compounding=True, post_aggregation=False):
+        Each period decomposed into daily optionlets (one per business day).
+        Each priced on the expected overnight rate; t_exp per day from StartDate.
+        Days with t_exp ≤ 0 valued at intrinsic. Sum discounted at period PayDate.
 
     Sign convention: positive notional = long; negative notional = short.
     cap=True prices a cap; cap=False prices a floor.
-
-    Schedule columns added beyond the base schedule:
-        Strike, t_exp, Moneyness, Vol, d1, d2, OptionFactor, DiscountFactor, PV.
+    Moneyness = (K − F) × 100 (in percent, matching vol surface input convention).
     """
 
     def __init__(
@@ -28,38 +581,18 @@ class CapFloor:
         cap: bool = True,
         forward_shift: float = 0.0,
         current_ibor_rate: float = None,
+        compounding: bool = False,
+        post_aggregation: bool = True,
+        current_compounded_rate: float = None,
+        current_period_end_date: date = None,
         calendar: str = "TARGET",
         business_convention: str = "ModifiedFollowing",
         termination_business_convention: str = "ModifiedFollowing",
         date_generation: str = "Backward",
         day_count: str = "ACT/365",
         end_of_month: bool = False,
+        use_schedule_end_date: bool = True,
     ):
-        """
-        Parameters:
-            effective_date: Cap/floor start date.
-            maturity_date: Cap/floor end date.
-            notional: Signed notional. Positive = long; negative = short.
-            forward_curve: IBOR forward curve.
-            discount_curve: Discount curve for PV.
-            ir_vol: Volatility surface (moneyness, expiry, maturity).
-            strike: Cap/floor strike rate.
-            valuation_date: Valuation date for t_exp and schedule filtering.
-            payment_frequency: Period length in months (default 3).
-            payment_offset: Payment date offset in days (default 0).
-            cap: True = cap (caplets); False = floor (floorlets).
-            forward_shift: Shift applied to F and K in Black's formula (default 0).
-            current_ibor_rate: Known IBOR fixing for the current in-motion period.
-                When provided and the first period has already started, the forward
-                rate for that period is replaced with this fixing and the caplet/floorlet
-                is valued at intrinsic (no optionality remaining).
-            calendar: QuantLib calendar name (default 'TARGET').
-            business_convention: Business day convention (default 'ModifiedFollowing').
-            termination_business_convention: Termination convention (default 'ModifiedFollowing').
-            date_generation: Schedule generation rule (default 'Backward').
-            day_count: Day count convention (default 'ACT/365').
-            end_of_month: End-of-month convention (default False).
-        """
         self.effective_date = effective_date
         self.maturity_date = maturity_date
         self.notional = notional
@@ -73,18 +606,22 @@ class CapFloor:
         self.cap = cap
         self.forward_shift = forward_shift
         self.current_ibor_rate = current_ibor_rate
+        self.compounding = compounding
+        self.post_aggregation = post_aggregation
+        self.current_compounded_rate = current_compounded_rate
+        self.current_period_end_date = current_period_end_date
         self.calendar = calendar
         self.business_convention = business_convention
         self.termination_business_convention = termination_business_convention
         self.date_generation = date_generation
         self.day_count = day_count
         self.end_of_month = end_of_month
+        self.use_schedule_end_date = use_schedule_end_date
 
         self._build_schedule()
         self._calculate_caplets()
 
     def _build_schedule(self):
-        """Generates the caplet schedule and attaches IBOR forward rates."""
         self.schedule = generate_swap_leg_schedule(
             effective_date=self.effective_date,
             maturity_date=self.maturity_date,
@@ -104,21 +641,87 @@ class CapFloor:
             frequency=self.payment_frequency,
             calendar=self.calendar,
             business_convention="Following",
-            use_schedule_end_date=True,
+            use_schedule_end_date=self.use_schedule_end_date,
+            compounding=self.compounding,
         )
 
-    def _calculate_caplets(self):
-        """Prices each caplet/floorlet using Black's formula and computes PV."""
+    def _black_option_factor(
+        self, f: float, tau: float, t: float, moneyness: float,
+        vol_maturity: float = None,
+    ) -> float:
+        """Black factor for one caplet/floorlet. Returns tau × [payoff] or intrinsic when t≤0.
+
+        vol_maturity: maturity passed to vol surface (defaults to tau). Use the full
+        caplet period year-frac when pricing individual daily optionlets so that the
+        vol surface is queried at the same maturity as for the period-level caplet.
+        """
+        f_s = f + self.forward_shift
+        k_s = self.strike + self.forward_shift
+        if t <= 0:
+            if self.cap:
+                return max(f - self.strike, 0.0) * tau
+            return max(self.strike - f, 0.0) * tau
+        mat = vol_maturity if vol_maturity is not None else tau
+        vol = self.ir_vol.get_vol(moneyness, t, mat)
+        if vol <= 0 or f_s <= 0 or k_s <= 0:
+            return 0.0
+        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
+        d2 = d1 - vol * np.sqrt(t)
+        if self.cap:
+            return tau * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2))
+        return tau * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1))
+
+    def _black_option_factor_with_vol(
+        self, f: float, tau: float, t: float, moneyness: float
+    ):
+        """Returns (option_factor, vol, d1, d2) tuple."""
+        f_s = f + self.forward_shift
+        k_s = self.strike + self.forward_shift
+        if t <= 0:
+            if self.cap:
+                return max(f - self.strike, 0.0) * tau, 0.0, np.nan, np.nan
+            return max(self.strike - f, 0.0) * tau, 0.0, np.nan, np.nan
+        vol = self.ir_vol.get_vol(moneyness, t, tau)
+        if vol <= 0 or f_s <= 0 or k_s <= 0:
+            return 0.0, vol, np.nan, np.nan
+        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
+        d2 = d1 - vol * np.sqrt(t)
+        if self.cap:
+            factor = tau * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2))
+        else:
+            factor = tau * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1))
+        return factor, vol, d1, d2
+
+    def _attach_option_columns(self, schedule: pd.DataFrame) -> None:
+        """Adds Vol, d1, d2, OptionFactor, DiscountFactor, PV to schedule in-place."""
+        vols, d1s, d2s, opt_factors = [], [], [], []
+        for _, row in schedule.iterrows():
+            factor, vol, d1, d2 = self._black_option_factor_with_vol(
+                row["ForwardRate"], row["YearFrac"], row["t_exp"], row["Moneyness"]
+            )
+            vols.append(vol)
+            d1s.append(d1)
+            d2s.append(d2)
+            opt_factors.append(factor)
+        schedule["Vol"] = vols
+        schedule["d1"] = d1s
+        schedule["d2"] = d2s
+        schedule["OptionFactor"] = opt_factors
+        schedule["DiscountFactor"] = schedule["PayDate"].apply(
+            self.discount_curve.get_discount_factor_for_date
+        )
+        schedule["PV"] = self.notional * schedule["OptionFactor"] * schedule["DiscountFactor"]
+
+    def _ibor_caplets(self) -> None:
         schedule = self.schedule.copy()
         schedule["Strike"] = self.strike
 
-        # Override forward rate for the in-motion period (fixing already known)
         if self.current_ibor_rate is not None and len(schedule) > 0:
             first_start = schedule.iloc[0]["StartDate"]
             if self.valuation_date is not None and first_start < self.valuation_date:
-                schedule.iloc[0, schedule.columns.get_loc("ForwardRate")] = self.current_ibor_rate
+                loc = schedule.columns.get_loc("ForwardRate")
+                schedule.iloc[0, loc] = self.current_ibor_rate
 
-        # t_exp = (StartDate - valuation_date).days / 365, always /365
         if self.valuation_date is not None:
             schedule["t_exp"] = schedule["StartDate"].apply(
                 lambda s: (s - self.valuation_date).days / 365.0
@@ -126,56 +729,90 @@ class CapFloor:
         else:
             schedule["t_exp"] = 0.0
 
-        # Moneyness = K - F (consistent with Swaption convention)
-        schedule["Moneyness"] = self.strike - schedule["ForwardRate"]
-
-        # Vol, d1, d2, OptionFactor per caplet
-        vols, d1s, d2s, opt_factors = [], [], [], []
-
-        for _, row in schedule.iterrows():
-            t = row["t_exp"]
-            f = row["ForwardRate"]
-            tau = row["YearFrac"]
-            f_s = f + self.forward_shift
-            k_s = self.strike + self.forward_shift
-
-            if t <= 0:
-                # Fixing has passed: intrinsic value, no vol
-                vols.append(0.0)
-                d1s.append(np.nan)
-                d2s.append(np.nan)
-                if self.cap:
-                    opt_factors.append(max(f - self.strike, 0.0) * tau)
-                else:
-                    opt_factors.append(max(self.strike - f, 0.0) * tau)
-            else:
-                vol = self.ir_vol.get_vol(row["Moneyness"], t, tau)
-                vols.append(vol)
-                if vol <= 0 or f_s <= 0 or k_s <= 0:
-                    d1s.append(np.nan)
-                    d2s.append(np.nan)
-                    opt_factors.append(0.0)
-                else:
-                    d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
-                    d2 = d1 - vol * np.sqrt(t)
-                    d1s.append(d1)
-                    d2s.append(d2)
-                    if self.cap:
-                        opt_factors.append(tau * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2)))
-                    else:
-                        opt_factors.append(tau * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1)))
-
-        schedule["Vol"] = vols
-        schedule["d1"] = d1s
-        schedule["d2"] = d2s
-        schedule["OptionFactor"] = opt_factors
-
-        schedule["DiscountFactor"] = schedule["PayDate"].apply(
-            lambda pay_date: self.discount_curve.get_discount_factor_for_date(pay_date)
-        )
-        schedule["PV"] = self.notional * schedule["OptionFactor"] * schedule["DiscountFactor"]
-
+        schedule["Moneyness"] = (self.strike - schedule["ForwardRate"]) * 100
+        self._attach_option_columns(schedule)
         self.schedule = schedule
+
+    def _ois_post_agg_caplets(self) -> None:
+        schedule = self.schedule.copy()
+        schedule["Strike"] = self.strike
+
+        # In-motion: blend already-compounded portion with projected remaining.
+        if (
+            self.current_compounded_rate is not None
+            and self.current_period_end_date is not None
+            and len(schedule) > 0
+        ):
+            first_start = schedule.iloc[0]["StartDate"]
+            first_end = schedule.iloc[0]["EndDate"]
+            val = self.valuation_date
+            if val is not None and first_start <= val <= first_end:
+                tau_elapsed = self.forward_curve.rate_day_count_convention(
+                    first_start, val
+                )
+                elapsed_factor = 1.0 + self.current_compounded_rate * tau_elapsed
+                remaining_ois = compute_daily_ois_factor(
+                    self.forward_curve, val, self.current_period_end_date, self.calendar
+                )
+                remaining_factor = 1.0 + remaining_ois
+                tau_total = schedule.iloc[0]["YearFrac"]
+                blended_rate = (elapsed_factor * remaining_factor - 1.0) / tau_total
+                loc = schedule.columns.get_loc("ForwardRate")
+                schedule.iloc[0, loc] = blended_rate
+
+        # t_exp from EndDate — compounded OIS rate settles at period end.
+        if self.valuation_date is not None:
+            schedule["t_exp"] = schedule["EndDate"].apply(
+                lambda e: (e - self.valuation_date).days / 365.0
+            )
+        else:
+            schedule["t_exp"] = 0.0
+
+        schedule["Moneyness"] = (self.strike - schedule["ForwardRate"]) * 100
+        self._attach_option_columns(schedule)
+        self.schedule = schedule
+
+    def _ois_daily_caplets(self) -> None:
+        records = []
+        for _, period in self.schedule.iterrows():
+            period_start = period["StartDate"]
+            period_end = period["EndDate"]
+            pay_date = period["PayDate"]
+            period_tau = period["YearFrac"]
+            df_pay = self.discount_curve.get_discount_factor_for_date(pay_date)
+
+            period_pv = 0.0
+            for d_i, d_next in iter_overnight_periods(period_start, period_end, self.calendar):
+                tau_i = self.forward_curve.rate_day_count_convention(d_i, d_next)
+                f_day = self.forward_curve.get_simple_forward(d_i, d_next)
+                moneyness = (self.strike - f_day) * 100
+                t = (d_i - self.valuation_date).days / 365.0 if self.valuation_date else 0.0
+                opt_factor = self._black_option_factor(
+                    f_day, tau_i, t, moneyness, vol_maturity=period_tau
+                )
+                period_pv += self.notional * opt_factor * df_pay
+
+            records.append({
+                "StartDate": period_start,
+                "EndDate": period_end,
+                "PayDate": pay_date,
+                "DaysInPeriod": period["DaysInPeriod"],
+                "YearFrac": period_tau,
+                "ForwardRate": period["ForwardRate"],
+                "Strike": self.strike,
+                "DiscountFactor": df_pay,
+                "PV": period_pv,
+            })
+
+        self.schedule = pd.DataFrame(records)
+
+    def _calculate_caplets(self) -> None:
+        if not self.compounding:
+            self._ibor_caplets()
+        elif self.post_aggregation:
+            self._ois_post_agg_caplets()
+        else:
+            self._ois_daily_caplets()
 
     def net_pv(self) -> float:
         return float(self.schedule["PV"].sum())
@@ -192,3 +829,325 @@ class CapFloor:
             "effective_date": self.effective_date,
             "maturity_date": self.maturity_date,
         }
+
+
+
+
+
+
+
+
+
+import pandas as pd
+from datetime import date
+from dateutil.relativedelta import relativedelta
+from curve.discount_curve import DiscountYieldCurveHandler
+from utils.schedule import ql_to_datetime
+import QuantLib as ql
+
+def compute_daily_ois_factor(
+    curve: DiscountYieldCurveHandler,
+    start_date: date,
+    end_date: date,
+    calendar: str = "TARGET",
+) -> float:
+    """
+    Computes the OIS compounded cashflow factor by stepping through each business day.
+
+    For each business day i the overnight rate accrues over the calendar days until the
+    next business day (covering weekends and holidays). The daily contribution is:
+        factor_i = DF(t_i) / DF(t_next_business_day)
+
+    Multiplying these together gives the total compounded return:
+        Π(factor_i) - 1 = DF(start) / DF(end) - 1  for a smooth curve, but explicitly
+    captures kinks or step-shaped curves (e.g. around central-bank meeting dates).
+
+    Parameters:
+        curve: Discount curve used for DF lookups.
+        start_date: Start of the compounding period (must be a business day).
+        end_date: End of the compounding period (must be a business day).
+        calendar: QuantLib calendar name (default 'TARGET').
+
+    Returns:
+        Compounded cashflow factor: Π(DF_i / DF_{i+1}) - 1.
+    """
+    if "." in calendar:
+        parts = calendar.split(".")
+        calendar_class = getattr(ql, parts[0])
+        market = getattr(calendar_class, parts[1])
+        ql_calendar = calendar_class(market)
+    else:
+        ql_calendar = getattr(ql, calendar)()
+
+    current_ql = ql.Date(start_date.day, start_date.month, start_date.year)
+    end_ql = ql.Date(end_date.day, end_date.month, end_date.year)
+
+    compound_factor = 1.0
+
+    while current_ql < end_ql:
+        # Advance by 1 calendar day then adjust to next business day.
+        # This naturally handles weekends (Fri → Mon, 3 days) and holidays.
+        next_ql = ql_calendar.advance(current_ql, 1, ql.Days, ql.Following)
+        if next_ql > end_ql:
+            next_ql = end_ql
+
+        current_py = date(current_ql.year(), current_ql.month(), current_ql.dayOfMonth())
+        next_py = date(next_ql.year(), next_ql.month(), next_ql.dayOfMonth())
+
+        df_current = curve.get_discount_factor_for_date(current_py)
+        df_next = curve.get_discount_factor_for_date(next_py)
+        compound_factor *= df_current / df_next
+
+        current_ql = next_ql
+
+    return compound_factor - 1.0
+
+
+def iter_overnight_periods(
+    start_date: date,
+    end_date: date,
+    calendar: str = "TARGET",
+) -> list:
+    """
+    Returns a list of (period_start, period_end) date pairs, one per overnight period,
+    stepping through business days from start_date up to (but not including) end_date.
+
+    Weekends and holidays are handled by QuantLib: a Friday period runs to Monday,
+    giving three calendar days of accrual for that overnight rate.
+    """
+    if "." in calendar:
+        parts = calendar.split(".")
+        calendar_class = getattr(ql, parts[0])
+        market = getattr(calendar_class, parts[1])
+        ql_calendar = calendar_class(market)
+    else:
+        ql_calendar = getattr(ql, calendar)()
+
+    current_ql = ql.Date(start_date.day, start_date.month, start_date.year)
+    end_ql = ql.Date(end_date.day, end_date.month, end_date.year)
+
+    periods = []
+    while current_ql < end_ql:
+        next_ql = ql_calendar.advance(current_ql, 1, ql.Days, ql.Following)
+        if next_ql > end_ql:
+            next_ql = end_ql
+        d_start = date(current_ql.year(), current_ql.month(), current_ql.dayOfMonth())
+        d_end = date(next_ql.year(), next_ql.month(), next_ql.dayOfMonth())
+        periods.append((d_start, d_end))
+        current_ql = next_ql
+
+    return periods
+
+
+def add_forward_rates_to_schedule(
+    schedule: pd.DataFrame,
+    curve: DiscountYieldCurveHandler,
+    frequency: int,
+    calendar: str = "TARGET",
+    business_convention: str = "Following",
+    use_schedule_end_date: bool = True,
+    start_col: str = "StartDate",
+    end_col: str = "EndDate",
+    year_frac_col: str = "YearFrac",
+    day_count: str = "ACT/365",
+    compounding: bool = False
+) -> pd.DataFrame:
+    """
+    Adds forward rate column to swap schedule.
+
+    Parameters:
+        schedule: DataFrame with swap schedule.
+        curve: Discount curve for forward rate calculation.
+        frequency: Payment frequency in months.
+        calendar: QuantLib calendar name (default 'TARGET').
+        business_convention: Business day convention (default 'Following').
+        use_schedule_end_date: Use schedule end dates if True, calculate with QuantLib if False.
+        start_col: Column name for start dates (default 'StartDate').
+        end_col: Column name for end dates (default 'EndDate').
+        year_frac_col: Column name for year fractions (default 'YearFrac').
+
+    Returns:
+        Schedule with additional 'ForwardRate' column.
+
+
+
+
+    """
+    schedule = schedule.copy()
+
+    forward_rates = []
+
+    if use_schedule_end_date:
+        for _, row in schedule.iterrows():
+            start_date = row[start_col]
+            end_date = row[end_col]
+            if compounding:
+                ois_factor = compute_daily_ois_factor(
+                    curve, start_date, end_date, calendar
+                )
+                forward_rate = ois_factor / row[year_frac_col]
+            else:
+                forward_rate = curve.get_simple_forward(start_date, end_date)
+            forward_rates.append(forward_rate)
+    else:
+        # Calculate end dates using Quantlib
+        # Handle calendars with markets (e.g. UnitedStates.Settlement)
+        if "." in calendar:
+            parts = calendar.split(".")
+            calendar_class = getattr(ql, parts[0])
+            market = getattr(calendar_class, parts[1])
+            ql_calendar = calendar_class(market)
+        else:
+            ql_calendar = getattr(ql, calendar)()
+
+        ql_convention = getattr(ql, business_convention)
+        tenor = ql.Period(frequency, ql.Months)
+
+        for _, row in schedule.iterrows():
+            start_date = row[start_col]
+
+            #
+            ql_start_date = ql.Date(start_date.day, start_date.month, start_date.year)
+            
+            #
+            ql_end_date = ql_start_date + tenor
+            
+            #
+            ql_end_date = ql_calendar.adjust(ql_end_date, ql_convention)
+            
+            #
+            end_date = ql_to_datetime(ql_end_date)
+            
+            forward_rate = curve.get_simple_forward(start_date, end_date)
+            forward_rates.append(forward_rate)
+
+    schedule["ForwardRate"] = forward_rates
+    return schedule
+
+
+def add_floating_cashflows(
+    schedule: pd.DataFrame,
+    notional: float,
+    forward_rate_col: str = "ForwardRate",
+    year_frac_col: str = "YearFrac"
+) -> pd.DataFrame:
+    """
+    Adds floating cashflow column to swap schedule.
+
+    Parameters:
+        schedule: DataFrame with forward rates and year fractions.
+        notional: Notional amount.
+        forward_rate_col: Column name for forward rates (default 'ForwardRate').
+        year_frac_col: Column name for year fractions (default 'YearFrac').
+
+    Returns:
+        Schedule with additional 'Cashflow' column.
+    
+    
+    """
+    schedule = schedule.copy()
+    schedule["Cashflow"] = notional * schedule[year_frac_col] * schedule[forward_rate_col]
+    return schedule
+
+
+def generate_swap_leg_schedule(
+    effective_date: date,
+    maturity_date: date,
+    valuation_date: date = None,
+    payment_frequency: int = 6,
+    payment_offset: int = 0,
+    calendar: str = "TARGET",
+    business_convention: str = "ModifiedFollowing",
+    termination_business_convention: str = "ModifiedFollowing",
+    date_generation: str = "Backward",
+    day_count: str = "ACT/365",
+    end_of_month: bool = False,
+) -> pd.DataFrame:
+    """
+    Generates swap leg schedule using QuantLib.
+
+    Parameters:
+        effective_date: Swap start date.
+        maturity_date: Swap end date.
+        valuation_date: Optional valuation date for filtering past periods.
+        payment_frequency: Payment frequency in months (default 6).
+        calendar: Calendar name (default 'TARGET').
+        business_convention: Business day convention (default 'ModifiedFollowing').
+        termination_business_convention: Termination business convention (default 'ModifiedFollowing').
+        date_generation: Schedule rule (default 'Backward').
+        day_count: Day count convention (default 'ACT/365').
+        end_of_month: End of month convention (default False).
+
+    Returns:
+        DataFrame with columns: 'StartDate', 'EndDate', 'PayDate', 'DaysInPeriod', 'YearFrac'.
+   
+    """
+
+    #handle calendars with markets (e.g., "UnitedStates.Settlement")
+    if "." in calendar:
+        parts = calendar.split(".")
+        calendar_class = getattr(ql, parts[0])
+        market = getattr(calendar_class, parts[1])
+        ql_calendar = calendar_class(market)
+    else:
+        ql_calendar = getattr(ql, calendar)()
+    ql_convention = getattr(ql, business_convention)
+    ql_term_convention = getattr(ql, termination_business_convention)
+    ql_rule = getattr(ql.DateGeneration, date_generation)
+
+    # map day count conventions to QuantLib classes
+    daycount_map = {
+        "ACT/360": ql.Actual360(),
+        "ACT/365": ql.Actual365Fixed(),
+        "ACT/365F": ql.Actual365Fixed(),
+        "ACT/ACT": ql.ActualActual(ql.ActualActual.ISDA),
+        "30/360": ql.Thirty360(ql.Thirty360.BondBasis),
+    }
+    ql_daycount = daycount_map.get(day_count, ql.Actual360())
+
+    start_date = ql.Date(effective_date.day, effective_date.month, effective_date.year)
+    end_date = ql.Date(maturity_date.day, maturity_date.month, maturity_date.year)
+    tenor = ql.Period(payment_frequency, ql.Months)
+
+    schedule = ql.Schedule(
+        start_date,
+        end_date,
+        tenor,
+        ql_calendar,
+        ql_convention,
+        ql_term_convention,
+        ql_rule,
+        end_of_month
+    )
+
+    start_dates = []
+    end_dates = []
+    pay_dates = []
+    year_fracs = []
+    days_in_period = []
+
+    for i in range(len(schedule) - 1):
+        accrual_start = schedule[i]
+        accrual_end = schedule[i + 1]
+        #pay_date = ql_calendar.adjust(accrual_end, ql_convention)
+        pay_date = ql_calendar.advance(accrual_end, payment_offset, ql.Days, ql_convention)
+        year_frac = float((accrual_end - accrual_start) / 365.0) if day_count == "ACT/365" else ql_daycount.yearFraction(accrual_start, accrual_end)
+        num_days = accrual_end - accrual_start
+        start_dates.append(ql_to_datetime(accrual_start))
+        end_dates.append(ql_to_datetime(accrual_end))
+        pay_dates.append(ql_to_datetime(pay_date))
+        year_fracs.append(year_frac) 
+        days_in_period.append(num_days)
+
+    df = pd.DataFrame({
+        "StartDate": start_dates,
+        "EndDate": end_dates,
+        "PayDate": pay_dates,
+        "DaysInPeriod": days_in_period,
+        "YearFrac": year_fracs
+    })
+
+    if valuation_date is not None:
+        df = df[df["EndDate"] >= valuation_date].reset_index(drop=True)
+
+    return df
