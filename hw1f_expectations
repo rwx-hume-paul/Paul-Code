@@ -254,7 +254,9 @@ class CapFloor:
         self.schedule = schedule
 
     def _ois_daily_caplets(self) -> None:
-        records = []
+        period_records = []
+        daily_records = []
+
         for _, period in self.schedule.iterrows():
             period_start = period["StartDate"]
             period_end = period["EndDate"]
@@ -262,8 +264,6 @@ class CapFloor:
             period_tau = period["YearFrac"]
             df_pay = self.discount_curve.get_discount_factor_for_date(pay_date)
 
-            # All daily optionlets in this period share the same fixing date
-            # (EndDate − 1 business day), consistent with post-aggregation convention.
             fixing_date = prev_business_day(period_end, self.calendar)
             t_fix = (
                 (fixing_date - self.valuation_date).days / 365.0
@@ -275,12 +275,50 @@ class CapFloor:
                 tau_i = self.forward_curve.rate_day_count_convention(d_i, d_next)
                 f_day = self.forward_curve.get_simple_forward(d_i, d_next)
                 moneyness = (self.strike - f_day) * 100
-                opt_factor = self._black_option_factor(
-                    f_day, tau_i, t_fix, moneyness, vol_maturity=period_tau
-                )
-                period_pv += self.notional * opt_factor * df_pay
+                f_s = f_day + self.forward_shift
+                k_s = self.strike + self.forward_shift
 
-            records.append({
+                if t_fix <= 0:
+                    vol, d1, d2 = 0.0, np.nan, np.nan
+                    opt_factor = (
+                        max(f_day - self.strike, 0.0) * tau_i if self.cap
+                        else max(self.strike - f_day, 0.0) * tau_i
+                    )
+                else:
+                    vol = self.ir_vol.get_vol(moneyness, t_fix, period_tau)
+                    if vol <= 0 or f_s <= 0 or k_s <= 0:
+                        d1, d2, opt_factor = np.nan, np.nan, 0.0
+                    else:
+                        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t_fix) / (vol * np.sqrt(t_fix))
+                        d2 = d1 - vol * np.sqrt(t_fix)
+                        if self.cap:
+                            opt_factor = tau_i * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2))
+                        else:
+                            opt_factor = tau_i * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1))
+
+                pv_day = self.notional * opt_factor * df_pay
+                period_pv += pv_day
+
+                daily_records.append({
+                    "PeriodStart": period_start,
+                    "PeriodEnd": period_end,
+                    "PayDate": pay_date,
+                    "DayStart": d_i,
+                    "DayEnd": d_next,
+                    "YearFrac": tau_i,
+                    "ForwardRate": f_day,
+                    "Strike": self.strike,
+                    "Moneyness": moneyness,
+                    "t_exp": t_fix,
+                    "Vol": vol,
+                    "d1": d1,
+                    "d2": d2,
+                    "OptionFactor": opt_factor,
+                    "DiscountFactor": df_pay,
+                    "PV": pv_day,
+                })
+
+            period_records.append({
                 "StartDate": period_start,
                 "EndDate": period_end,
                 "PayDate": pay_date,
@@ -292,7 +330,8 @@ class CapFloor:
                 "PV": period_pv,
             })
 
-        self.schedule = pd.DataFrame(records)
+        self.schedule = pd.DataFrame(period_records)
+        self.daily_schedule = pd.DataFrame(daily_records)
 
     def _calculate_caplets(self) -> None:
         if not self.ois:
@@ -307,6 +346,14 @@ class CapFloor:
 
     def get_schedule(self) -> pd.DataFrame:
         return self.schedule.copy()
+
+    def get_daily_schedule(self) -> pd.DataFrame:
+        """Returns the per-day optionlet detail. Only available in OIS pre-aggregation mode."""
+        if not hasattr(self, "daily_schedule"):
+            raise ValueError(
+                "Daily schedule is only available when ois=True and post_aggregation=False."
+            )
+        return self.daily_schedule.copy()
 
     def summary(self) -> dict:
         return {
