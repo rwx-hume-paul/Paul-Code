@@ -242,6 +242,31 @@ class CapFloor:
             schedule["VolExpiry"] = schedule["t_exp"]
             schedule["t_exp"] = schedule["t_exp"] - (2.0 / 3.0) * (schedule["t_exp"] - t_start)
 
+            # Override for the in-motion first period: the general formula uses T_start
+            # measured from valuation_date (negative when in motion). Instead use:
+            #   t_exp = (fixing_date - effective_date) / 3  −  (valuation_date - effective_date)
+            # all in accrual year fractions, anchored on period start rather than valuation_date.
+            if (
+                self.current_compounded_rate is not None
+                and self.current_period_end_date is not None
+                and len(schedule) > 0
+            ):
+                first_start = schedule.iloc[0]["StartDate"]
+                val = self.valuation_date
+                if first_start <= val:
+                    fixing_date = prev_business_day(
+                        self.current_period_end_date, self.calendar
+                    )
+                    d_fix = self.forward_curve.rate_day_count_convention(
+                        first_start, fixing_date
+                    )
+                    d_elapsed = self.forward_curve.rate_day_count_convention(
+                        first_start, val
+                    )
+                    t_exp_in_motion = d_fix / 3.0 - d_elapsed
+                    loc = schedule.columns.get_loc("t_exp")
+                    schedule.iloc[0, loc] = t_exp_in_motion
+
         schedule["Moneyness"] = (self.strike - schedule["ForwardRate"]) * 100
         self._attach_option_columns(schedule)
         self.schedule = schedule
