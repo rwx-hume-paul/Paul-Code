@@ -494,6 +494,11 @@ class Swaption:
         self.ir_vol = ir_vol
         self.forward_shift = forward_shift
         self.fair_forward = self.underlying_swap.calculate_fair_rate()
+        # Floor at 1e-5+shift before the log rather than special-casing zero/negative
+        # strike as "call=forward, put=0" — rates can go negative, so Black's d1/d2
+        # need a positive shifted forward/strike, not a payoff assumption.
+        self.shifted_forward = max(self.fair_forward, 1e-5) + self.forward_shift
+        self.shifted_strike = max(self.strike, 1e-5) + self.forward_shift
         self.a_factor = self._calculate_A_factor()
         self.expiry_time = self._calculate_expiry_time()
         self.maturity_time = self._calculate_maturity_time()
@@ -508,10 +513,10 @@ class Swaption:
         else:
             a_factor = (self.underlying_swap.receive_schedule['YearFrac'] * self.underlying_swap.receive_schedule['DiscountFactor']).values.sum()
         return a_factor
-    
+
     def _calculate_expiry_time(self):
         return (self.expiry_date - self.underlying_swap.valuation_date).days/365
-    
+
     def _calculate_maturity_time(self):
         if self.underlying_swap.pay_fixed:
             last_pay_date = self.underlying_swap.pay_schedule["PayDate"].iloc[-1]
@@ -520,18 +525,18 @@ class Swaption:
         return (last_pay_date - self.underlying_swap.effective_date).days / 365
 
     def _calculate_d1(self):
-        d1 = (np.log((self.fair_forward + self.forward_shift) / (self.strike + self.forward_shift)) + self.expiry_time * (self.volatility)**2/2) / (self.volatility * np.sqrt(self.expiry_time))
+        d1 = (np.log(self.shifted_forward / self.shifted_strike) + self.expiry_time * (self.volatility)**2/2) / (self.volatility * np.sqrt(self.expiry_time))
         return d1
-    
+
     def _calculate_d2(self):
-        d2 = (np.log((self.fair_forward + self.forward_shift) / (self.strike + self.forward_shift)) - self.expiry_time * (self.volatility)**2/2) / (self.volatility * np.sqrt(self.expiry_time))
+        d2 = (np.log(self.shifted_forward / self.shifted_strike) - self.expiry_time * (self.volatility)**2/2) / (self.volatility * np.sqrt(self.expiry_time))
         return d2
-    
+
 
 
     def swaption_value(self):
-        """Returns the Black swaption value, or the discounted intrinsic value when vol == 0."""
-        if self.volatility <= 0:
+        """ Returns the Black swaption value, or the discounted intric value when vol == 0."""
+        if self.volatility <=0:
             intrinsic = (
                 max(self.fair_forward - self.strike, 0.0) if self.underlying_swap.pay_fixed
                 else max(self.strike - self.fair_forward, 0.0)
@@ -541,10 +546,10 @@ class Swaption:
         d1 = self._calculate_d1()
         d2 = self._calculate_d2()
         if self.underlying_swap.pay_fixed == True: # payer swaption
-            return self.underlying_swap.notional * self.a_factor * ((self.fair_forward + self.forward_shift) * norm.cdf(d1) - (self.strike + self.forward_shift) * norm.cdf(d2))
+            return self.underlying_swap.notional * self.a_factor * (self.shifted_forward * norm.cdf(d1) - self.shifted_strike * norm.cdf(d2))
         else: # receiver swaption
-            return self.underlying_swap.notional * self.a_factor * ((self.strike + self.forward_shift) * norm.cdf(-d2) - (self.fair_forward + self.forward_shift) * norm.cdf(-d1))
-        
+            return self.underlying_swap.notional * self.a_factor * (self.shifted_strike * norm.cdf(-d2) - self.shifted_forward * norm.cdf(-d1))
+
 
     def calculate_swaption_volatility(self) -> float:
         return self.ir_vol.get_vol(self.moneyness, self.expiry_time, self.maturity_time)
@@ -570,6 +575,12 @@ class CapFloor:
         less_1_day=True:  t_exp = (DayStart − valuation_date) / 365.
         less_1_day=False: t_exp = (DayEnd − valuation_date) / 365 (rate publication date).
         Days with t_exp ≤ 0 valued at intrinsic. Sum discounted at period PayDate.
+
+    Degenerate cases: any caplet/floorlet with t_exp ≤ 0, zero/negative vol, or a
+    non-positive shifted forward/strike is valued at its discounted intrinsic value —
+    max(F − K, 0) × τ for a cap, max(K − F, 0) × τ for a floor — discounted at the
+    period PayDate. This is applied per optionlet, so in daily mode only the affected
+    days fall back to intrinsic.
 
     Sign convention: positive notional = long; negative notional = short.
     cap=True prices a cap; cap=False prices a floor.
@@ -661,17 +672,26 @@ class CapFloor:
             compounding=self.ois,
         )
 
+    def _intrinsic_factor(self, f: float, tau: float) -> float:
+        """Undiscounted intrinsic factor for one caplet/floorlet: tau × max(F − K, 0) for a
+        cap, tau × max(K − F, 0) for a floor. The forward shift cancels out of F − K and is
+        deliberately not applied here."""
+        if self.cap:
+            return max(f - self.strike, 0.0) * tau
+        return max(self.strike - f, 0.0) * tau
+
     def _black_option_factor(self, f: float, tau: float, t: float, moneyness: float) -> float:
-        """Black factor for one caplet/floorlet. Returns tau × [payoff] or intrinsic when t≤0."""
-        f_s = f + self.forward_shift
-        k_s = self.strike + self.forward_shift
+        """Black factor for one caplet/floorlet. Returns tau × [payoff], or the intrinsic
+        factor when t≤0 or vol is 0. Forward and strike are floored at 1e-5+shift before
+        the log (rates can go negative, so we deliberately don't special-case zero/negative
+        strike as "call=forward, put=0") so Black's d1/d2 stay defined."""
+        f_s = max(f, 1e-5) + self.forward_shift
+        k_s = max(self.strike, 1e-5) + self.forward_shift
         if t <= 0:
-            if self.cap:
-                return max(f - self.strike, 0.0) * tau
-            return max(self.strike - f, 0.0) * tau
+            return self._intrinsic_factor(f, tau)
         vol = self.ir_vol.get_vol(moneyness, t, self.cap_vol_maturity)
-        if vol <= 0 or f_s <= 0 or k_s <= 0:
-            return 0.0
+        if vol <= 0:
+            return self._intrinsic_factor(f, tau)
         d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
         d2 = d1 - vol * np.sqrt(t)
         if self.cap:
@@ -682,26 +702,23 @@ class CapFloor:
         self, f: float, tau: float, t: float, moneyness: float,
         vol_expiry: float = None,
     ):
-        """Returns (option_factor, vol, d1, d2) tuple.
+        """Returns (option_factor, vol, d1, d2) tuple. Falls back to the intrinsic factor
+        when t≤0 or vol is 0. Forward and strike are floored at 1e-5+shift before the log
+        (rates can go negative, so we deliberately don't special-case zero/negative strike
+        as "call=forward, put=0") so Black's d1/d2 stay defined.
 
         vol_expiry: expiry passed to the vol surface (defaults to t). Supply the
         unmodified fixing-date time when vol_decay is active so vol interpolation
         is unaffected while d1/d2 use the decayed t.
         """
-        f_s = f + self.forward_shift
-        k_s = self.strike + self.forward_shift
-        intrinsic = (
-            max(f - self.strike, 0.0) * tau if self.cap
-            else max(self.strike - f, 0.0) * tau
-        )
+        f_s = max(f, 1e-5) + self.forward_shift
+        k_s = max(self.strike, 1e-5) + self.forward_shift
         if t <= 0:
-            return intrinsic, 0.0, np.nan, np.nan
+            return self._intrinsic_factor(f, tau), 0.0, np.nan, np.nan
         t_vol = vol_expiry if vol_expiry is not None else t
         vol = self.ir_vol.get_vol(moneyness, t_vol, self.cap_vol_maturity)
-        if vol <= 0 or f_s <= 0 or k_s <= 0:
-            # Zero (or degenerate) vol: fall back to discounted intrinsic value
-            # rather than pricing at zero (PV = notional * factor * DiscountFactor downstream).
-            return intrinsic, vol, np.nan, np.nan
+        if vol <= 0:
+            return self._intrinsic_factor(f, tau), vol, np.nan, np.nan
         d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
         d2 = d1 - vol * np.sqrt(t)
         if self.cap:
@@ -853,14 +870,12 @@ class CapFloor:
 
                 if t_i <= 0:
                     vol, d1, d2 = 0.0, np.nan, np.nan
-                    opt_factor = (
-                        max(f_day - self.strike, 0.0) * tau_i if self.cap
-                        else max(self.strike - f_day, 0.0) * tau_i
-                    )
+                    opt_factor = self._intrinsic_factor(f_day, tau_i)
                 else:
                     vol = self.ir_vol.get_vol(moneyness, t_i, self.cap_vol_maturity)
                     if vol <= 0 or f_s <= 0 or k_s <= 0:
-                        d1, d2, opt_factor = np.nan, np.nan, 0.0
+                        d1, d2 = np.nan, np.nan
+                        opt_factor = self._intrinsic_factor(f_day, tau_i)
                     else:
                         d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t_i) / (vol * np.sqrt(t_i))
                         d2 = d1 - vol * np.sqrt(t_i)
