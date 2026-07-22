@@ -576,11 +576,44 @@ class CapFloor:
         less_1_day=False: t_exp = (DayEnd − valuation_date) / 365 (rate publication date).
         Days with t_exp ≤ 0 valued at intrinsic. Sum discounted at period PayDate.
 
-    Degenerate cases: any caplet/floorlet with t_exp ≤ 0, zero/negative vol, or a
-    non-positive shifted forward/strike is valued at its discounted intrinsic value —
-    max(F − K, 0) × τ for a cap, max(K − F, 0) × τ for a floor — discounted at the
-    period PayDate. This is applied per optionlet, so in daily mode only the affected
-    days fall back to intrinsic.
+    Degenerate cases: any caplet/floorlet with t_exp ≤ 0 or zero/negative vol is valued
+    at its discounted intrinsic value — max(F − K, 0) × τ for a cap, max(K − F, 0) × τ
+    for a floor — discounted at the period PayDate. This is applied per optionlet, so in
+    daily mode only the affected days fall back to intrinsic. Forward and strike are
+    floored at 1e-5+shift before entering the Black formula so a zero/negative underlying
+    rate never blows up d1/d2.
+
+    Vega: each caplet/floorlet also gets a forward-difference vega — the interpolated vol
+    is bumped by 1bp and repriced; see CapFloor._vega_factor. Zero for caplets valued at
+    intrinsic (t_exp ≤ 0).
+
+    Digital (digital=True): each caplet/floorlet instead pays digital_payoff × τ if it
+    settles in the money — priced as a cash-or-nothing digital, tau × digital_payoff ×
+    N(d2) for a cap, tau × digital_payoff × N(-d2) for a floor. An already-fixed (t_exp≤0)
+    or zero-vol caplet/floorlet is valued at its intrinsic digital payoff instead (the full
+    digital_payoff × τ if in the money, else 0).
+
+    Skew adjustment (use_skew_adjustment=True, requires digital=True and an ir_vol with
+    strike_interp='hermite'): corrects the flat-vol digital price for the local slope of
+    the vol surface — the standard digital-via-vanilla-spread adjustment —
+        PV(digital caplet, skew-adjusted)  = PV(digital caplet)  − slope × vega
+        PV(digital floorlet, skew-adjusted) = PV(digital floorlet) + slope × vega
+    where slope = ir_vol.get_slope(...) (∂vol/∂moneyness) and vega is the corresponding
+    vanilla caplet/floorlet's forward-difference vega (CapFloor._vega_factor) at the same
+    strike/expiry/maturity — both computed per optionlet, exposed via the Slope and Vega
+    columns.
+
+    Call/put-spread skew (use_call_spread_skew=True, requires digital=True and a positive
+    spread; mutually exclusive with use_skew_adjustment — no analytic slope/Hermite surface
+    required): replaces the entire digital valuation (not just an add-on adjustment) with a
+    replication via a call spread (cap) or put spread (floor) of width 2×spread around the
+    strike, each leg independently vol-surface-queried at its own bumped strike:
+        PV = L · τ · D(t, t_{i+1}) · (digital_payoff / spread) · φ ·
+             (B(F, K−spread, σ(K−spread), τ_exp, φ) − B(F, K+spread, σ(K+spread), τ_exp, φ))
+    where φ=+1 for a cap (call spread), φ=−1 for a floor (put spread), and B(F, K, σ, T, φ)
+    is the undiscounted, unit-notional Black value of a European option struck at K with
+    payoff φ×(F−K)⁺ (CapFloor._black_value). See CapFloor._call_spread_digital_factor. d1/d2
+    aren't reported in this mode (there's no single pair — two strikes are priced).
 
     Sign convention: positive notional = long; negative notional = short.
     cap=True prices a cap; cap=False prices a floor.
@@ -616,6 +649,11 @@ class CapFloor:
         use_schedule_end_date: bool = True,
         cap_vol_maturity: float = 0.25,
         less_1_day: bool = True,
+        digital: bool = False,
+        use_skew_adjustment: bool = False,
+        digital_payoff: float = 1.0,
+        use_call_spread_skew: bool = False,
+        spread: float = None,
     ):
         self.effective_date = effective_date
         self.maturity_date = maturity_date
@@ -644,6 +682,28 @@ class CapFloor:
         self.use_schedule_end_date = use_schedule_end_date
         self.cap_vol_maturity = cap_vol_maturity
         self.less_1_day = less_1_day
+        self.digital = digital
+        self.use_skew_adjustment = use_skew_adjustment
+        self.digital_payoff = digital_payoff
+        self.use_call_spread_skew = use_call_spread_skew
+        self.spread = spread
+
+        if use_skew_adjustment and not digital:
+            raise ValueError("use_skew_adjustment requires digital=True")
+        if use_skew_adjustment and getattr(ir_vol, "strike_interp", None) != "hermite":
+            raise ValueError(
+                "use_skew_adjustment requires the vol surface to use strike_interp='hermite' "
+                "— get_slope() is undefined for a linearly-interpolated strike dimension."
+            )
+        if use_call_spread_skew and not digital:
+            raise ValueError("use_call_spread_skew requires digital=True")
+        if use_call_spread_skew and use_skew_adjustment:
+            raise ValueError(
+                "use_call_spread_skew and use_skew_adjustment are alternative ways to model "
+                "the skew — set only one."
+            )
+        if use_call_spread_skew and not (spread is not None and spread > 0):
+            raise ValueError("use_call_spread_skew requires spread to be a positive float")
 
         self._build_schedule()
         self._calculate_caplets()
@@ -680,67 +740,189 @@ class CapFloor:
             return max(f - self.strike, 0.0) * tau
         return max(self.strike - f, 0.0) * tau
 
-    def _black_option_factor(self, f: float, tau: float, t: float, moneyness: float) -> float:
-        """Black factor for one caplet/floorlet. Returns tau × [payoff], or the intrinsic
-        factor when t≤0 or vol is 0. Forward and strike are floored at 1e-5+shift before
-        the log (rates can go negative, so we deliberately don't special-case zero/negative
-        strike as "call=forward, put=0") so Black's d1/d2 stay defined."""
+    def _lookup_vol(self, t: float, t_vol: float, moneyness: float) -> float:
+        """Vol-surface lookup, 0.0 for an already-expired caplet/floorlet (t≤0) rather than
+        querying the surface with a non-positive expiry."""
+        if t <= 0:
+            return 0.0
+        return self.ir_vol.get_vol(moneyness, t_vol, self.cap_vol_maturity)
+
+    def _lookup_slope(self, t: float, t_vol: float, moneyness: float) -> float:
+        """Strike-dimension vol slope (∂vol/∂moneyness), 0.0 for an already-expired
+        caplet/floorlet (t≤0). Requires the vol surface to use strike_interp='hermite'."""
+        if t <= 0:
+            return 0.0
+        return self.ir_vol.get_slope(moneyness, t_vol, self.cap_vol_maturity)
+
+    def _intrinsic_digital_factor(self, f: float, tau: float) -> float:
+        """Undiscounted intrinsic factor for one digital caplet/floorlet: tau ×
+        digital_payoff if in the money (F > K for a cap, F < K for a floor), else 0."""
+        in_the_money = f > self.strike if self.cap else f < self.strike
+        return tau * self.digital_payoff if in_the_money else 0.0
+
+    def _digital_option_factor_given_vol(self, f: float, tau: float, t: float, vol: float):
+        """Cash-or-nothing digital factor (and d1, d2) for one caplet/floorlet at an
+        explicit vol: tau × digital_payoff × N(d2) for a cap, tau × digital_payoff × N(-d2)
+        for a floor. Falls back to the intrinsic digital factor (d1=d2=nan) when t≤0 or
+        vol≤0, using the same forward/strike floor as the vanilla Black factor."""
+        if t <= 0 or vol <= 0:
+            return self._intrinsic_digital_factor(f, tau), np.nan, np.nan
         f_s = max(f, 1e-5) + self.forward_shift
         k_s = max(self.strike, 1e-5) + self.forward_shift
-        if t <= 0:
-            return self._intrinsic_factor(f, tau)
-        vol = self.ir_vol.get_vol(moneyness, t, self.cap_vol_maturity)
-        if vol <= 0:
-            return self._intrinsic_factor(f, tau)
         d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
         d2 = d1 - vol * np.sqrt(t)
-        if self.cap:
-            return tau * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2))
-        return tau * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1))
+        factor = tau * self.digital_payoff * (norm.cdf(d2) if self.cap else norm.cdf(-d2))
+        return factor, d1, d2
 
-    def _black_option_factor_with_vol(
+    def _digital_option_factor_with_vol(
         self, f: float, tau: float, t: float, moneyness: float,
         vol_expiry: float = None,
     ):
-        """Returns (option_factor, vol, d1, d2) tuple. Falls back to the intrinsic factor
-        when t≤0 or vol is 0. Forward and strike are floored at 1e-5+shift before the log
-        (rates can go negative, so we deliberately don't special-case zero/negative strike
-        as "call=forward, put=0") so Black's d1/d2 stay defined.
+        """Returns (digital_factor, vol, d1, d2), mirroring _black_option_factor_with_vol
+        but pricing a cash-or-nothing digital caplet/floorlet instead of the vanilla payoff."""
+        t_vol = vol_expiry if vol_expiry is not None else t
+        vol = self._lookup_vol(t, t_vol, moneyness)
+        factor, d1, d2 = self._digital_option_factor_given_vol(f, tau, t, vol)
+        return factor, vol, d1, d2
 
-        vol_expiry: expiry passed to the vol surface (defaults to t). Supply the
-        unmodified fixing-date time when vol_decay is active so vol interpolation
-        is unaffected while d1/d2 use the decayed t.
-        """
+    def _black_value(self, f: float, k: float, t: float, vol: float, phi: float) -> float:
+        """Raw European option value (unit notional, no accrual, undiscounted) with payoff
+        phi × (F − K) floored at 0 — phi=+1 for a call, phi=-1 for a put. Falls back to
+        intrinsic (using the true, unfloored f/k, since negative rates are legitimate) when
+        t≤0 or vol≤0; otherwise floors forward/strike at 1e-5+shift before the log, same as
+        the rest of the class. Used by the call/put-spread digital replication, where each
+        leg is struck (and vol-surface queried) away from self.strike."""
+        if t <= 0 or vol <= 0:
+            return max(phi * (f - k), 0.0)
+        f_s = max(f, 1e-5) + self.forward_shift
+        k_s = max(k, 1e-5) + self.forward_shift
+        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
+        d2 = d1 - vol * np.sqrt(t)
+        return phi * (f_s * norm.cdf(phi * d1) - k_s * norm.cdf(phi * d2))
+
+    def _call_spread_digital_factor(self, f: float, tau: float, t: float, t_vol: float) -> float:
+        """Digital caplet/floorlet factor via the call/put-spread replication
+        (use_call_spread_skew) — the alternative to the analytic slope × vega skew
+        adjustment. Prices a long European at strike−spread minus a long European at
+        strike+spread (same call/put type as the cap/floor itself, phi=+1/-1), each off ITS
+        OWN vol-surface lookup at that bumped strike's moneyness — so the skew is captured
+        by repricing at two strikes rather than a single instantaneous slope — scaled by
+        digital_payoff/spread and tau (notional/discounting are applied by the caller)."""
+        phi = 1.0 if self.cap else -1.0
+        k_lo = self.strike - self.spread
+        k_hi = self.strike + self.spread
+        vol_lo = self._lookup_vol(t, t_vol, (k_lo - f) * 100)
+        vol_hi = self._lookup_vol(t, t_vol, (k_hi - f) * 100)
+        b_lo = self._black_value(f, k_lo, t, vol_lo, phi)
+        b_hi = self._black_value(f, k_hi, t, vol_hi, phi)
+        return tau * (self.digital_payoff / self.spread) * phi * (b_lo - b_hi)
+
+    def _call_spread_digital_factor_with_vol(
+        self, f: float, tau: float, t: float, moneyness: float,
+        vol_expiry: float = None,
+    ):
+        """Returns (digital_factor, vol, d1, d2), mirroring _digital_option_factor_with_vol
+        but pricing via the call/put-spread replication (_call_spread_digital_factor)
+        instead of a single flat-vol N(d2). vol is a diagnostic lookup at the actual strike
+        only — the replication itself looks up vol independently at each bumped strike, so
+        there's no single d1/d2 pair to report (returned as nan)."""
+        t_vol = vol_expiry if vol_expiry is not None else t
+        vol = self._lookup_vol(t, t_vol, moneyness)
+        factor = self._call_spread_digital_factor(f, tau, t, t_vol)
+        return factor, vol, np.nan, np.nan
+
+    def _black_option_factor_given_vol(self, f: float, tau: float, t: float, vol: float):
+        """Black factor (and d1, d2) for one caplet/floorlet at an explicit vol. Returns the
+        intrinsic factor (d1=d2=nan) when t≤0 or vol≤0. Forward and strike are floored at
+        1e-5+shift before the log (rates can go negative, so we deliberately don't
+        special-case zero/negative strike as "call=forward, put=0") so Black's d1/d2 stay
+        defined. Shared by the vol-surface lookup path and the vega bump-and-reval calc, so
+        both price off the exact same formula."""
+        if t <= 0 or vol <= 0:
+            return self._intrinsic_factor(f, tau), np.nan, np.nan
         f_s = max(f, 1e-5) + self.forward_shift
         k_s = max(self.strike, 1e-5) + self.forward_shift
-        if t <= 0:
-            return self._intrinsic_factor(f, tau), 0.0, np.nan, np.nan
-        t_vol = vol_expiry if vol_expiry is not None else t
-        vol = self.ir_vol.get_vol(moneyness, t_vol, self.cap_vol_maturity)
-        if vol <= 0:
-            return self._intrinsic_factor(f, tau), vol, np.nan, np.nan
         d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
         d2 = d1 - vol * np.sqrt(t)
         if self.cap:
             factor = tau * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2))
         else:
             factor = tau * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1))
+        return factor, d1, d2
+
+    def _vega_factor(self, f: float, tau: float, t: float, vol: float, bump: float = 0.0001) -> float:
+        """Forward-difference vega factor for one caplet/floorlet: bumps the (already
+        interpolated) vol by `bump` (1bp by default) and returns
+        ((V(vol+bump) - V(vol)) / bump) * 0.01 — the undiscounted, per-unit-notional PV
+        sensitivity to a 1% (100bp) parallel vol move. Zero for expired caplets (t≤0),
+        since their value is fixed intrinsic regardless of vol."""
+        factor, _, _ = self._black_option_factor_given_vol(f, tau, t, vol)
+        factor_bumped, _, _ = self._black_option_factor_given_vol(f, tau, t, vol + bump)
+        return ((factor_bumped - factor) / bump) * 0.01
+
+    def _black_option_factor(self, f: float, tau: float, t: float, moneyness: float) -> float:
+        """Black factor for one caplet/floorlet. Returns tau × [payoff], or the intrinsic
+        factor when t≤0 or vol is 0."""
+        vol = self._lookup_vol(t, t, moneyness)
+        factor, _, _ = self._black_option_factor_given_vol(f, tau, t, vol)
+        return factor
+
+    def _black_option_factor_with_vol(
+        self, f: float, tau: float, t: float, moneyness: float,
+        vol_expiry: float = None,
+    ):
+        """Returns (option_factor, vol, d1, d2) tuple. Falls back to the intrinsic factor
+        when t≤0 or vol is 0.
+
+        vol_expiry: expiry passed to the vol surface (defaults to t). Supply the
+        unmodified fixing-date time when vol_decay is active so vol interpolation
+        is unaffected while d1/d2 use the decayed t.
+        """
+        t_vol = vol_expiry if vol_expiry is not None else t
+        vol = self._lookup_vol(t, t_vol, moneyness)
+        factor, d1, d2 = self._black_option_factor_given_vol(f, tau, t, vol)
         return factor, vol, d1, d2
 
     def _attach_option_columns(self, schedule: pd.DataFrame) -> None:
-        """Adds Vol, d1, d2, OptionFactor, DiscountFactor, PV to schedule in-place."""
-        vols, d1s, d2s, opt_factors = [], [], [], []
+        """Adds Vol, d1, d2, OptionFactor, Vega, DiscountFactor, PV to schedule in-place.
+
+        If self.digital, OptionFactor/PV price a cash-or-nothing digital caplet/floorlet
+        instead of the vanilla payoff, using one of two mutually-exclusive skew treatments:
+
+        - self.use_skew_adjustment: flat-vol N(d2)/N(-d2) digital, corrected by the
+          analytic slope × vega adjustment — PV -= slope * Vega for a cap, PV += slope *
+          Vega for a floor. Adds a Slope column. Requires ir_vol.strike_interp='hermite'.
+        - self.use_call_spread_skew: the entire digital valuation is instead the
+          call/put-spread replication (_call_spread_digital_factor) — no separate
+          adjustment step, no Slope column, and no single d1/d2 (reported as nan).
+
+        Vega is always the vanilla caplet/floorlet's forward-difference vega, computed for
+        every row regardless of digital/skew mode.
+        """
+        vols, d1s, d2s, opt_factors, vega_factors = [], [], [], [], []
+        slopes = [] if (self.digital and self.use_skew_adjustment) else None
+        if self.digital and self.use_call_spread_skew:
+            pricer = self._call_spread_digital_factor_with_vol
+        elif self.digital:
+            pricer = self._digital_option_factor_with_vol
+        else:
+            pricer = self._black_option_factor_with_vol
         has_vol_expiry = "VolExpiry" in schedule.columns
         for _, row in schedule.iterrows():
             vol_exp = row["VolExpiry"] if has_vol_expiry else None
-            factor, vol, d1, d2 = self._black_option_factor_with_vol(
+            factor, vol, d1, d2 = pricer(
                 row["ForwardRate"], row["YearFrac"], row["t_exp"], row["Moneyness"],
                 vol_expiry=vol_exp,
             )
+            vega_factor = self._vega_factor(row["ForwardRate"], row["YearFrac"], row["t_exp"], vol)
             vols.append(vol)
             d1s.append(d1)
             d2s.append(d2)
             opt_factors.append(factor)
+            vega_factors.append(vega_factor)
+            if slopes is not None:
+                t_vol = vol_exp if vol_exp is not None else row["t_exp"]
+                slopes.append(self._lookup_slope(row["t_exp"], t_vol, row["Moneyness"]))
         schedule["Vol"] = vols
         schedule["d1"] = d1s
         schedule["d2"] = d2s
@@ -749,6 +931,12 @@ class CapFloor:
             self.discount_curve.get_discount_factor_for_date
         )
         schedule["PV"] = self.notional * schedule["OptionFactor"] * schedule["DiscountFactor"]
+        schedule["Vega"] = self.notional * pd.Series(vega_factors, index=schedule.index) * schedule["DiscountFactor"]
+
+        if slopes is not None:
+            schedule["Slope"] = slopes
+            skew_adjustment = pd.Series(slopes, index=schedule.index) * schedule["Vega"]
+            schedule["PV"] = schedule["PV"] - skew_adjustment if self.cap else schedule["PV"] + skew_adjustment
 
     def _ibor_caplets(self) -> None:
         schedule = self.schedule.copy()
@@ -856,36 +1044,38 @@ class CapFloor:
             df_pay = self.discount_curve.get_discount_factor_for_date(pay_date)
 
             period_pv = 0.0
+            period_vega = 0.0
             for d_i, d_next in iter_overnight_periods(period_start, period_end, self.calendar):
                 tau_i = self.forward_curve.rate_day_count_convention(d_i, d_next)
                 f_day = self.forward_curve.get_simple_forward(d_i, d_next)
                 moneyness = (self.strike - f_day) * 100
-                f_s = f_day + self.forward_shift
-                k_s = self.strike + self.forward_shift
                 t_i_date = d_i if self.less_1_day else d_next
                 t_i = (
                     (t_i_date - self.valuation_date).days / 365.0
                     if self.valuation_date else 0.0
                 )
 
-                if t_i <= 0:
-                    vol, d1, d2 = 0.0, np.nan, np.nan
-                    opt_factor = self._intrinsic_factor(f_day, tau_i)
+                vol = self._lookup_vol(t_i, t_i, moneyness)
+                if self.digital and self.use_call_spread_skew:
+                    opt_factor = self._call_spread_digital_factor(f_day, tau_i, t_i, t_i)
+                    d1, d2 = np.nan, np.nan
+                elif self.digital:
+                    opt_factor, d1, d2 = self._digital_option_factor_given_vol(f_day, tau_i, t_i, vol)
                 else:
-                    vol = self.ir_vol.get_vol(moneyness, t_i, self.cap_vol_maturity)
-                    if vol <= 0 or f_s <= 0 or k_s <= 0:
-                        d1, d2 = np.nan, np.nan
-                        opt_factor = self._intrinsic_factor(f_day, tau_i)
-                    else:
-                        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t_i) / (vol * np.sqrt(t_i))
-                        d2 = d1 - vol * np.sqrt(t_i)
-                        if self.cap:
-                            opt_factor = tau_i * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2))
-                        else:
-                            opt_factor = tau_i * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1))
+                    opt_factor, d1, d2 = self._black_option_factor_given_vol(f_day, tau_i, t_i, vol)
+                vega_factor = self._vega_factor(f_day, tau_i, t_i, vol)
 
                 pv_day = self.notional * opt_factor * df_pay
+                vega_day = self.notional * vega_factor * df_pay
+
+                slope = np.nan
+                if self.digital and self.use_skew_adjustment:
+                    slope = self._lookup_slope(t_i, t_i, moneyness)
+                    skew_adj_day = slope * vega_day
+                    pv_day = pv_day - skew_adj_day if self.cap else pv_day + skew_adj_day
+
                 period_pv += pv_day
+                period_vega += vega_day
 
                 daily_records.append({
                     "PeriodStart": period_start,
@@ -904,6 +1094,8 @@ class CapFloor:
                     "OptionFactor": opt_factor,
                     "DiscountFactor": df_pay,
                     "PV": pv_day,
+                    "Vega": vega_day,
+                    "Slope": slope,
                 })
 
             period_records.append({
@@ -916,6 +1108,7 @@ class CapFloor:
                 "Strike": self.strike,
                 "DiscountFactor": df_pay,
                 "PV": period_pv,
+                "Vega": period_vega,
             })
 
         self.schedule = pd.DataFrame(period_records)
@@ -931,6 +1124,10 @@ class CapFloor:
 
     def net_pv(self) -> float:
         return float(self.schedule["PV"].sum())
+
+    def net_vega(self) -> float:
+        """Sum of per-caplet/floorlet vega (PV sensitivity to a 1% parallel vol move)."""
+        return float(self.schedule["Vega"].sum())
 
     def get_schedule(self) -> pd.DataFrame:
         return self.schedule.copy()
@@ -949,6 +1146,9 @@ class CapFloor:
             "notional": self.notional,
             "strike": self.strike,
             "cap": self.cap,
+            "digital": self.digital,
+            "use_skew_adjustment": self.use_skew_adjustment,
+            "use_call_spread_skew": self.use_call_spread_skew,
             "effective_date": self.effective_date,
             "maturity_date": self.maturity_date,
         }
