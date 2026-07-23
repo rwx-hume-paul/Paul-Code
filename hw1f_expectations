@@ -593,22 +593,25 @@ class CapFloor:
     or zero-vol caplet/floorlet is valued at its intrinsic digital payoff instead (the full
     digital_payoff × τ if in the money, else 0).
 
-    Skew adjustment (use_skew_adjustment=True, requires digital=True and an ir_vol with
-    strike_interp='hermite'): corrects the flat-vol digital price for the local slope of
-    the vol surface — the standard digital-via-vanilla-spread adjustment —
-        PV(digital caplet, skew-adjusted)  = PV(digital caplet)  − slope × vega
-        PV(digital floorlet, skew-adjusted) = PV(digital floorlet) + slope × vega
-    where slope = ir_vol.get_slope(...) (∂vol/∂moneyness) and vega is the corresponding
-    vanilla caplet/floorlet's forward-difference vega (CapFloor._vega_factor) at the same
+    Skew adjustment (use_skew_adjustment=True, requires digital=True): corrects the flat-vol
+    digital price for the local slope of the vol surface — the standard digital-via-vanilla-
+    spread adjustment —
+        PV(digital caplet, skew-adjusted)  = PV(digital caplet)  − slope × vega × digital_payoff × 100
+        PV(digital floorlet, skew-adjusted) = PV(digital floorlet) + slope × vega × digital_payoff × 100
+    where slope = ir_vol.get_slope(...) (∂vol/∂moneyness, × 100 in the bulk/non-daily path
+    to match Vega's per-1%-vol-move convention) and vega is the corresponding vanilla
+    caplet/floorlet's forward-difference vega (CapFloor._vega_factor) at the same
     strike/expiry/maturity — both computed per optionlet, exposed via the Slope and Vega
-    columns.
+    columns. Works with either ir_vol.strike_interp mode — 'hermite' gives a smooth analytic
+    slope, 'linear' gives the local piecewise-linear segment slope (a step function,
+    constant between strike nodes).
 
     Call/put-spread skew (use_call_spread_skew=True, requires digital=True and a positive
     spread; mutually exclusive with use_skew_adjustment — no analytic slope/Hermite surface
     required): replaces the entire digital valuation (not just an add-on adjustment) with a
     replication via a call spread (cap) or put spread (floor) of width 2×spread around the
     strike, each leg independently vol-surface-queried at its own bumped strike:
-        PV = L · τ · D(t, t_{i+1}) · (digital_payoff / spread) · φ ·
+        PV = L · τ · D(t, t_{i+1}) · (digital_payoff / (2 × spread)) · φ ·
              (B(F, K−spread, σ(K−spread), τ_exp, φ) − B(F, K+spread, σ(K+spread), τ_exp, φ))
     where φ=+1 for a cap (call spread), φ=−1 for a floor (put spread), and B(F, K, σ, T, φ)
     is the undiscounted, unit-notional Black value of a European option struck at K with
@@ -690,11 +693,6 @@ class CapFloor:
 
         if use_skew_adjustment and not digital:
             raise ValueError("use_skew_adjustment requires digital=True")
-        if use_skew_adjustment and getattr(ir_vol, "strike_interp", None) != "hermite":
-            raise ValueError(
-                "use_skew_adjustment requires the vol surface to use strike_interp='hermite' "
-                "— get_slope() is undefined for a linearly-interpolated strike dimension."
-            )
         if use_call_spread_skew and not digital:
             raise ValueError("use_call_spread_skew requires digital=True")
         if use_call_spread_skew and use_skew_adjustment:
@@ -749,7 +747,7 @@ class CapFloor:
 
     def _lookup_slope(self, t: float, t_vol: float, moneyness: float) -> float:
         """Strike-dimension vol slope (∂vol/∂moneyness), 0.0 for an already-expired
-        caplet/floorlet (t≤0). Requires the vol surface to use strike_interp='hermite'."""
+        caplet/floorlet (t≤0). Works with either ir_vol.strike_interp mode."""
         if t <= 0:
             return 0.0
         return self.ir_vol.get_slope(moneyness, t_vol, self.cap_vol_maturity)
@@ -807,7 +805,12 @@ class CapFloor:
         strike+spread (same call/put type as the cap/floor itself, phi=+1/-1), each off ITS
         OWN vol-surface lookup at that bumped strike's moneyness — so the skew is captured
         by repricing at two strikes rather than a single instantaneous slope — scaled by
-        digital_payoff/spread and tau (notional/discounting are applied by the caller)."""
+        digital_payoff / (2 × spread) and tau (notional/discounting are applied by the
+        caller). The 2×spread (not spread) is the full distance between the two strikes:
+        dividing by only spread would double-count, since (B(K−spread) − B(K+spread)) is a
+        central difference over a 2×spread-wide interval — with it, the flat-vol/no-skew
+        limit as spread→0 converges to the plain N(d2)/N(-d2) digital, as it should, with
+        only the skew correction (from the two independent vol-surface lookups) remaining."""
         phi = 1.0 if self.cap else -1.0
         k_lo = self.strike - self.spread
         k_hi = self.strike + self.spread
@@ -815,7 +818,7 @@ class CapFloor:
         vol_hi = self._lookup_vol(t, t_vol, (k_hi - f) * 100)
         b_lo = self._black_value(f, k_lo, t, vol_lo, phi)
         b_hi = self._black_value(f, k_hi, t, vol_hi, phi)
-        return tau * (self.digital_payoff / self.spread) * phi * (b_lo - b_hi)
+        return tau * (self.digital_payoff / (2 * self.spread)) * phi * (b_lo - b_hi)
 
     def _call_spread_digital_factor_with_vol(
         self, f: float, tau: float, t: float, moneyness: float,
@@ -891,16 +894,18 @@ class CapFloor:
 
         - self.use_skew_adjustment: flat-vol N(d2)/N(-d2) digital, corrected by the
           analytic slope × vega adjustment — PV -= slope * Vega for a cap, PV += slope *
-          Vega for a floor. Adds a Slope column. Requires ir_vol.strike_interp='hermite'.
+          Vega for a floor. Adds a Slope column. Works with either ir_vol.strike_interp
+          mode ('hermite' gives a smooth slope, 'linear' a piecewise-constant one).
         - self.use_call_spread_skew: the entire digital valuation is instead the
           call/put-spread replication (_call_spread_digital_factor) — no separate
           adjustment step, no Slope column, and no single d1/d2 (reported as nan).
 
         Vega is always the vanilla caplet/floorlet's forward-difference vega, computed for
-        every row regardless of digital/skew mode.
+        every row regardless of digital/skew mode. Slope is always added too — nan unless
+        self.use_skew_adjustment is active, matching the OIS-daily path's convention.
         """
-        vols, d1s, d2s, opt_factors, vega_factors = [], [], [], [], []
-        slopes = [] if (self.digital and self.use_skew_adjustment) else None
+        vols, d1s, d2s, opt_factors, vega_factors, slopes = [], [], [], [], [], []
+        compute_slope = self.digital and self.use_skew_adjustment
         if self.digital and self.use_call_spread_skew:
             pricer = self._call_spread_digital_factor_with_vol
         elif self.digital:
@@ -920,9 +925,11 @@ class CapFloor:
             d2s.append(d2)
             opt_factors.append(factor)
             vega_factors.append(vega_factor)
-            if slopes is not None:
+            if compute_slope:
                 t_vol = vol_exp if vol_exp is not None else row["t_exp"]
-                slopes.append(self._lookup_slope(row["t_exp"], t_vol, row["Moneyness"]))
+                slopes.append(self._lookup_slope(row["t_exp"], t_vol, row["Moneyness"]) * 100)
+            else:
+                slopes.append(np.nan)
         schedule["Vol"] = vols
         schedule["d1"] = d1s
         schedule["d2"] = d2s
@@ -932,10 +939,13 @@ class CapFloor:
         )
         schedule["PV"] = self.notional * schedule["OptionFactor"] * schedule["DiscountFactor"]
         schedule["Vega"] = self.notional * pd.Series(vega_factors, index=schedule.index) * schedule["DiscountFactor"]
+        schedule["Slope"] = slopes
 
-        if slopes is not None:
-            schedule["Slope"] = slopes
-            skew_adjustment = pd.Series(slopes, index=schedule.index) * schedule["Vega"]
+        if compute_slope:
+            skew_adjustment = (
+                pd.Series(slopes, index=schedule.index) * schedule["Vega"]
+                * self.digital_payoff * 100
+            )
             schedule["PV"] = schedule["PV"] - skew_adjustment if self.cap else schedule["PV"] + skew_adjustment
 
     def _ibor_caplets(self) -> None:
@@ -1071,7 +1081,7 @@ class CapFloor:
                 slope = np.nan
                 if self.digital and self.use_skew_adjustment:
                     slope = self._lookup_slope(t_i, t_i, moneyness)
-                    skew_adj_day = slope * vega_day
+                    skew_adj_day = slope * vega_day * self.digital_payoff * 100
                     pv_day = pv_day - skew_adj_day if self.cap else pv_day + skew_adj_day
 
                 period_pv += pv_day
