@@ -1,1164 +1,187 @@
-import pandas as pd
 import numpy as np
-from datetime import date, timedelta
-from scipy.stats import norm
-from curve.discount_curve import DiscountYieldCurveHandler
-from market_data.vol_surface import IRVol
-from utils.swap_schedule import (
-    generate_swap_leg_schedule,
-    add_forward_rates_to_schedule,
-    add_floating_cashflows,
-    compute_daily_ois_factor,
-    iter_overnight_periods,
-    prev_business_day,
-)
+from scipy.interpolate import PchipInterpolator
 
 
-class IRSwap:
-    """
-    Interest rate swap pricer.
+class IRVol:
+    """Interest rate volatility surface for swaptions and caps/floors.
 
-    Handles schedule creation, forward rates, cashflows, and present value calculation
-    for both receive and pay legs.
+    Input DataFrame must have columns: Moneyness, Expiry, Maturity, Vol.
+    Expiry and Maturity are year fractions. Moneyness convention is caller-defined
+    (absolute strike, log-moneyness, offset from ATM, etc.).
+
+    Interpolation order: Maturity → Expiry → Moneyness.
+    Maturity and Expiry are always linear on volatility, with flat extrapolation outside
+    the surface range. Moneyness (strike) is linear by default; pass strike_interp='hermite'
+    to interpolate the strike dimension with a monotone cubic Hermite (PCHIP) spline on
+    volatility instead, still with flat extrapolation beyond the node range.
     """
 
+    def __init__(self, vol_data: list, strike_interp: str = "linear") -> None:
+        if strike_interp not in ("linear", "hermite"):
+            raise ValueError(f"strike_interp must be 'linear' or 'hermite', got {strike_interp!r}")
+        self.strike_interp = strike_interp
 
-    def __init__(
-        self,
-        effective_date: date,
-        maturity_date: date,
-        notional: float,
-        receive_curve: DiscountYieldCurveHandler = None,
-        pay_curve: DiscountYieldCurveHandler = None,
-        discount_curve: DiscountYieldCurveHandler = None,
-        valuation_date: date = None,
-        receive_payment_frequency: int = 6,
-        pay_payment_frequency: int = 6,
-        payment_offset: int=0,
-        receive_fixed_rate: float = None,
-        pay_fixed_rate: float = None,
-        receive_spread: float = 0.0,
-        pay_spread: float = 0.0,
-        use_schedule_end_date_receive: bool = True,
-        use_schedule_end_date_pay: bool = True,
-        calendar: str = "TARGET",
-        business_convention: str = "ModifiedFollowing",
-        termination_business_convention: str = "ModifiedFollowing",
-        date_generation: str = "Backward",
-        day_count: str = "ACT/365",
-        end_of_month: bool = False,
-        pay_fixed: bool = True,
-        compounding: bool = False,
-        current_compounded_rate: float = None,
-        current_period_end_date: date = None,
-    ):
-        """
-        Parameters:
-            effective_date: Swap start date. For in-motion trades, the start of the current period.
-            maturity_date: Swap end date.
-            notional: Notional amount.
-            receive_curve: Curve for receive leg forwards (not required if receive_fixed_rate provided).
-            pay_curve: Curve for pay leg forwards (not required if pay_fixed_rate provided).
-            discount_curve: Curve for discounting.
-            valuation_date: Optional valuation date for filtering.
-            receive_payment_frequency: Receive payment frequency in months (default 6).
-            pay_payment_frequency: Pay payment frequency in months (default 6).
-            receive_fixed_rate: Optional fixed rate for receive leg.
-            pay_fixed_rate: Optional fixed rate for pay leg.
-            receive_spread: Spread for receive leg (default 0.0).
-            pay_spread: Spread for pay leg (default 0.0).
-            use_schedule_end_date: Use schedule end dates for forwards (default True).
-            calendar: Calendar (default 'TARGET').
-            business_convention: Business convention (default 'ModifiedFollowing').
-            termination_business_convention: Termination convention (default 'ModifiedFollowing').
-            date_generation: Schedule rule (default 'Backward').
-            day_count: Day count convention (default 'ACT/365').
-            end_of_month: End of month convention (default False).
-            compounding: Use OIS daily compounding for the floating leg (default False).
-            current_compounded_rate: For in-motion OIS trades, the annualized compounded rate
-                realized from effective_date to valuation_date (in the curve's rate day count
-                convention, e.g. ACT/360 for SOFR). Requires compounding=True.
-            current_period_end_date: End date of the in-motion payment period. Required when
-                current_compounded_rate is provided. The elapsed accrual fraction is derived
-                internally from effective_date and valuation_date.
-        """
+        arr = np.asarray(vol_data, dtype=np.float64)  # (N, 4): moneyness, expiry, maturity, vol
+        self._maturities = np.unique(arr[:, 2])
 
+        # {maturity: {expiry: (moneyness_nodes, vol_nodes, hermite_spline_or_None)}}
+        self._surface: dict = {}
 
-
-
-
-
-
-        self.effective_date = effective_date
-        self.maturity_date = maturity_date
-        self.notional = notional
-        self.receive_curve = receive_curve
-        self.pay_curve = pay_curve
-        self.discount_curve = discount_curve
-        self.valuation_date = valuation_date
-        self.receive_payment_frequency = receive_payment_frequency
-        self.pay_payment_frequency = pay_payment_frequency
-        self.payment_offset = payment_offset
-        self.receive_fixed_rate = receive_fixed_rate
-        self.pay_fixed_rate = pay_fixed_rate
-        self.receive_spread = receive_spread
-        self.pay_spread = pay_spread
-        self.use_schedule_end_date_receive = use_schedule_end_date_receive
-        self.use_schedule_end_date_pay = use_schedule_end_date_pay
-        self.calendar = calendar
-        self.business_convention = business_convention
-        self.termination_business_convention = termination_business_convention
-        self.date_generation = date_generation
-        self.day_count = day_count
-        self.end_of_month = end_of_month
-        self.pay_fixed = pay_fixed
-        self.compounding = compounding
-        self.current_compounded_rate = current_compounded_rate
-        self.current_period_end_date = current_period_end_date
-
-        # Validation: ensure either curve or fixed rate is provided for each leg
-        if receive_fixed_rate is None and receive_curve is None:
-            raise ValueError("Either receive_curve or receive_fixed_rate must be provided")
-        if pay_fixed_rate is None and pay_curve is None:
-            raise ValueError("Either pay_curve or pay_fixed_rate must be provided")
-        if current_compounded_rate is not None and not compounding:
-            raise ValueError("compounding must be True to use current_compounded_rate")
-        if current_compounded_rate is not None and current_period_end_date is None:
-            raise ValueError("current_period_end_date must be provided with current_compounded_rate")
-
-        # Generate schedules and cashflows on initialization
-        self._generate_schedules()
-        self._calculate_cashflows()
-        self._calculate_present_values()
-
-
-    def _generate_schedules(self):
-        """Generates schedules for receive and pay legs."""
-        schedule_params = {
-            "effective_date": self.effective_date,
-            "maturity_date": self.maturity_date,
-            "valuation_date": self.valuation_date,
-            "calendar": self.calendar,
-            "business_convention": self.business_convention,
-            "termination_business_convention": self.termination_business_convention,
-            "date_generation": self.date_generation,
-            "day_count": self.day_count,
-            "end_of_month": self.end_of_month,
-            "payment_offset": self.payment_offset
-        }
-
-        self.receive_schedule = generate_swap_leg_schedule(
-            **schedule_params,
-            payment_frequency=self.receive_payment_frequency
-        )
-
-        self.pay_schedule = generate_swap_leg_schedule(
-            **schedule_params,
-            payment_frequency=self.pay_payment_frequency
-        )
-
-    def _apply_inmotion_compounding(self, schedule: pd.DataFrame, curve) -> pd.DataFrame:
-        """
-        Overrides the first period's ForwardRate for an OIS leg that is currently in motion.
-
-        Combines the already-realized compounding (effective_date → valuation_date), supplied
-        via current_compounded_rate, with the projected forward compounding
-        (valuation_date → current_period_end_date) derived from the curve.
-
-        Total factor = (1 + elapsed_factor) × (DF(val) / DF(period_end)) - 1
-        where elapsed_factor = current_compounded_rate × elapsed_tau.
-
-        The resulting ForwardRate is annualized over the full period's YearFrac so that
-        add_floating_cashflows (N × YearFrac × ForwardRate) still gives the correct cashflow.
-        """
-        schedule = schedule.copy()
-
-        # Year fraction of the already-elapsed portion (effective_date → valuation_date),
-        # derived from the curve's rate day count convention (e.g. ACT/360 for SOFR)
-        elapsed_tau = curve.rate_day_count_convention(self.effective_date, self.valuation_date)
-        elapsed_factor = self.current_compounded_rate * elapsed_tau
-
-        # Forward compounding factor for the remaining portion via daily business-day stepping.
-        remaining_factor = compute_daily_ois_factor(
-            curve, self.valuation_date, self.current_period_end_date, self.calendar
-        )
-
-        # Compound the two portions together
-        total_factor = (1 + elapsed_factor) * (1 + remaining_factor) - 1
-
-        # Express as an annualized rate over the full period so the existing cashflow
-        # formula (N × YearFrac × ForwardRate) correctly yields N × total_factor
-        full_tau = schedule.iloc[0]["YearFrac"]
-        schedule.iloc[0, schedule.columns.get_loc("ForwardRate")] = total_factor / full_tau
-
-        return schedule
-
-    def _calculate_cashflows(self):
-        """Calculates forward rates and cashflows for both legs."""
-        # Receive leg
-        if self.receive_fixed_rate is not None:
-            # Use fixed rate instead of curve
-            self.receive_schedule["ForwardRate"] = self.receive_fixed_rate
-        elif self.pay_fixed == False: # keep flat rate as act 365, hence no day_count passed in
-            self.receive_schedule = add_forward_rates_to_schedule(
-                self.receive_schedule,
-                self.receive_curve,
-                frequency=self.receive_payment_frequency,
-                calendar=self.calendar,
-                business_convention="Following",
-                use_schedule_end_date=self.use_schedule_end_date_receive
-            )
-        else:
-            # Use curve to calculate forward rates (with OIS compounding if enabled)
-            self.receive_schedule = add_forward_rates_to_schedule(
-                self.receive_schedule,
-                self.receive_curve,
-                frequency=self.receive_payment_frequency,
-                calendar=self.calendar,
-                business_convention="Following",
-                use_schedule_end_date=self.use_schedule_end_date_receive,
-                day_count=self.day_count,
-                compounding=self.compounding
-            )
-            if self.compounding and self.current_compounded_rate is not None:
-                self.receive_schedule = self._apply_inmotion_compounding(
-                    self.receive_schedule, self.receive_curve
+        for mat in self._maturities:
+            mat_rows = arr[np.isclose(arr[:, 2], mat)]
+            expiries = np.unique(mat_rows[:, 1])
+            self._surface[float(mat)] = {}
+            for exp in expiries:
+                exp_rows = mat_rows[np.isclose(mat_rows[:, 1], exp)]
+                order = np.argsort(exp_rows[:, 0])
+                m_nodes = exp_rows[order, 0]
+                v_nodes = exp_rows[order, 3]
+                hermite = (
+                    PchipInterpolator(m_nodes, v_nodes)
+                    if self.strike_interp == "hermite" and len(m_nodes) > 1
+                    else None
                 )
-
-        # Add spread to receive leg forward rates
-        self.receive_schedule["ForwardRate"] = self.receive_schedule["ForwardRate"] + self.receive_spread
-
-        self.receive_schedule = add_floating_cashflows(
-            self.receive_schedule,
-            self.notional
-        )
-
-        # Pay leg
-        if self.pay_fixed_rate is not None:
-            # Use fixed rate instead of curve
-            self.pay_schedule["ForwardRate"] = self.pay_fixed_rate
-        elif self.pay_fixed == True: # keep flat rate as act 365
-            # Use curve to calculate forward rates
-            self.pay_schedule = add_forward_rates_to_schedule(
-                self.pay_schedule,
-                self.pay_curve,
-                frequency=self.pay_payment_frequency,
-                calendar=self.calendar,
-                business_convention="Following",
-                use_schedule_end_date=self.use_schedule_end_date_pay
-            )
-        else:
-            # use curve to calculate forward rates (with OIS compounding if enabled)
-            self.pay_schedule = add_forward_rates_to_schedule(
-                self.pay_schedule,
-                self.pay_curve,
-                frequency=self.pay_payment_frequency,
-                calendar=self.calendar,
-                business_convention="Following",
-                use_schedule_end_date=self.use_schedule_end_date_pay,
-                day_count=self.day_count,
-                compounding=self.compounding
-            )
-            if self.compounding and self.current_compounded_rate is not None:
-                self.pay_schedule = self._apply_inmotion_compounding(
-                    self.pay_schedule, self.pay_curve
-                )
-
-        # Add spread to pay leg forward rates
-        self.pay_schedule["ForwardRate"] = self.pay_schedule["ForwardRate"] + self.pay_spread
-
-        self.pay_schedule = add_floating_cashflows(
-            self.pay_schedule,
-            self.notional
-        )
-
-    def _calculate_present_values(self):
-        """Calculates present values using discount curve."""
-        self.receive_schedule["DiscountFactor"] = self.receive_schedule["PayDate"].apply(
-            lambda pay_date: self.discount_curve.get_discount_factor_for_date(pay_date)
-        )
-        self.receive_schedule["PV"] = (
-            self.receive_schedule["Cashflow"] * self.receive_schedule["DiscountFactor"]
-        )
-
-        self.pay_schedule["DiscountFactor"] = self.pay_schedule["PayDate"].apply(
-            lambda pay_date: self.discount_curve.get_discount_factor_for_date(pay_date)
-        )
-        self.pay_schedule["PV"] = (
-            self.pay_schedule["Cashflow"] * self.pay_schedule["DiscountFactor"]
-        )
-    def calculate_fair_rate(self):
-        """Calculate fair fixed rate of the swap (also used for swaptions)"""
-        if self.pay_fixed == True:
-            fair_rate = (self.receive_schedule['YearFrac'] * self.receive_schedule['DiscountFactor'] * self.receive_schedule['ForwardRate']).values.sum()/(self.pay_schedule['YearFrac'] * self.pay_schedule['DiscountFactor']).values.sum()
-        else:
-            fair_rate = (self.pay_schedule['YearFrac'] * self.pay_schedule['DiscountFactor'] * self.pay_schedule['ForwardRate']).values.sum()/(self.receive_schedule['YearFrac'] * self.receive_schedule['DiscountFactor']).values.sum()
-        return fair_rate
-    
-
-
-
-
-
-
-
-    def receive_leg_pv(self) -> float:
-        """Returns present value of receive leg."""
-        return self.receive_schedule["PV"].sum()
-
-    def pay_leg_pv(self) -> float:
-        """Returns present value of pay leg."""
-        return self.pay_schedule["PV"].sum()
-
-    def net_pv(self) -> float:
-        """Returns net present value (receive - pay)."""
-        return self.receive_leg_pv() - self.pay_leg_pv()
-
-    def get_receive_schedule(self) -> pd.DataFrame:
-        """Returns receive leg schedule."""
-        return self.receive_schedule.copy()
-
-    def get_pay_schedule(self) -> pd.DataFrame:
-        """Returns pay leg schedule."""
-        return self.pay_schedule.copy()
-
-    def summary(self) -> dict:
-        """Returns summary with PVs and swap details."""
-        return {
-            "receive_leg_pv": self.receive_leg_pv(),
-            "pay_leg_pv": self.pay_leg_pv(),
-            "net_pv": self.net_pv(),
-            "notional": self.notional,
-            "effective_date": self.effective_date,
-            "maturity_date": self.maturity_date,
-        }
-    
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-class FRA:
-    """
-    Forward Rate Agreement pricer.
-
-    Net PV = notional × YearFrac × (ForwardRate - fixed_rate) × DF(start_date).
-    Sign convention: positive notional = pay fixed / receive IBOR (long rate).
-                     negative notional = receive fixed / pay IBOR (short rate).
-    Settlement occurs on the start date of the reference period.
-    """
-
-    def __init__(
-        self,
-        effective_date: date,
-        maturity_date: date,
-        notional: float,
-        reference_rate_curve: DiscountYieldCurveHandler,
-        discount_curve: DiscountYieldCurveHandler,
-        fixed_rate: float,
-        valuation_date: date = None,
-        calendar: str = "TARGET",
-        business_convention: str = "ModifiedFollowing",
-        day_count: str = "ACT/365",
-    ):
-        """
-        Parameters:
-            effective_date: Start of the FRA reference period (also the settlement date).
-            maturity_date: End of the FRA reference period.
-            notional: Signed notional. Positive = pay fixed; negative = receive fixed.
-            reference_rate_curve: IBOR forward curve.
-            discount_curve: Curve for discounting to the settlement date.
-            fixed_rate: The agreed fixed rate.
-            valuation_date: Valuation date.
-            calendar: QuantLib calendar name (default 'TARGET').
-            business_convention: Business day convention (default 'ModifiedFollowing').
-            day_count: Day count convention (default 'ACT/365').
-        """
-        self.effective_date = effective_date
-        self.maturity_date = maturity_date
-        self.notional = notional
-        self.reference_rate_curve = reference_rate_curve
-        self.discount_curve = discount_curve
-        self.fixed_rate = fixed_rate
-        self.valuation_date = valuation_date
-        self.calendar = calendar
-        self.business_convention = business_convention
-        self.day_count = day_count
-
-        self._build_schedule()
-        self._calculate_cashflows()
-        self._calculate_present_values()
-
-    def _build_schedule(self):
-        """Builds the single-period schedule. PayDate = StartDate (FRA settles on fixing date)."""
-        import QuantLib as ql
-
-        if "." in self.calendar:
-            parts = self.calendar.split(".")
-            calendar_class = getattr(ql, parts[0])
-            market = getattr(calendar_class, parts[1])
-            ql_calendar = calendar_class(market)
-        else:
-            ql_calendar = getattr(ql, self.calendar)()
-
-        ql_convention = getattr(ql, self.business_convention)
-
-        ql_start = ql.Date(self.effective_date.day, self.effective_date.month, self.effective_date.year)
-        ql_end = ql.Date(self.maturity_date.day, self.maturity_date.month, self.maturity_date.year)
-        ql_start = ql_calendar.adjust(ql_start, ql_convention)
-        ql_end = ql_calendar.adjust(ql_end, ql_convention)
-
-        daycount_map = {
-            "ACT/360": ql.Actual360(),
-            "ACT/365": ql.Actual365Fixed(),
-            "ACT/365F": ql.Actual365Fixed(),
-            "ACT/ACT": ql.ActualActual(ql.ActualActual.ISDA),
-            "30/360": ql.Thirty360(ql.Thirty360.BondBasis),
-        }
-        ql_daycount = daycount_map.get(self.day_count, ql.Actual365Fixed())
-
-        start_date = date(ql_start.year(), ql_start.month(), ql_start.dayOfMonth())
-        end_date = date(ql_end.year(), ql_end.month(), ql_end.dayOfMonth())
-
-        self.schedule = pd.DataFrame([{
-            "StartDate": start_date,
-            "EndDate": end_date,
-            "PayDate": end_date,
-            "DaysInPeriod": (end_date - start_date).days,
-            "YearFrac": ql_daycount.yearFraction(ql_start, ql_end),
-        }])
-
-    def _calculate_cashflows(self):
-        """Computes the net cashflow: notional × YearFrac × (ForwardRate - fixed_rate)."""
-        row = self.schedule.iloc[0]
-        forward_rate = self.reference_rate_curve.get_simple_forward(row["StartDate"], row["EndDate"])
-        self.schedule["ForwardRate"] = forward_rate
-        self.schedule["FixedRate"] = self.fixed_rate
-        self.schedule["NetCashflow"] = self.notional * row["YearFrac"] * (forward_rate - self.fixed_rate)
-
-    def _calculate_present_values(self):
-        """Discounts the net cashflow to valuation date using DF at the settlement date."""
-        df = self.discount_curve.get_discount_factor_for_date(self.schedule.iloc[0]["PayDate"])
-        self.schedule["DiscountFactor"] = df
-        self.schedule["PV"] = self.schedule["NetCashflow"] * df
-
-    def net_pv(self) -> float:
-        return float(self.schedule["PV"].sum())
-
-    def calculate_fair_rate(self) -> float:
-        """Returns the par FRA rate (the IBOR forward over the reference period)."""
-        row = self.schedule.iloc[0]
-        return self.reference_rate_curve.get_simple_forward(row["StartDate"], row["EndDate"])
-
-    def get_schedule(self) -> pd.DataFrame:
-        return self.schedule.copy()
-
-    def summary(self) -> dict:
-        return {
-            "net_pv": self.net_pv(),
-            "forward_rate": float(self.schedule["ForwardRate"].iloc[0]),
-            "fixed_rate": self.fixed_rate,
-            "notional": self.notional,
-            "effective_date": self.effective_date,
-            "maturity_date": self.maturity_date,
-        }
-
-
-class Swaption:
-    def __init__(
-        self,
-        underlying_swap: IRSwap,
-        expiry_date: date,
-        strike: float,
-        ir_vol: IRVol,
-        forward_shift: float = 0,
-    ):
-        self.underlying_swap = underlying_swap
-        self.expiry_date = expiry_date
-        self.strike = strike
-        self.ir_vol = ir_vol
-        self.forward_shift = forward_shift
-        self.fair_forward = self.underlying_swap.calculate_fair_rate()
-        # Floor at 1e-5+shift before the log rather than special-casing zero/negative
-        # strike as "call=forward, put=0" — rates can go negative, so Black's d1/d2
-        # need a positive shifted forward/strike, not a payoff assumption.
-        self.shifted_forward = max(self.fair_forward, 1e-5) + self.forward_shift
-        self.shifted_strike = max(self.strike, 1e-5) + self.forward_shift
-        self.a_factor = self._calculate_A_factor()
-        self.expiry_time = self._calculate_expiry_time()
-        self.maturity_time = self._calculate_maturity_time()
-        self.moneyness = (self.strike - self.fair_forward)
-        self.volatility = self.calculate_swaption_volatility()
-
-
-    def _calculate_A_factor(self):
-        """Calculate the A factor of the swap (used for swaptions)"""
-        if self.underlying_swap.pay_fixed == True: # then fixed_leg = payment dfs and accruals etc
-            a_factor = (self.underlying_swap.pay_schedule['YearFrac'] * self.underlying_swap.pay_schedule['DiscountFactor']).values.sum()
-        else:
-            a_factor = (self.underlying_swap.receive_schedule['YearFrac'] * self.underlying_swap.receive_schedule['DiscountFactor']).values.sum()
-        return a_factor
-
-    def _calculate_expiry_time(self):
-        return (self.expiry_date - self.underlying_swap.valuation_date).days/365
-
-    def _calculate_maturity_time(self):
-        if self.underlying_swap.pay_fixed:
-            last_pay_date = self.underlying_swap.pay_schedule["PayDate"].iloc[-1]
-        else:
-            last_pay_date = self.underlying_swap.receive_schedule["PayDate"].iloc[-1]
-        return (last_pay_date - self.underlying_swap.effective_date).days / 365
-
-    def _calculate_d1(self):
-        d1 = (np.log(self.shifted_forward / self.shifted_strike) + self.expiry_time * (self.volatility)**2/2) / (self.volatility * np.sqrt(self.expiry_time))
-        return d1
-
-    def _calculate_d2(self):
-        d2 = (np.log(self.shifted_forward / self.shifted_strike) - self.expiry_time * (self.volatility)**2/2) / (self.volatility * np.sqrt(self.expiry_time))
-        return d2
-
-
-
-    def swaption_value(self):
-        """ Returns the Black swaption value, or the discounted intric value when vol == 0."""
-        if self.volatility <=0:
-            intrinsic = (
-                max(self.fair_forward - self.strike, 0.0) if self.underlying_swap.pay_fixed
-                else max(self.strike - self.fair_forward, 0.0)
-            )
-            return self.underlying_swap.notional * self.a_factor * intrinsic
-
-        d1 = self._calculate_d1()
-        d2 = self._calculate_d2()
-        if self.underlying_swap.pay_fixed == True: # payer swaption
-            return self.underlying_swap.notional * self.a_factor * (self.shifted_forward * norm.cdf(d1) - self.shifted_strike * norm.cdf(d2))
-        else: # receiver swaption
-            return self.underlying_swap.notional * self.a_factor * (self.shifted_strike * norm.cdf(-d2) - self.shifted_forward * norm.cdf(-d1))
-
-
-    def calculate_swaption_volatility(self) -> float:
-        return self.ir_vol.get_vol(self.moneyness, self.expiry_time, self.maturity_time)
-
-
-class CapFloor:
-    """
-    IBOR and OIS Cap and Floor pricer.
-
-    IBOR mode (ois=False):
-        One Black caplet/floorlet per period on the simple IBOR forward rate.
-        t_exp = (StartDate − valuation_date) / 365.
-        In-motion: supply current_ibor_rate to fix the rate (intrinsic only).
-
-    OIS post-aggregation mode (ois=True, post_aggregation=True):
-        One Black caplet/floorlet per period on the compounded OIS rate.
-        t_exp = (EndDate − 1 business day − valuation_date) / 365.
-        In-motion: blend current_compounded_rate with projected remaining rate.
-        Optionality remains — d1/d2 and Black formula still applied.
-
-    OIS daily mode (ois=True, post_aggregation=False):
-        Each period decomposed into daily optionlets (one per business day).
-        less_1_day=True:  t_exp = (DayStart − valuation_date) / 365.
-        less_1_day=False: t_exp = (DayEnd − valuation_date) / 365 (rate publication date).
-        Days with t_exp ≤ 0 valued at intrinsic. Sum discounted at period PayDate.
-
-    Degenerate cases: any caplet/floorlet with t_exp ≤ 0 or zero/negative vol is valued
-    at its discounted intrinsic value — max(F − K, 0) × τ for a cap, max(K − F, 0) × τ
-    for a floor — discounted at the period PayDate. This is applied per optionlet, so in
-    daily mode only the affected days fall back to intrinsic. Forward and strike are
-    floored at 1e-5+shift before entering the Black formula so a zero/negative underlying
-    rate never blows up d1/d2.
-
-    Vega: each caplet/floorlet also gets a forward-difference vega — the interpolated vol
-    is bumped by 1bp and repriced; see CapFloor._vega_factor. Zero for caplets valued at
-    intrinsic (t_exp ≤ 0).
-
-    Digital (digital=True): each caplet/floorlet instead pays digital_payoff × τ if it
-    settles in the money — priced as a cash-or-nothing digital, tau × digital_payoff ×
-    N(d2) for a cap, tau × digital_payoff × N(-d2) for a floor. An already-fixed (t_exp≤0)
-    or zero-vol caplet/floorlet is valued at its intrinsic digital payoff instead (the full
-    digital_payoff × τ if in the money, else 0).
-
-    Skew adjustment (use_skew_adjustment=True, requires digital=True): corrects the flat-vol
-    digital price for the local slope of the vol surface — the standard digital-via-vanilla-
-    spread adjustment —
-        PV(digital caplet, skew-adjusted)  = PV(digital caplet)  − slope × vega × digital_payoff × 100
-        PV(digital floorlet, skew-adjusted) = PV(digital floorlet) + slope × vega × digital_payoff × 100
-    where slope = ir_vol.get_slope(...) (∂vol/∂moneyness, × 100 in the bulk/non-daily path
-    to match Vega's per-1%-vol-move convention) and vega is the corresponding vanilla
-    caplet/floorlet's forward-difference vega (CapFloor._vega_factor) at the same
-    strike/expiry/maturity — both computed per optionlet, exposed via the Slope and Vega
-    columns. Works with either ir_vol.strike_interp mode — 'hermite' gives a smooth analytic
-    slope, 'linear' gives the local piecewise-linear segment slope (a step function,
-    constant between strike nodes).
-
-    Call/put-spread skew (use_call_spread_skew=True, requires digital=True and a positive
-    spread; mutually exclusive with use_skew_adjustment — no analytic slope/Hermite surface
-    required): replaces the entire digital valuation (not just an add-on adjustment) with a
-    replication via a call spread (cap) or put spread (floor) of width 2×spread around the
-    strike, each leg independently vol-surface-queried at its own bumped strike:
-        PV = L · τ · D(t, t_{i+1}) · (digital_payoff / (2 × spread)) · φ ·
-             (B(F, K−spread, σ(K−spread), τ_exp, φ) − B(F, K+spread, σ(K+spread), τ_exp, φ))
-    where φ=+1 for a cap (call spread), φ=−1 for a floor (put spread), and B(F, K, σ, T, φ)
-    is the undiscounted, unit-notional Black value of a European option struck at K with
-    payoff φ×(F−K)⁺ (CapFloor._black_value). See CapFloor._call_spread_digital_factor. d1/d2
-    aren't reported in this mode (there's no single pair — two strikes are priced).
-
-    Sign convention: positive notional = long; negative notional = short.
-    cap=True prices a cap; cap=False prices a floor.
-    Moneyness = (K − F) × 100 (in percent, matching vol surface input convention).
-    """
-
-    def __init__(
-        self,
-        effective_date: date,
-        maturity_date: date,
-        notional: float,
-        forward_curve: DiscountYieldCurveHandler,
-        discount_curve: DiscountYieldCurveHandler,
-        ir_vol: IRVol,
-        strike: float,
-        valuation_date: date = None,
-        payment_frequency: int = 3,
-        payment_offset: int = 0,
-        cap: bool = True,
-        forward_shift: float = 0.0,
-        current_ibor_rate: float = None,
-        ois: bool = False,
-        post_aggregation: bool = True,
-        vol_decay: bool = False,
-        current_compounded_rate: float = None,
-        current_period_end_date: date = None,
-        calendar: str = "TARGET",
-        business_convention: str = "ModifiedFollowing",
-        termination_business_convention: str = "ModifiedFollowing",
-        date_generation: str = "Backward",
-        day_count: str = "ACT/365",
-        end_of_month: bool = False,
-        use_schedule_end_date: bool = True,
-        cap_vol_maturity: float = 0.25,
-        less_1_day: bool = True,
-        digital: bool = False,
-        use_skew_adjustment: bool = False,
-        digital_payoff: float = 1.0,
-        use_call_spread_skew: bool = False,
-        spread: float = None,
-    ):
-        self.effective_date = effective_date
-        self.maturity_date = maturity_date
-        self.notional = notional
-        self.forward_curve = forward_curve
-        self.discount_curve = discount_curve
-        self.ir_vol = ir_vol
-        self.strike = strike
-        self.valuation_date = valuation_date
-        self.payment_frequency = payment_frequency
-        self.payment_offset = payment_offset
-        self.cap = cap
-        self.forward_shift = forward_shift
-        self.current_ibor_rate = current_ibor_rate
-        self.ois = ois
-        self.post_aggregation = post_aggregation
-        self.vol_decay = vol_decay
-        self.current_compounded_rate = current_compounded_rate
-        self.current_period_end_date = current_period_end_date
-        self.calendar = calendar
-        self.business_convention = business_convention
-        self.termination_business_convention = termination_business_convention
-        self.date_generation = date_generation
-        self.day_count = day_count
-        self.end_of_month = end_of_month
-        self.use_schedule_end_date = use_schedule_end_date
-        self.cap_vol_maturity = cap_vol_maturity
-        self.less_1_day = less_1_day
-        self.digital = digital
-        self.use_skew_adjustment = use_skew_adjustment
-        self.digital_payoff = digital_payoff
-        self.use_call_spread_skew = use_call_spread_skew
-        self.spread = spread
-
-        if use_skew_adjustment and not digital:
-            raise ValueError("use_skew_adjustment requires digital=True")
-        if use_call_spread_skew and not digital:
-            raise ValueError("use_call_spread_skew requires digital=True")
-        if use_call_spread_skew and use_skew_adjustment:
-            raise ValueError(
-                "use_call_spread_skew and use_skew_adjustment are alternative ways to model "
-                "the skew — set only one."
-            )
-        if use_call_spread_skew and not (spread is not None and spread > 0):
-            raise ValueError("use_call_spread_skew requires spread to be a positive float")
-
-        self._build_schedule()
-        self._calculate_caplets()
-
-    def _build_schedule(self):
-        self.schedule = generate_swap_leg_schedule(
-            effective_date=self.effective_date,
-            maturity_date=self.maturity_date,
-            valuation_date=self.valuation_date,
-            payment_frequency=self.payment_frequency,
-            payment_offset=self.payment_offset,
-            calendar=self.calendar,
-            business_convention=self.business_convention,
-            termination_business_convention=self.termination_business_convention,
-            date_generation=self.date_generation,
-            day_count=self.day_count,
-            end_of_month=self.end_of_month,
-        )
-        self.schedule = add_forward_rates_to_schedule(
-            self.schedule,
-            self.forward_curve,
-            frequency=self.payment_frequency,
-            calendar=self.calendar,
-            business_convention="Following",
-            use_schedule_end_date=self.use_schedule_end_date,
-            compounding=self.ois,
-        )
-
-    def _intrinsic_factor(self, f: float, tau: float) -> float:
-        """Undiscounted intrinsic factor for one caplet/floorlet: tau × max(F − K, 0) for a
-        cap, tau × max(K − F, 0) for a floor. The forward shift cancels out of F − K and is
-        deliberately not applied here."""
-        if self.cap:
-            return max(f - self.strike, 0.0) * tau
-        return max(self.strike - f, 0.0) * tau
-
-    def _lookup_vol(self, t: float, t_vol: float, moneyness: float) -> float:
-        """Vol-surface lookup, 0.0 for an already-expired caplet/floorlet (t≤0) rather than
-        querying the surface with a non-positive expiry."""
-        if t <= 0:
+                self._surface[float(mat)][float(exp)] = (m_nodes, v_nodes, hermite)
+
+    def _vol_at_expiry_maturity(self, moneyness: float, expiry: float, maturity: float) -> float:
+        m_nodes, v_nodes, hermite = self._surface[maturity][expiry]
+        if hermite is not None:
+            # Clamp to the node range first so we get flat extrapolation, matching linear mode,
+            # rather than the polynomial's own (potentially divergent) extrapolation.
+            m_clamped = np.clip(moneyness, m_nodes[0], m_nodes[-1])
+            return float(hermite(m_clamped))
+        return float(np.interp(moneyness, m_nodes, v_nodes))
+
+    def _slope_at_expiry_maturity(self, moneyness: float, expiry: float, maturity: float) -> float:
+        """∂vol/∂moneyness at one (expiry, maturity) node — the Hermite spline's derivative
+        in 'hermite' mode, or the local piecewise-linear segment slope in 'linear' mode. 0
+        outside the node range (flat extrapolation) or when there's only one strike (flat
+        vol, so slope is 0 regardless of mode)."""
+        m_nodes, v_nodes, hermite = self._surface[maturity][expiry]
+        if moneyness < m_nodes[0] or moneyness > m_nodes[-1]:
             return 0.0
-        return self.ir_vol.get_vol(moneyness, t_vol, self.cap_vol_maturity)
-
-    def _lookup_slope(self, t: float, t_vol: float, moneyness: float) -> float:
-        """Strike-dimension vol slope (∂vol/∂moneyness), 0.0 for an already-expired
-        caplet/floorlet (t≤0). Works with either ir_vol.strike_interp mode."""
-        if t <= 0:
+        if hermite is not None:
+            return float(hermite.derivative()(moneyness))
+        if len(m_nodes) < 2:
             return 0.0
-        return self.ir_vol.get_slope(moneyness, t_vol, self.cap_vol_maturity)
+        idx = int(np.searchsorted(m_nodes, moneyness, side="right"))
+        idx = min(max(idx, 1), len(m_nodes) - 1)
+        m0, m1 = m_nodes[idx - 1], m_nodes[idx]
+        v0, v1 = v_nodes[idx - 1], v_nodes[idx]
+        return float((v1 - v0) / (m1 - m0))
 
-    def _intrinsic_digital_factor(self, f: float, tau: float) -> float:
-        """Undiscounted intrinsic factor for one digital caplet/floorlet: tau ×
-        digital_payoff if in the money (F > K for a cap, F < K for a floor), else 0."""
-        in_the_money = f > self.strike if self.cap else f < self.strike
-        return tau * self.digital_payoff if in_the_money else 0.0
+    def _vol_at_maturity(self, moneyness: float, swaption_expiry: float, maturity: float) -> float:
+        expiries = np.array(sorted(self._surface[maturity].keys()))
+        idx = int(np.searchsorted(expiries, swaption_expiry))
 
-    def _digital_option_factor_given_vol(self, f: float, tau: float, t: float, vol: float):
-        """Cash-or-nothing digital factor (and d1, d2) for one caplet/floorlet at an
-        explicit vol: tau × digital_payoff × N(d2) for a cap, tau × digital_payoff × N(-d2)
-        for a floor. Falls back to the intrinsic digital factor (d1=d2=nan) when t≤0 or
-        vol≤0, using the same forward/strike floor as the vanilla Black factor."""
-        if t <= 0 or vol <= 0:
-            return self._intrinsic_digital_factor(f, tau), np.nan, np.nan
-        f_s = max(f, 1e-5) + self.forward_shift
-        k_s = max(self.strike, 1e-5) + self.forward_shift
-        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
-        d2 = d1 - vol * np.sqrt(t)
-        factor = tau * self.digital_payoff * (norm.cdf(d2) if self.cap else norm.cdf(-d2))
-        return factor, d1, d2
+        if idx == 0:
+            return self._vol_at_expiry_maturity(moneyness, float(expiries[0]), maturity)
+        if idx == len(expiries):
+            return self._vol_at_expiry_maturity(moneyness, float(expiries[-1]), maturity)
 
-    def _digital_option_factor_with_vol(
-        self, f: float, tau: float, t: float, moneyness: float,
-        vol_expiry: float = None,
-    ):
-        """Returns (digital_factor, vol, d1, d2), mirroring _black_option_factor_with_vol
-        but pricing a cash-or-nothing digital caplet/floorlet instead of the vanilla payoff."""
-        t_vol = vol_expiry if vol_expiry is not None else t
-        vol = self._lookup_vol(t, t_vol, moneyness)
-        factor, d1, d2 = self._digital_option_factor_given_vol(f, tau, t, vol)
-        return factor, vol, d1, d2
+        e2 = float(expiries[idx])
+        if np.isclose(swaption_expiry, e2):
+            return self._vol_at_expiry_maturity(moneyness, e2, maturity)
 
-    def _black_value(self, f: float, k: float, t: float, vol: float, phi: float) -> float:
-        """Raw European option value (unit notional, no accrual, undiscounted) with payoff
-        phi × (F − K) floored at 0 — phi=+1 for a call, phi=-1 for a put. Falls back to
-        intrinsic (using the true, unfloored f/k, since negative rates are legitimate) when
-        t≤0 or vol≤0; otherwise floors forward/strike at 1e-5+shift before the log, same as
-        the rest of the class. Used by the call/put-spread digital replication, where each
-        leg is struck (and vol-surface queried) away from self.strike."""
-        if t <= 0 or vol <= 0:
-            return max(phi * (f - k), 0.0)
-        f_s = max(f, 1e-5) + self.forward_shift
-        k_s = max(k, 1e-5) + self.forward_shift
-        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
-        d2 = d1 - vol * np.sqrt(t)
-        return phi * (f_s * norm.cdf(phi * d1) - k_s * norm.cdf(phi * d2))
+        e1 = float(expiries[idx - 1])
+        v1 = self._vol_at_expiry_maturity(moneyness, e1, maturity)
+        v2 = self._vol_at_expiry_maturity(moneyness, e2, maturity)
+        w = (swaption_expiry - e1) / (e2 - e1)
+        return v1 + w * (v2 - v1)
 
-    def _call_spread_digital_factor(self, f: float, tau: float, t: float, t_vol: float) -> float:
-        """Digital caplet/floorlet factor via the call/put-spread replication
-        (use_call_spread_skew) — the alternative to the analytic slope × vega skew
-        adjustment. Prices a long European at strike−spread minus a long European at
-        strike+spread (same call/put type as the cap/floor itself, phi=+1/-1), each off ITS
-        OWN vol-surface lookup at that bumped strike's moneyness — so the skew is captured
-        by repricing at two strikes rather than a single instantaneous slope — scaled by
-        digital_payoff / (2 × spread) and tau (notional/discounting are applied by the
-        caller). The 2×spread (not spread) is the full distance between the two strikes:
-        dividing by only spread would double-count, since (B(K−spread) − B(K+spread)) is a
-        central difference over a 2×spread-wide interval — with it, the flat-vol/no-skew
-        limit as spread→0 converges to the plain N(d2)/N(-d2) digital, as it should, with
-        only the skew correction (from the two independent vol-surface lookups) remaining."""
-        phi = 1.0 if self.cap else -1.0
-        k_lo = self.strike - self.spread
-        k_hi = self.strike + self.spread
-        vol_lo = self._lookup_vol(t, t_vol, (k_lo - f) * 100)
-        vol_hi = self._lookup_vol(t, t_vol, (k_hi - f) * 100)
-        b_lo = self._black_value(f, k_lo, t, vol_lo, phi)
-        b_hi = self._black_value(f, k_hi, t, vol_hi, phi)
-        return tau * (self.digital_payoff / (2 * self.spread)) * phi * (b_lo - b_hi)
+    def _slope_at_maturity(self, moneyness: float, swaption_expiry: float, maturity: float) -> float:
+        """Blends the per-expiry strike-slopes the same (linear) way _vol_at_maturity blends
+        vol values — valid because expiry interpolation is a linear (affine) combination
+        whose weights don't depend on moneyness, so differentiating w.r.t. moneyness commutes
+        with it."""
+        expiries = np.array(sorted(self._surface[maturity].keys()))
+        idx = int(np.searchsorted(expiries, swaption_expiry))
 
-    def _call_spread_digital_factor_with_vol(
-        self, f: float, tau: float, t: float, moneyness: float,
-        vol_expiry: float = None,
-    ):
-        """Returns (digital_factor, vol, d1, d2), mirroring _digital_option_factor_with_vol
-        but pricing via the call/put-spread replication (_call_spread_digital_factor)
-        instead of a single flat-vol N(d2). vol is a diagnostic lookup at the actual strike
-        only — the replication itself looks up vol independently at each bumped strike, so
-        there's no single d1/d2 pair to report (returned as nan)."""
-        t_vol = vol_expiry if vol_expiry is not None else t
-        vol = self._lookup_vol(t, t_vol, moneyness)
-        factor = self._call_spread_digital_factor(f, tau, t, t_vol)
-        return factor, vol, np.nan, np.nan
+        if idx == 0:
+            return self._slope_at_expiry_maturity(moneyness, float(expiries[0]), maturity)
+        if idx == len(expiries):
+            return self._slope_at_expiry_maturity(moneyness, float(expiries[-1]), maturity)
 
-    def _black_option_factor_given_vol(self, f: float, tau: float, t: float, vol: float):
-        """Black factor (and d1, d2) for one caplet/floorlet at an explicit vol. Returns the
-        intrinsic factor (d1=d2=nan) when t≤0 or vol≤0. Forward and strike are floored at
-        1e-5+shift before the log (rates can go negative, so we deliberately don't
-        special-case zero/negative strike as "call=forward, put=0") so Black's d1/d2 stay
-        defined. Shared by the vol-surface lookup path and the vega bump-and-reval calc, so
-        both price off the exact same formula."""
-        if t <= 0 or vol <= 0:
-            return self._intrinsic_factor(f, tau), np.nan, np.nan
-        f_s = max(f, 1e-5) + self.forward_shift
-        k_s = max(self.strike, 1e-5) + self.forward_shift
-        d1 = (np.log(f_s / k_s) + 0.5 * vol**2 * t) / (vol * np.sqrt(t))
-        d2 = d1 - vol * np.sqrt(t)
-        if self.cap:
-            factor = tau * (f_s * norm.cdf(d1) - k_s * norm.cdf(d2))
-        else:
-            factor = tau * (k_s * norm.cdf(-d2) - f_s * norm.cdf(-d1))
-        return factor, d1, d2
+        e2 = float(expiries[idx])
+        if np.isclose(swaption_expiry, e2):
+            return self._slope_at_expiry_maturity(moneyness, e2, maturity)
 
-    def _vega_factor(self, f: float, tau: float, t: float, vol: float, bump: float = 0.0001) -> float:
-        """Forward-difference vega factor for one caplet/floorlet: bumps the (already
-        interpolated) vol by `bump` (1bp by default) and returns
-        ((V(vol+bump) - V(vol)) / bump) * 0.01 — the undiscounted, per-unit-notional PV
-        sensitivity to a 1% (100bp) parallel vol move. Zero for expired caplets (t≤0),
-        since their value is fixed intrinsic regardless of vol."""
-        factor, _, _ = self._black_option_factor_given_vol(f, tau, t, vol)
-        factor_bumped, _, _ = self._black_option_factor_given_vol(f, tau, t, vol + bump)
-        return ((factor_bumped - factor) / bump) * 0.01
+        e1 = float(expiries[idx - 1])
+        s1 = self._slope_at_expiry_maturity(moneyness, e1, maturity)
+        s2 = self._slope_at_expiry_maturity(moneyness, e2, maturity)
+        w = (swaption_expiry - e1) / (e2 - e1)
+        return s1 + w * (s2 - s1)
 
-    def _black_option_factor(self, f: float, tau: float, t: float, moneyness: float) -> float:
-        """Black factor for one caplet/floorlet. Returns tau × [payoff], or the intrinsic
-        factor when t≤0 or vol is 0."""
-        vol = self._lookup_vol(t, t, moneyness)
-        factor, _, _ = self._black_option_factor_given_vol(f, tau, t, vol)
-        return factor
+    def get_vol(self, moneyness: float, swaption_expiry: float, swap_maturity: float) -> float:
+        """Return interpolated swaption / cap / floor volatility.
 
-    def _black_option_factor_with_vol(
-        self, f: float, tau: float, t: float, moneyness: float,
-        vol_expiry: float = None,
-    ):
-        """Returns (option_factor, vol, d1, d2) tuple. Falls back to the intrinsic factor
-        when t≤0 or vol is 0.
+        Parameters
+        ----------
+        moneyness : float
+            Strike moneyness (convention matches the input data).
+        swaption_expiry : float
+            Time to swaption expiry in year fractions.
+        swap_maturity : float
+            Underlying swap (or caplet) maturity in year fractions.
 
-        vol_expiry: expiry passed to the vol surface (defaults to t). Supply the
-        unmodified fixing-date time when vol_decay is active so vol interpolation
-        is unaffected while d1/d2 use the decayed t.
+        Returns
+        -------
+        float
+            Implied volatility.
         """
-        t_vol = vol_expiry if vol_expiry is not None else t
-        vol = self._lookup_vol(t, t_vol, moneyness)
-        factor, d1, d2 = self._black_option_factor_given_vol(f, tau, t, vol)
-        return factor, vol, d1, d2
+        maturities = self._maturities
+        idx = int(np.searchsorted(maturities, swap_maturity))
 
-    def _attach_option_columns(self, schedule: pd.DataFrame) -> None:
-        """Adds Vol, d1, d2, OptionFactor, Vega, DiscountFactor, PV to schedule in-place.
+        if idx == 0:
+            return self._vol_at_maturity(moneyness, swaption_expiry, float(maturities[0]))
+        if idx == len(maturities):
+            return self._vol_at_maturity(moneyness, swaption_expiry, float(maturities[-1]))
 
-        If self.digital, OptionFactor/PV price a cash-or-nothing digital caplet/floorlet
-        instead of the vanilla payoff, using one of two mutually-exclusive skew treatments:
+        m2 = float(maturities[idx])
+        if np.isclose(swap_maturity, m2):
+            return self._vol_at_maturity(moneyness, swaption_expiry, m2)
 
-        - self.use_skew_adjustment: flat-vol N(d2)/N(-d2) digital, corrected by the
-          analytic slope × vega adjustment — PV -= slope * Vega for a cap, PV += slope *
-          Vega for a floor. Adds a Slope column. Works with either ir_vol.strike_interp
-          mode ('hermite' gives a smooth slope, 'linear' a piecewise-constant one).
-        - self.use_call_spread_skew: the entire digital valuation is instead the
-          call/put-spread replication (_call_spread_digital_factor) — no separate
-          adjustment step, no Slope column, and no single d1/d2 (reported as nan).
+        m1 = float(maturities[idx - 1])
+        v1 = self._vol_at_maturity(moneyness, swaption_expiry, m1)
+        v2 = self._vol_at_maturity(moneyness, swaption_expiry, m2)
+        w = (swap_maturity - m1) / (m2 - m1)
+        return v1 + w * (v2 - v1)
 
-        Vega is always the vanilla caplet/floorlet's forward-difference vega, computed for
-        every row regardless of digital/skew mode. Slope is always added too — nan unless
-        self.use_skew_adjustment is active, matching the OIS-daily path's convention.
+    def get_slope(self, moneyness: float, swaption_expiry: float, swap_maturity: float) -> float:
+        """Return the instantaneous strike-dimension slope (∂vol/∂moneyness) at the given
+        point, blended across expiry/maturity the same linear way get_vol blends vol
+        values. Works in both strike_interp modes: the Hermite spline's derivative in
+        'hermite' mode, or the local piecewise-linear segment slope in 'linear' mode (a
+        step function in moneyness — constant between strike nodes, discontinuous at them).
+
+        Parameters
+        ----------
+        moneyness : float
+            Strike moneyness (convention matches the input data).
+        swaption_expiry : float
+            Time to swaption expiry in year fractions.
+        swap_maturity : float
+            Underlying swap (or caplet) maturity in year fractions.
+
+        Returns
+        -------
+        float
+            d(vol)/d(moneyness), i.e. the local slope of the strike smile.
         """
-        vols, d1s, d2s, opt_factors, vega_factors, slopes = [], [], [], [], [], []
-        compute_slope = self.digital and self.use_skew_adjustment
-        if self.digital and self.use_call_spread_skew:
-            pricer = self._call_spread_digital_factor_with_vol
-        elif self.digital:
-            pricer = self._digital_option_factor_with_vol
-        else:
-            pricer = self._black_option_factor_with_vol
-        has_vol_expiry = "VolExpiry" in schedule.columns
-        for _, row in schedule.iterrows():
-            vol_exp = row["VolExpiry"] if has_vol_expiry else None
-            factor, vol, d1, d2 = pricer(
-                row["ForwardRate"], row["YearFrac"], row["t_exp"], row["Moneyness"],
-                vol_expiry=vol_exp,
-            )
-            vega_factor = self._vega_factor(row["ForwardRate"], row["YearFrac"], row["t_exp"], vol)
-            vols.append(vol)
-            d1s.append(d1)
-            d2s.append(d2)
-            opt_factors.append(factor)
-            vega_factors.append(vega_factor)
-            if compute_slope:
-                t_vol = vol_exp if vol_exp is not None else row["t_exp"]
-                slopes.append(self._lookup_slope(row["t_exp"], t_vol, row["Moneyness"]) * 100)
-            else:
-                slopes.append(np.nan)
-        schedule["Vol"] = vols
-        schedule["d1"] = d1s
-        schedule["d2"] = d2s
-        schedule["OptionFactor"] = opt_factors
-        schedule["DiscountFactor"] = schedule["PayDate"].apply(
-            self.discount_curve.get_discount_factor_for_date
-        )
-        schedule["PV"] = self.notional * schedule["OptionFactor"] * schedule["DiscountFactor"]
-        schedule["Vega"] = self.notional * pd.Series(vega_factors, index=schedule.index) * schedule["DiscountFactor"]
-        schedule["Slope"] = slopes
+        maturities = self._maturities
+        idx = int(np.searchsorted(maturities, swap_maturity))
 
-        if compute_slope:
-            skew_adjustment = (
-                pd.Series(slopes, index=schedule.index) * schedule["Vega"]
-                * self.digital_payoff * 100
-            )
-            schedule["PV"] = schedule["PV"] - skew_adjustment if self.cap else schedule["PV"] + skew_adjustment
+        if idx == 0:
+            return self._slope_at_maturity(moneyness, swaption_expiry, float(maturities[0]))
+        if idx == len(maturities):
+            return self._slope_at_maturity(moneyness, swaption_expiry, float(maturities[-1]))
 
-    def _ibor_caplets(self) -> None:
-        schedule = self.schedule.copy()
-        schedule["Strike"] = self.strike
+        m2 = float(maturities[idx])
+        if np.isclose(swap_maturity, m2):
+            return self._slope_at_maturity(moneyness, swaption_expiry, m2)
 
-        if self.current_ibor_rate is not None and len(schedule) > 0:
-            first_start = schedule.iloc[0]["StartDate"]
-            if self.valuation_date is not None and first_start < self.valuation_date:
-                loc = schedule.columns.get_loc("ForwardRate")
-                schedule.iloc[0, loc] = self.current_ibor_rate
-
-        if self.valuation_date is not None:
-            schedule["t_exp"] = schedule["StartDate"].apply(
-                lambda s: (s - self.valuation_date).days / 365.0
-            )
-        else:
-            schedule["t_exp"] = 0.0
-
-        schedule["Moneyness"] = (self.strike - schedule["ForwardRate"]) * 100
-        self._attach_option_columns(schedule)
-        self.schedule = schedule
-
-    def _ois_post_agg_caplets(self) -> None:
-        schedule = self.schedule.copy()
-        schedule["Strike"] = self.strike
-
-        # In-motion: blend already-compounded portion with projected remaining.
-        if (
-            self.current_compounded_rate is not None
-            and self.current_period_end_date is not None
-            and len(schedule) > 0
-        ):
-            first_start = schedule.iloc[0]["StartDate"]
-            first_end = schedule.iloc[0]["EndDate"]
-            val = self.valuation_date
-            if val is not None and first_start <= val <= first_end:
-                tau_elapsed = self.forward_curve.rate_day_count_convention(
-                    first_start, val
-                )
-                elapsed_factor = 1.0 + self.current_compounded_rate * tau_elapsed
-                remaining_ois = compute_daily_ois_factor(
-                    self.forward_curve, val, self.current_period_end_date, self.calendar
-                )
-                remaining_factor = 1.0 + remaining_ois
-                tau_total = schedule.iloc[0]["YearFrac"]
-                blended_rate = (elapsed_factor * remaining_factor - 1.0) / tau_total
-                loc = schedule.columns.get_loc("ForwardRate")
-                schedule.iloc[0, loc] = blended_rate
-
-        # t_exp base: EndDate − 1 business day when less_1_day=True, else EndDate.
-        if self.valuation_date is not None:
-            schedule["t_exp"] = schedule["EndDate"].apply(
-                lambda e: (
-                    (prev_business_day(e, self.calendar) if self.less_1_day else e)
-                    - self.valuation_date
-                ).days / 365.0
-            )
-        else:
-            schedule["t_exp"] = 0.0
-
-        # vol_decay: shrink t_exp used for d1/d2 by 2/3 of the period elapsed time,
-        # while keeping the original fixing-date time for vol surface lookup.
-        if self.vol_decay and self.valuation_date is not None:
-            t_start = schedule["StartDate"].apply(
-                lambda s: (s - self.valuation_date).days / 365.0
-            )
-            schedule["VolExpiry"] = schedule["t_exp"]
-            schedule["t_exp"] = schedule["t_exp"] - (2.0 / 3.0) * (schedule["t_exp"] - t_start)
-
-            # Override for the in-motion first period: the general formula uses T_start
-            # measured from valuation_date (negative when in motion). Instead use:
-            #   t_exp = (fixing_date - effective_date) / 3  −  (valuation_date - effective_date)
-            # all in accrual year fractions, anchored on period start rather than valuation_date.
-            if (
-                self.current_compounded_rate is not None
-                and self.current_period_end_date is not None
-                and len(schedule) > 0
-            ):
-                first_start = schedule.iloc[0]["StartDate"]
-                val = self.valuation_date
-                if first_start <= val:
-                    fixing_date = (
-                        prev_business_day(self.current_period_end_date, self.calendar)
-                        if self.less_1_day else self.current_period_end_date
-                    )
-                    d_fix = (fixing_date - first_start).days / 365.0
-                    d_elapsed = (val - timedelta(days=1) - first_start).days / 365.0
-                    t_exp_in_motion = d_fix / 3.0 - d_elapsed
-                    loc = schedule.columns.get_loc("t_exp")
-                    schedule.iloc[0, loc] = t_exp_in_motion
-
-        schedule["Moneyness"] = (self.strike - schedule["ForwardRate"]) * 100
-        self._attach_option_columns(schedule)
-        self.schedule = schedule
-
-    def _ois_daily_caplets(self) -> None:
-        period_records = []
-        daily_records = []
-
-        for _, period in self.schedule.iterrows():
-            period_start = period["StartDate"]
-            period_end = period["EndDate"]
-            pay_date = period["PayDate"]
-            period_tau = period["YearFrac"]
-            df_pay = self.discount_curve.get_discount_factor_for_date(pay_date)
-
-            period_pv = 0.0
-            period_vega = 0.0
-            for d_i, d_next in iter_overnight_periods(period_start, period_end, self.calendar):
-                tau_i = self.forward_curve.rate_day_count_convention(d_i, d_next)
-                f_day = self.forward_curve.get_simple_forward(d_i, d_next)
-                moneyness = (self.strike - f_day) * 100
-                t_i_date = d_i if self.less_1_day else d_next
-                t_i = (
-                    (t_i_date - self.valuation_date).days / 365.0
-                    if self.valuation_date else 0.0
-                )
-
-                vol = self._lookup_vol(t_i, t_i, moneyness)
-                if self.digital and self.use_call_spread_skew:
-                    opt_factor = self._call_spread_digital_factor(f_day, tau_i, t_i, t_i)
-                    d1, d2 = np.nan, np.nan
-                elif self.digital:
-                    opt_factor, d1, d2 = self._digital_option_factor_given_vol(f_day, tau_i, t_i, vol)
-                else:
-                    opt_factor, d1, d2 = self._black_option_factor_given_vol(f_day, tau_i, t_i, vol)
-                vega_factor = self._vega_factor(f_day, tau_i, t_i, vol)
-
-                pv_day = self.notional * opt_factor * df_pay
-                vega_day = self.notional * vega_factor * df_pay
-
-                slope = np.nan
-                if self.digital and self.use_skew_adjustment:
-                    slope = self._lookup_slope(t_i, t_i, moneyness)
-                    skew_adj_day = slope * vega_day * self.digital_payoff * 100
-                    pv_day = pv_day - skew_adj_day if self.cap else pv_day + skew_adj_day
-
-                period_pv += pv_day
-                period_vega += vega_day
-
-                daily_records.append({
-                    "PeriodStart": period_start,
-                    "PeriodEnd": period_end,
-                    "PayDate": pay_date,
-                    "DayStart": d_i,
-                    "DayEnd": d_next,
-                    "YearFrac": tau_i,
-                    "ForwardRate": f_day,
-                    "Strike": self.strike,
-                    "Moneyness": moneyness,
-                    "t_exp": t_i,
-                    "Vol": vol,
-                    "d1": d1,
-                    "d2": d2,
-                    "OptionFactor": opt_factor,
-                    "DiscountFactor": df_pay,
-                    "PV": pv_day,
-                    "Vega": vega_day,
-                    "Slope": slope,
-                })
-
-            period_records.append({
-                "StartDate": period_start,
-                "EndDate": period_end,
-                "PayDate": pay_date,
-                "DaysInPeriod": period["DaysInPeriod"],
-                "YearFrac": period_tau,
-                "ForwardRate": period["ForwardRate"],
-                "Strike": self.strike,
-                "DiscountFactor": df_pay,
-                "PV": period_pv,
-                "Vega": period_vega,
-            })
-
-        self.schedule = pd.DataFrame(period_records)
-        self.daily_schedule = pd.DataFrame(daily_records)
-
-    def _calculate_caplets(self) -> None:
-        if not self.ois:
-            self._ibor_caplets()
-        elif self.post_aggregation:
-            self._ois_post_agg_caplets()
-        else:
-            self._ois_daily_caplets()
-
-    def net_pv(self) -> float:
-        return float(self.schedule["PV"].sum())
-
-    def net_vega(self) -> float:
-        """Sum of per-caplet/floorlet vega (PV sensitivity to a 1% parallel vol move)."""
-        return float(self.schedule["Vega"].sum())
-
-    def get_schedule(self) -> pd.DataFrame:
-        return self.schedule.copy()
-
-    def get_daily_schedule(self) -> pd.DataFrame:
-        """Returns the per-day optionlet detail. Only available in OIS pre-aggregation mode."""
-        if not hasattr(self, "daily_schedule"):
-            raise ValueError(
-                "Daily schedule is only available when ois=True and post_aggregation=False."
-            )
-        return self.daily_schedule.copy()
-
-    def summary(self) -> dict:
-        return {
-            "net_pv": self.net_pv(),
-            "notional": self.notional,
-            "strike": self.strike,
-            "cap": self.cap,
-            "digital": self.digital,
-            "use_skew_adjustment": self.use_skew_adjustment,
-            "use_call_spread_skew": self.use_call_spread_skew,
-            "effective_date": self.effective_date,
-            "maturity_date": self.maturity_date,
-        }
+        m1 = float(maturities[idx - 1])
+        s1 = self._slope_at_maturity(moneyness, swaption_expiry, m1)
+        s2 = self._slope_at_maturity(moneyness, swaption_expiry, m2)
+        w = (swap_maturity - m1) / (m2 - m1)
+        return s1 + w * (s2 - s1)
