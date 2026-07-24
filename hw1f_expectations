@@ -1,187 +1,116 @@
-import numpy as np
-from scipy.interpolate import PchipInterpolator
+            if cashflow_pricer in [pricer_cap, pricer_floor] and factor_dep['AveragingMethod'] == 'Pre_Aggregation':
+                # Price each overnight/daily reset in the period as its own cap/floor
+                # optionlet (its own dates, accrual and a strike broadcast from its parent
+                # cashflow) instead of first compounding every reset in the period into a
+                # single rate and pricing one option on that. Post_Aggregation and the
+                # default (no Averaging_Method / plain IBOR) cases are untouched — they
+                # still go through the compounding step below and price one option per
+                # period on the (single) compounded/forward rate.
+                reset_per_cashflows = factor_dep['Cashflows'].offsets[start_index[index]:, 0]
+                reset_split = torch.as_tensor(
+                    reset_per_cashflows[reset_per_cashflows > 0], device=shared.one.device, dtype=torch.long)
+                lengths = reset_split.unsqueeze(0).expand(all_resets.shape[0], -1)
+                daily_accrual = reset_block.tn[:, utils.RESET_INDEX_Accrual]  # should align with all_resets dim=1
+                daily_ends = reset_block.np[:, utils.RESET_INDEX_End_Day] - time_slice
+                strike_daily = torch.repeat_interleave(
+                    reset_cashflows.tn[:, utils.CASHFLOW_INDEX_Strike], reset_split).reshape(1, -1, 1)
+                # note that the tenor (Year Frac) is averaged
+                # all the cashflows are supposed to have the same year frac
+                # (but practically not - should be ok to do this)
+                tenor = cashflows.np[:, utils.CASHFLOW_INDEX_Year_Frac].mean()
+                call_or_put = 1.0 if cashflow_pricer is pricer_cap else -1.0
+                all_int, all_margin = _pricer_cap_floor_daily(
+                    all_resets, strike_daily, daily_accrual, daily_ends, tenor,
+                    factor_dep, call_or_put, lengths, shared)
+            else:
+                if all_resets.shape[1] != reset_cashflows.np.shape[0]:
+                    # check if the resets need to be averaged (compounded) before being applied (i.e. OIS)
+                    reset_per_cashflows = factor_dep['Cashflows'].offsets[start_index[index]:, 0]
+                    accrual = reset_block.tn[:, utils.RESET_INDEX_Accrual]  # should align with all_resets dim=1
+                    # note that if we want to do average rate (not compounding) - we just need to drop log1p and expm1
+                    log_rt = torch.log1p(all_resets * accrual.view(1, -1, 1))
+                    reset_split = torch.as_tensor(
+                        reset_per_cashflows[reset_per_cashflows > 0], device=shared.one.device, dtype=torch.long)
+                    lengths = reset_split.unsqueeze(0).expand(log_rt.shape[0], -1)
+                    sum_log = torch.segment_reduce(log_rt, reduce="sum", lengths=lengths, axis=1)
+                    sum_acc = torch.segment_reduce(accrual, reduce="sum", lengths=reset_split, axis=0)
+                    all_resets = torch.expm1(sum_log)/sum_acc.view(1, -1, 1)
+
+                # check if we need extra information to price caps or floors
+                if cashflow_pricer in [pricer_cap, pricer_floor]:
+                    # adjust the expiry date to adjust the vol
+                    expiries = cashflows.np[:, utils.CASHFLOW_INDEX_Start_Day] - time_slice
+                    if factor_dep['AveragingMethod']=='Post_Aggregation':
+                        t_k = cashflows.np[:, utils.CASHFLOW_INDEX_Start_Day] - time_slice
+                        t_kp1 = cashflows.np[:, utils.CASHFLOW_INDEX_End_Day] - time_slice
+                        # The (2/3) linear vol-decay formula integrates variance assuming the
+                        # whole period [t_k, t_kp1] is still in the future. For the caplet/
+                        # floorlet we're currently inside the accrual period of (t_k <= 0),
+                        # only the remaining [0, t_kp1] portion still carries optionality, so
+                        # the effective expiry instead integrates variance over just that
+                        # remaining portion: t_kp1**3 / (3*(t_kp1-t_k)**2). t_kp1 > 0 guards
+                        # against applying this to an already fully-expired caplet/floorlet.
+                        expiries = t_kp1 # actual expiries used for vol lookup
+                        eff_expiries = np.where( # expiries used in Black formula with vol decay
+                            (t_k <= 0) & (t_kp1 > 0),
+                            t_kp1 ** 3 / (3 * (t_kp1 - t_k) ** 2),
+                            t_kp1 - (2 / 3) * (t_kp1 - t_k),
+                        )
+                    else:
+                        eff_expiries = expiries #cashflows.np[:, utils.CASHFLOW_INDEX_Start_Day] - time_slice
+                    # note that the tenor (Year Frac) is averaged
+                    # all the cashflows are supposed to have the same year frac
+                    # (but practically not - should be ok to do this)
+                    tenor = cashflows.np[:, utils.CASHFLOW_INDEX_Year_Frac].mean()
+                    all_int, all_margin = cashflow_pricer(
+                        all_resets, reset_cashflows.tn, factor_dep, eff_expiries, tenor, shared, expiries)
+                else:
+                    all_int, all_margin = cashflow_pricer(all_resets, reset_cashflows.tn, shared)
+############
 
 
-class IRVol:
-    """Interest rate volatility surface for swaptions and caps/floors.
+def _pricer_cap_floor_daily(all_resets, strike, accrual, end_days, tenor, factor_dep, call_or_put, lengths, shared):
+    """Prices each row (individual overnight/daily reset) as its own cap/floor optionlet —
+    its own accrual and its own expiry, used for both the Black/Bachelier time-to-expiry
+    and the vol-surface lookup (no separate decay treatment needed here, unlike
+    Post_Aggregation's period-level formula — every row already carries its true
+    remaining time to its own fixing). strike is pre-broadcast per-row from its parent
+    cashflow; tenor is the parent period's Year_Frac (used only for the vol surface's
+    tenor-bucket axis, matching _pricer_cap_floor's convention). The already-optioned
+    daily payoffs are then summed back to one value per cashflow via `lengths` — the same
+    reset-to-cashflow grouping the OIS reset-compounding step elsewhere uses, so a
+    Pre_Aggregation cap ends up with one Black/Bachelier evaluation per overnight reset
+    instead of one per period on a single compounded rate. Kept as an independent copy of
+    _pricer_cap_floor's pricing logic (rather than a shared helper) so _pricer_cap_floor
+    itself stays untouched."""
+    expiry = factor_dep['Discount'][0][utils.FACTOR_INDEX_Daycount](end_days)
+    digital_payoff = factor_dep['Digital_Payoff_Rate'] if 'Digital_Payoff_Rate' in factor_dep else 0.0
+    dist, shf = factor_dep['VolSurface'][0][utils.FACTOR_INDEX_SubType]
+    pricing_fn = utils.black_european_option if dist=='Lognormal' else utils.bachelier_european_option
 
-    Input DataFrame must have columns: Moneyness, Expiry, Maturity, Vol.
-    Expiry and Maturity are year fractions. Moneyness convention is caller-defined
-    (absolute strike, log-moneyness, offset from ATM, etc.).
+    if digital_payoff and factor_dep.get('Digital_Spread', 0.0) > 0:
+        eps = factor_dep['Digital_Spread']
+        strike_lo = strike * (1.0 - eps)
+        strike_hi = strike * (1.0 + eps)
+        mn_lo = -100.0 * (all_resets - strike_lo)
+        mn_hi = -100.0 * (all_resets - strike_hi)
+        vols_lo = utils.calc_tenor_cap_time_grid_vol_rate(
+            factor_dep['VolSurface'], mn_lo, expiry, tenor, shared)
+        vols_hi = utils.calc_tenor_cap_time_grid_vol_rate(
+            factor_dep['VolSurface'], mn_hi, expiry, tenor, shared)
+        payoff = digital_payoff * (
+            pricing_fn(all_resets, strike_lo, vols_lo, expiry, 1.0, call_or_put, shared, shift=shf.amount) -
+            pricing_fn(all_resets, strike_hi, vols_hi, expiry, 1.0, call_or_put, shared, shift=shf.amount)
+        ) / (2.0 * eps * strike)
+    else:
+        mn_option = -100.0 * (all_resets - strike)
+        vols = utils.calc_tenor_cap_time_grid_vol_rate(
+            factor_dep['VolSurface'], mn_option, expiry, tenor, shared)
+        payoff = pricing_fn(
+            all_resets, strike, vols, expiry, 1.0, call_or_put, shared,
+            cash_payoff=digital_payoff, shift=shf.amount)
 
-    Interpolation order: Maturity → Expiry → Moneyness.
-    Maturity and Expiry are always linear on volatility, with flat extrapolation outside
-    the surface range. Moneyness (strike) is linear by default; pass strike_interp='hermite'
-    to interpolate the strike dimension with a monotone cubic Hermite (PCHIP) spline on
-    volatility instead, still with flat extrapolation beyond the node range.
-    """
-
-    def __init__(self, vol_data: list, strike_interp: str = "linear") -> None:
-        if strike_interp not in ("linear", "hermite"):
-            raise ValueError(f"strike_interp must be 'linear' or 'hermite', got {strike_interp!r}")
-        self.strike_interp = strike_interp
-
-        arr = np.asarray(vol_data, dtype=np.float64)  # (N, 4): moneyness, expiry, maturity, vol
-        self._maturities = np.unique(arr[:, 2])
-
-        # {maturity: {expiry: (moneyness_nodes, vol_nodes, hermite_spline_or_None)}}
-        self._surface: dict = {}
-
-        for mat in self._maturities:
-            mat_rows = arr[np.isclose(arr[:, 2], mat)]
-            expiries = np.unique(mat_rows[:, 1])
-            self._surface[float(mat)] = {}
-            for exp in expiries:
-                exp_rows = mat_rows[np.isclose(mat_rows[:, 1], exp)]
-                order = np.argsort(exp_rows[:, 0])
-                m_nodes = exp_rows[order, 0]
-                v_nodes = exp_rows[order, 3]
-                hermite = (
-                    PchipInterpolator(m_nodes, v_nodes)
-                    if self.strike_interp == "hermite" and len(m_nodes) > 1
-                    else None
-                )
-                self._surface[float(mat)][float(exp)] = (m_nodes, v_nodes, hermite)
-
-    def _vol_at_expiry_maturity(self, moneyness: float, expiry: float, maturity: float) -> float:
-        m_nodes, v_nodes, hermite = self._surface[maturity][expiry]
-        if hermite is not None:
-            # Clamp to the node range first so we get flat extrapolation, matching linear mode,
-            # rather than the polynomial's own (potentially divergent) extrapolation.
-            m_clamped = np.clip(moneyness, m_nodes[0], m_nodes[-1])
-            return float(hermite(m_clamped))
-        return float(np.interp(moneyness, m_nodes, v_nodes))
-
-    def _slope_at_expiry_maturity(self, moneyness: float, expiry: float, maturity: float) -> float:
-        """∂vol/∂moneyness at one (expiry, maturity) node — the Hermite spline's derivative
-        in 'hermite' mode, or the local piecewise-linear segment slope in 'linear' mode. 0
-        outside the node range (flat extrapolation) or when there's only one strike (flat
-        vol, so slope is 0 regardless of mode)."""
-        m_nodes, v_nodes, hermite = self._surface[maturity][expiry]
-        if moneyness < m_nodes[0] or moneyness > m_nodes[-1]:
-            return 0.0
-        if hermite is not None:
-            return float(hermite.derivative()(moneyness))
-        if len(m_nodes) < 2:
-            return 0.0
-        idx = int(np.searchsorted(m_nodes, moneyness, side="right"))
-        idx = min(max(idx, 1), len(m_nodes) - 1)
-        m0, m1 = m_nodes[idx - 1], m_nodes[idx]
-        v0, v1 = v_nodes[idx - 1], v_nodes[idx]
-        return float((v1 - v0) / (m1 - m0))
-
-    def _vol_at_maturity(self, moneyness: float, swaption_expiry: float, maturity: float) -> float:
-        expiries = np.array(sorted(self._surface[maturity].keys()))
-        idx = int(np.searchsorted(expiries, swaption_expiry))
-
-        if idx == 0:
-            return self._vol_at_expiry_maturity(moneyness, float(expiries[0]), maturity)
-        if idx == len(expiries):
-            return self._vol_at_expiry_maturity(moneyness, float(expiries[-1]), maturity)
-
-        e2 = float(expiries[idx])
-        if np.isclose(swaption_expiry, e2):
-            return self._vol_at_expiry_maturity(moneyness, e2, maturity)
-
-        e1 = float(expiries[idx - 1])
-        v1 = self._vol_at_expiry_maturity(moneyness, e1, maturity)
-        v2 = self._vol_at_expiry_maturity(moneyness, e2, maturity)
-        w = (swaption_expiry - e1) / (e2 - e1)
-        return v1 + w * (v2 - v1)
-
-    def _slope_at_maturity(self, moneyness: float, swaption_expiry: float, maturity: float) -> float:
-        """Blends the per-expiry strike-slopes the same (linear) way _vol_at_maturity blends
-        vol values — valid because expiry interpolation is a linear (affine) combination
-        whose weights don't depend on moneyness, so differentiating w.r.t. moneyness commutes
-        with it."""
-        expiries = np.array(sorted(self._surface[maturity].keys()))
-        idx = int(np.searchsorted(expiries, swaption_expiry))
-
-        if idx == 0:
-            return self._slope_at_expiry_maturity(moneyness, float(expiries[0]), maturity)
-        if idx == len(expiries):
-            return self._slope_at_expiry_maturity(moneyness, float(expiries[-1]), maturity)
-
-        e2 = float(expiries[idx])
-        if np.isclose(swaption_expiry, e2):
-            return self._slope_at_expiry_maturity(moneyness, e2, maturity)
-
-        e1 = float(expiries[idx - 1])
-        s1 = self._slope_at_expiry_maturity(moneyness, e1, maturity)
-        s2 = self._slope_at_expiry_maturity(moneyness, e2, maturity)
-        w = (swaption_expiry - e1) / (e2 - e1)
-        return s1 + w * (s2 - s1)
-
-    def get_vol(self, moneyness: float, swaption_expiry: float, swap_maturity: float) -> float:
-        """Return interpolated swaption / cap / floor volatility.
-
-        Parameters
-        ----------
-        moneyness : float
-            Strike moneyness (convention matches the input data).
-        swaption_expiry : float
-            Time to swaption expiry in year fractions.
-        swap_maturity : float
-            Underlying swap (or caplet) maturity in year fractions.
-
-        Returns
-        -------
-        float
-            Implied volatility.
-        """
-        maturities = self._maturities
-        idx = int(np.searchsorted(maturities, swap_maturity))
-
-        if idx == 0:
-            return self._vol_at_maturity(moneyness, swaption_expiry, float(maturities[0]))
-        if idx == len(maturities):
-            return self._vol_at_maturity(moneyness, swaption_expiry, float(maturities[-1]))
-
-        m2 = float(maturities[idx])
-        if np.isclose(swap_maturity, m2):
-            return self._vol_at_maturity(moneyness, swaption_expiry, m2)
-
-        m1 = float(maturities[idx - 1])
-        v1 = self._vol_at_maturity(moneyness, swaption_expiry, m1)
-        v2 = self._vol_at_maturity(moneyness, swaption_expiry, m2)
-        w = (swap_maturity - m1) / (m2 - m1)
-        return v1 + w * (v2 - v1)
-
-    def get_slope(self, moneyness: float, swaption_expiry: float, swap_maturity: float) -> float:
-        """Return the instantaneous strike-dimension slope (∂vol/∂moneyness) at the given
-        point, blended across expiry/maturity the same linear way get_vol blends vol
-        values. Works in both strike_interp modes: the Hermite spline's derivative in
-        'hermite' mode, or the local piecewise-linear segment slope in 'linear' mode (a
-        step function in moneyness — constant between strike nodes, discontinuous at them).
-
-        Parameters
-        ----------
-        moneyness : float
-            Strike moneyness (convention matches the input data).
-        swaption_expiry : float
-            Time to swaption expiry in year fractions.
-        swap_maturity : float
-            Underlying swap (or caplet) maturity in year fractions.
-
-        Returns
-        -------
-        float
-            d(vol)/d(moneyness), i.e. the local slope of the strike smile.
-        """
-        maturities = self._maturities
-        idx = int(np.searchsorted(maturities, swap_maturity))
-
-        if idx == 0:
-            return self._slope_at_maturity(moneyness, swaption_expiry, float(maturities[0]))
-        if idx == len(maturities):
-            return self._slope_at_maturity(moneyness, swaption_expiry, float(maturities[-1]))
-
-        m2 = float(maturities[idx])
-        if np.isclose(swap_maturity, m2):
-            return self._slope_at_maturity(moneyness, swaption_expiry, m2)
-
-        m1 = float(maturities[idx - 1])
-        s1 = self._slope_at_maturity(moneyness, swaption_expiry, m1)
-        s2 = self._slope_at_maturity(moneyness, swaption_expiry, m2)
-        w = (swap_maturity - m1) / (m2 - m1)
-        return s1 + w * (s2 - s1)
+    daily_int = accrual.view(1, -1, 1) * payoff
+    all_int = torch.segment_reduce(daily_int, reduce="sum", lengths=lengths, axis=1)
+    margin = shared.one.new_zeros(lengths.shape[1])
+    return all_int, margin
