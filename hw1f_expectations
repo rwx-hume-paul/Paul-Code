@@ -1,1033 +1,121 @@
+"""
+.. deprecated::
+    CubePricer is superseded by :class:`pricing.exposure_engine.ExposureEngine`.
+    Retained for backward compatibility. Migrate to ExposureEngine + NettingSet
+    for the full XVA pipeline.
+"""
 from __future__ import annotations
 
-import math
-from datetime import date, timedelta
-from typing import Callable
+import warnings
+from datetime import date
+from pathlib import Path
 
 import numpy as np
-import QuantLib as ql
+import pandas as pd
 
-from instruments.components.cashflow_leg import CashflowLeg, LegType, SwapLeg  # noqa: F401 — re-export
-from instruments.components.schedule_config import ScheduleConfig
-from instruments.instrument import Instrument
-from market_data.risk_factor import CurveSlice, RiskFactorSlice
-from market_data.vol_surface import IRVol
-from market_data.yield_curve import YieldCurve
-from models.cashflow_pv import (
-    _build_overnight_tenors,
-    _calc_forward_rates,
-    _compute_forward_tenors,
-    apply_fixings,
-    compute_period_year_fractions,
-    filter_future_periods,
-)
-from utils.maths import norm_cdf
-from utils.ql_helpers import (
-    BUSINESS_CONVENTIONS,
-    from_ql_date,
-    generate_sub_periods,
-    to_ql_date,
-)
+from market_data.scenario_cube import ScenarioCube
 
 
-# ---------------------------------------------------------------------------
-# Constants (CAPFLOOR_PRICING.md)
-# ---------------------------------------------------------------------------
-
-# §2 — floor applied to F and K inside the Black log only.  Purely a
-# numerical-stability device; it never leaks into an intrinsic/payoff value.
-_RATE_FLOOR = 1e-5
-
-# §6 — forward-difference vega step, then rescaled by 0.01/0.0001 = 100x so the
-# reported number is "PV change for a 1% (100bp) parallel vol move".
-_VEGA_BUMP = 1e-4
-_VEGA_SCALE = 0.01
-
-# §4 — expiries (t and t_vol) are always measured on a plain ACT/365 basis,
-# independent of the leg's accrual day count.
-_YEAR_DAYS = 365.0
-
-
-# ---------------------------------------------------------------------------
-# Optionlet formulas — all vectorised over paths
-#
-# In every function below F and sigma are per-path arrays of shape (n_paths,)
-# while K, tau, t, shift, phi and z are scalars for the period being priced.
-# ---------------------------------------------------------------------------
-
-def _black_d1_d2(
-    Fs: np.ndarray,
-    Ks: float,
-    sigma: np.ndarray,
-    t: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """d1 / d2 on already-floored, already-shifted forward and strike (§5).
-
-    Paths with a non-positive vol are given a placeholder sigma of 1 so the
-    division is well defined; callers mask those paths out afterwards.
+class CubePricer:
     """
-    sqrt_t = math.sqrt(t)
-    safe_sigma = np.where(sigma > 0.0, sigma, 1.0)
-    d1 = (np.log(Fs / Ks) + 0.5 * safe_sigma ** 2 * t) / (safe_sigma * sqrt_t)
-    d2 = d1 - safe_sigma * sqrt_t
-    return d1, d2
-
-
-def _intrinsic_factor(
-    F: np.ndarray,
-    K: float,
-    tau: float,
-    phi: float,
-) -> np.ndarray:
-    """Vanilla discounted-intrinsic factor, tau * max(phi*(F-K), 0) (§3).
-
-    Uses the true, un-floored, un-shifted F and K.
-    """
-    return tau * np.maximum(phi * (F - K), 0.0)
-
-
-def _intrinsic_digital_factor(
-    F: np.ndarray,
-    K: float,
-    tau: float,
-    phi: float,
-    z: float,
-) -> np.ndarray:
-    """Digital intrinsic factor: tau*z when in the money, else 0 (§3)."""
-    return np.where(phi * (F - K) > 0.0, tau * z, 0.0)
-
-
-def _black_option_factor_given_vol(
-    F: np.ndarray,
-    K: float,
-    sigma: np.ndarray,
-    tau: float,
-    t: float,
-    shift: float,
-    phi: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Vanilla Black caplet/floorlet option factor (§5), plus d1 and d2.
-
-    Falls back to the discounted intrinsic value wherever t <= 0 (whole
-    period) or sigma <= 0 (per path), reporting NaN for d1/d2 there (§3).
-
-        OptionFactor = tau * (phi*Fs*N(phi*d1) - phi*Ks*N(phi*d2))
-    """
-    F = np.asarray(F, dtype=np.float64)
-    sigma = np.asarray(sigma, dtype=np.float64)
-
-    intrinsic = _intrinsic_factor(F, K, tau, phi)
-    nan = np.full(F.shape, np.nan)
-
-    if t <= 0.0:
-        return intrinsic, nan, nan
-
-    Fs = np.maximum(F, _RATE_FLOOR) + shift
-    Ks = max(K, _RATE_FLOOR) + shift
-
-    d1, d2 = _black_d1_d2(Fs, Ks, sigma, t)
-    black = tau * (phi * Fs * norm_cdf(phi * d1) - phi * Ks * norm_cdf(phi * d2))
-
-    degenerate = sigma <= 0.0
-    return (
-        np.where(degenerate, intrinsic, black),
-        np.where(degenerate, np.nan, d1),
-        np.where(degenerate, np.nan, d2),
-    )
-
-
-def _digital_option_factor_given_vol(
-    F: np.ndarray,
-    K: float,
-    sigma: np.ndarray,
-    tau: float,
-    t: float,
-    shift: float,
-    phi: float,
-    z: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Flat-vol digital caplet/floorlet factor tau*z*N(phi*d2) (§7.1).
-
-    Shares d1/d2 with the vanilla formula at the same F, K, sigma, t.
-    Degenerate cases fall back to the digital intrinsic value (§3).
-    """
-    F = np.asarray(F, dtype=np.float64)
-    sigma = np.asarray(sigma, dtype=np.float64)
-
-    intrinsic = _intrinsic_digital_factor(F, K, tau, phi, z)
-    nan = np.full(F.shape, np.nan)
-
-    if t <= 0.0:
-        return intrinsic, nan, nan
-
-    Fs = np.maximum(F, _RATE_FLOOR) + shift
-    Ks = max(K, _RATE_FLOOR) + shift
-
-    d1, d2 = _black_d1_d2(Fs, Ks, sigma, t)
-    digital = tau * z * norm_cdf(phi * d2)
-
-    degenerate = sigma <= 0.0
-    return (
-        np.where(degenerate, intrinsic, digital),
-        np.where(degenerate, np.nan, d1),
-        np.where(degenerate, np.nan, d2),
-    )
-
-
-def _black_value(
-    F: np.ndarray,
-    K: float,
-    sigma: np.ndarray,
-    t: float,
-    shift: float,
-    phi: float,
-) -> np.ndarray:
-    """Raw European value B(F, K, sigma, t, phi) at an arbitrary strike (§7.3).
-
-    Unlike :func:`_black_option_factor_given_vol` this carries no accrual
-    scaling — the caller applies tau once to the assembled call/put spread.
-    """
-    F = np.asarray(F, dtype=np.float64)
-    sigma = np.asarray(sigma, dtype=np.float64)
-
-    intrinsic = np.maximum(phi * (F - K), 0.0)
-    if t <= 0.0:
-        return intrinsic
-
-    Fs = np.maximum(F, _RATE_FLOOR) + shift
-    Ks = max(K, _RATE_FLOOR) + shift
-
-    d1, d2 = _black_d1_d2(Fs, Ks, sigma, t)
-    black = phi * (Fs * norm_cdf(phi * d1) - Ks * norm_cdf(phi * d2))
-
-    return np.where(sigma > 0.0, black, intrinsic)
-
-
-def _call_spread_digital_factor(
-    F: np.ndarray,
-    K: float,
-    sigma_lo: np.ndarray,
-    sigma_hi: np.ndarray,
-    tau: float,
-    t: float,
-    shift: float,
-    phi: float,
-    z: float,
-    eps: float,
-) -> np.ndarray:
-    """Digital factor by call/put-spread replication (§7.3).
-
-    Long a European at K-eps, short one at K+eps — same call/put type as the
-    cap/floor itself — each priced with its own vol looked up at its own
-    bumped strike, then scaled by z/(2*eps).  Dividing by the *full* 2*eps
-    distance is what makes this converge to §7.1 as eps -> 0.
-    """
-    b_lo = _black_value(F, K - eps, sigma_lo, t, shift, phi)
-    b_hi = _black_value(F, K + eps, sigma_hi, t, shift, phi)
-    return tau * (z / (2.0 * eps)) * phi * (b_lo - b_hi)
-
-
-# ---------------------------------------------------------------------------
-# CapFloor
-# ---------------------------------------------------------------------------
-
-class CapFloor(Instrument):
-    """Interest-rate cap or floor priced against a ScenarioCube.
-
-    Schedule generation, forward-rate projection and the reset/fixing
-    interface are shared with :class:`~instruments.ir_swap.IRSwap` — the cap
-    holds a single ``CashflowLeg`` and reuses the same ``ScheduleConfig`` and
-    the same forward-rate machinery from :mod:`models.cashflow_pv`, so a cap's
-    forwards agree with the equivalent swap leg's forwards by construction.
-
-    On top of that, each accrual period is valued as a standalone European
-    optionlet following ``CAPFLOOR_PRICING.md``.  Every period is priced
-    independently — there is no path dependency or cross-period correlation:
-
-        PV = sum_i  L * OptionFactor_i * DF(PayDate_i)
-
-    Supported modes
-    ---------------
-    - **IBOR** — one caplet/floorlet per accrual period on the simple forward
-      rate, fixing at the period start (``overnight_compounding=False``).
-    - **OIS post-aggregation** — one caplet/floorlet per accrual period on the
-      single compounded overnight rate for that period
-      (``overnight_compounding=True``).
-
-    OIS *daily* mode (one optionlet per business day) is not implemented.
-
-    A cap and a floor run through exactly the same code path, distinguished
-    only by ``phi = +1`` (cap) / ``phi = -1`` (floor) wherever a sign choice
-    appears — including inside the intrinsic fallback and the call/put-spread
-    replication.
+    Prices an instrument across all dates in a ScenarioCube.
 
     Parameters
     ----------
-    name : str
-        Trade identifier.
-    effective_date, maturity_date : date
-        First accrual start and final accrual end.
-    notional : float
-        Signed notional L: positive = long, negative = short.  Applied as a
-        plain multiplier at the very end; it never enters F, K, sigma or t.
-    strike : float
-        Cap/floor strike K (annualised, decimal).
-    leg : CashflowLeg
-        The floating leg the option is written on.  Must be
-        ``LegType.FLOATING`` with ``curve_name`` set.  ``frequency`` drives
-        the optionlet schedule; ``overnight_compounding`` selects OIS mode.
-    discount_curve_name : str
-        Scenario-cube factor name for the discount curve.
-    interpolator : callable
-        Interpolator factory used to build both the discount and projection
-        curves, matching the convention used by IRSwap.
-    vol_surface : IRVol
-        IR vol surface, queried at ``(moneyness, t_vol, cap_vol_maturity)``.
-    is_cap : bool
-        True for a cap (phi = +1), False for a floor (phi = -1).
-    cap_vol_maturity : float
-        The underlying-rate-tenor axis of the vol surface — a constant for the
-        whole cap/floor, *not* the deal's own maturity.  Defaults to 0.25.
-    forward_shift : float
-        Shift s for the shifted-lognormal Black model.  Defaults to 0.
-    moneyness_scale : float
-        Multiplier converting ``K - F`` into the surface's own moneyness
-        units: ``m = (K - F) * moneyness_scale``.  Defaults to 1.0, matching
-        :class:`~instruments.swaption.Swaption`, which queries the same
-        ``IRVol`` surfaces built by ``pull_4d_IR_vol_surface`` with a raw
-        ``K - F``.  Set to 100 for a surface whose moneyness axis is quoted
-        in percentage points (the convention in ``CAPFLOOR_PRICING.md`` §1).
-    digital : bool
-        When True each optionlet is a cash-or-nothing digital paying
-        ``digital_payoff * tau`` if it settles in the money (§7).
-    digital_payoff : float
-        The digital's rate-like payoff z.  Required when ``digital=True``.
-    use_skew_adjustment : bool
-        Digital skew correction via analytic vol slope x vega (§7.2).
-    use_call_spread_skew : bool
-        Digital skew correction via call/put-spread replication (§7.3).
-        Mutually exclusive with ``use_skew_adjustment``.
-    call_spread_width : float or None
-        The replication half-width eps.  Required when
-        ``use_call_spread_skew=True``.
-    less_1_day : bool
-        OIS mode only.  Pull the fixing date back one business day from the
-        period end to reflect the overnight publication lag (§4.2).
-    vol_decay : bool
-        OIS mode only.  Decay the Black-formula t as a compounding period
-        progresses while holding the vol-surface expiry at the true fixing
-        time (§4.3).  Never applies in IBOR mode.
-    current_ibor_rate : float or None
-        IBOR mode only.  The already-observed fixing for the caplet that is in
-        motion at the valuation date (§4.1).  When supplied it overwrites that
-        period's projected forward with this deterministic, already-known
-        rate.  The period's t is still computed the usual way and will
-        naturally be <= 0, so §3's intrinsic fallback applies automatically —
-        the override just supplies the correct F for that evaluation.
-    current_compounded_rate : float or None
-        OIS mode only.  The realized compounded rate over the elapsed part of
-        the in-motion period, annualised in the curve's own day-count
-        convention (§4.2).  The already-realized portion is blended with the
-        projected remainder rather than replacing the whole period's rate.
-    current_period_end_date : date or None
-        OIS mode only.  End of the compounding window that
-        ``current_compounded_rate`` is being projected towards.  Defaults to
-        the in-motion period's own schedule end date.
-
-    Notes
-    -----
-    Both in-motion inputs describe market state observed at *the deal's*
-    valuation date, so they are bound to whichever accrual period was in
-    motion then, and go inert once the simulation has rolled past it.  Later
-    simulation dates fall back to the ExposureEngine's own fixings, which are
-    the correct path-dependent quantities there.
-    schedule_config : ScheduleConfig or None
-        Full schedule configuration.  When omitted it is assembled from the
-        flat legacy parameters below.
-    include_sim_date_cashflows : bool
-        Include periods whose end date equals the valuation date.
+    scenario_cube : ScenarioCube
+        The simulated scenario cube containing factor paths.
+    instrument
+        The instrument to price. Must implement a pricing interface
+        that the calculate_mtm method can call per simulation date.
     """
 
-    def __init__(
-        self,
-        name: str,
-        effective_date: date,
-        maturity_date: date,
-        notional: float,
-        strike: float,
-        leg: CashflowLeg,
-        discount_curve_name: str,
-        interpolator: Callable,
-        vol_surface: IRVol,
-        is_cap: bool = True,
-        cap_vol_maturity: float = 0.25,
-        forward_shift: float = 0.0,
-        moneyness_scale: float = 1.0,
-        # digital caplets/floorlets
-        digital: bool = False,
-        digital_payoff: float = 0.0,
-        use_skew_adjustment: bool = False,
-        use_call_spread_skew: bool = False,
-        call_spread_width: float | None = None,
-        # OIS post-aggregation conventions
-        less_1_day: bool = True,
-        vol_decay: bool = False,
-        # in-motion overrides for the period live at the valuation date
-        current_ibor_rate: float | None = None,
-        current_compounded_rate: float | None = None,
-        current_period_end_date: date | None = None,
-        schedule_config: ScheduleConfig | None = None,
-        # legacy flat params — used only when schedule_config is not supplied
-        calendar: str = "ZAR",
-        business_convention: str = "ModifiedFollowing",
-        termination_business_convention: str = "ModifiedFollowing",
-        date_generation: str = "Backward",
-        day_count: str = "ACT/365",
-        curve_day_count: str = "ACT/365",
-        end_of_month: bool = False,
-        include_sim_date_cashflows: bool = False,
-    ):
-        super().__init__(name)
-
-        if leg.leg_type != LegType.FLOATING:
-            raise ValueError("CapFloor requires a FLOATING leg")
-        if use_skew_adjustment and use_call_spread_skew:
-            raise ValueError(
-                "use_skew_adjustment and use_call_spread_skew are mutually exclusive"
-            )
-        if digital and digital_payoff == 0.0:
-            raise ValueError("digital_payoff is required when digital=True")
-        if use_call_spread_skew and not (call_spread_width and call_spread_width > 0):
-            raise ValueError(
-                "call_spread_width must be > 0 when use_call_spread_skew=True"
-            )
-        if (use_skew_adjustment or use_call_spread_skew) and not digital:
-            raise ValueError("skew adjustments only apply when digital=True")
-        if current_ibor_rate is not None and leg.overnight_compounding:
-            raise ValueError(
-                "current_ibor_rate applies to IBOR legs; use "
-                "current_compounded_rate for an overnight-compounding leg"
-            )
-        if current_compounded_rate is not None and not leg.overnight_compounding:
-            raise ValueError(
-                "current_compounded_rate applies to overnight-compounding legs; "
-                "use current_ibor_rate for an IBOR leg"
-            )
-        if current_period_end_date is not None and current_compounded_rate is None:
-            raise ValueError(
-                "current_period_end_date is only meaningful alongside "
-                "current_compounded_rate"
-            )
-
-        self.effective_date = effective_date
-        self.maturity_date = maturity_date
-        self.notional = notional
-        self.strike = strike
-        self.leg = leg
-        self.discount_curve_name = discount_curve_name
-        self.interpolator = interpolator
-        self.vol_surface = vol_surface
-        self.is_cap = is_cap
-        self.cap_vol_maturity = cap_vol_maturity
-        self.forward_shift = forward_shift
-        self.moneyness_scale = moneyness_scale
-        self.digital = digital
-        self.digital_payoff = digital_payoff
-        self.use_skew_adjustment = use_skew_adjustment
-        self.use_call_spread_skew = use_call_spread_skew
-        self.call_spread_width = call_spread_width
-        self.less_1_day = less_1_day
-        self.vol_decay = vol_decay
-        self.current_ibor_rate = current_ibor_rate
-        self.current_compounded_rate = current_compounded_rate
-        self.current_period_end_date = current_period_end_date
-        self.include_sim_date_cashflows = include_sim_date_cashflows
-
-        # phi: the only thing that differs between cap and floor (§9)
-        self.phi = 1.0 if is_cap else -1.0
-
-        # Accrual period the in-motion overrides describe, resolved once
-        # against the deal's valuation date (see _resolve_in_motion_period).
-        self._in_motion_start: date | None = None
-        self._in_motion_end: date | None = None
-        self._in_motion_resolved = False
-
-        self.schedule_config = schedule_config or ScheduleConfig(
-            calendar=calendar,
-            business_convention=business_convention,
-            termination_business_convention=termination_business_convention,
-            date_generation=date_generation,
-            day_count=day_count,
-            curve_day_count=curve_day_count,
-            end_of_month=end_of_month,
+    def __init__(self, scenario_cube: ScenarioCube, instrument):
+        warnings.warn(
+            "CubePricer is deprecated. Use ExposureEngine + NettingSet instead.",
+            DeprecationWarning,
+            stacklevel=2,
         )
+        self.cube = scenario_cube
+        self.instrument = instrument
 
-        self._generate_schedules()
-
-    # ------------------------------------------------------------------
-    # schedule generation
-    # ------------------------------------------------------------------
-
-    def _generate_schedules(self):
-        """Build the optionlet schedule — one caplet/floorlet per period."""
-        self.schedule = self.schedule_config.build(
-            self.effective_date, self.maturity_date, self.leg.frequency,
-        )
-
-    # ------------------------------------------------------------------
-    # in-motion overrides (§4.1 / §4.2)
-    # ------------------------------------------------------------------
-
-    def precompute(self, market_states, dates) -> None:
-        """Bind the in-motion overrides to the deal's valuation date.
-
-        The first simulation date is the deal's valuation date, which is the
-        date ``current_ibor_rate`` / ``current_compounded_rate`` describe.
+    def calculate_mtm(self) -> dict[date, dict[int, float]]:
         """
-        if dates:
-            self._resolve_in_motion_period(dates[0])
+        Mark-to-market the instrument at each date in the scenario cube,
+        across all simulated paths.
 
-    def _resolve_in_motion_period(self, val_date: date) -> None:
-        """Identify the accrual period the in-motion overrides refer to.
+        Category B resets (floating periods whose reset date falls before
+        the current scenario date) are fixed using the forward curve from
+        the latest scenario date on or before the reset date.  Fixings
+        are cached so each reset is computed at most once.
 
-        Runs once, against the earliest date the instrument is priced at.  The
-        override belongs to the period that has already started but not yet
-        ended there — the same period §4.1 calls "the first period" once past
-        ones have been filtered out.  If nothing is in motion at that date the
-        overrides are simply inert, and they go inert again as soon as the
-        simulation rolls past the bound period.
+        Reset handling is delegated to :class:`ExposureEngine` rather than
+        reimplemented here, so both pricers agree.  That matters for
+        overnight-compounding (OIS) legs, whose resets are 5-tuples carrying
+        an ``is_overnight`` flag and whose CF_realized must be accumulated
+        across time steps rather than fixed once — logic this class never
+        had of its own.
+
+        Returns
+        -------
+        dict[date, dict[int, float]]
+            {simulation_date: {path_index: npv}}
         """
-        if self._in_motion_resolved:
-            return
-        self._in_motion_resolved = True
+        # Imported lazily to keep this deprecated module's import graph flat.
+        from pricing.exposure_engine import ExposureEngine
 
-        if self.current_ibor_rate is None and self.current_compounded_rate is None:
-            return
+        results: dict[date, dict[int, float]] = {}
 
-        for start, end, _ in self.schedule:
-            ends_after = end >= val_date if self.include_sim_date_cashflows else end > val_date
-            if start < val_date and ends_after:
-                self._in_motion_start = start
-                self._in_motion_end = end
-                return
+        fixings_helper = ExposureEngine(cube=self.cube)
+        fixing_cache: dict[tuple, np.ndarray] = {}
+        scenario_dates = list(self.cube.dates)
 
-    # ------------------------------------------------------------------
-    # reset / fixing interface  (mirrors IRSwap)
-    # ------------------------------------------------------------------
+        # Honour the Instrument.precompute hook, as ExposureEngine does.
+        all_states = [
+            self.cube.get_time_slice(t) for t in range(self.cube.n_times)
+        ]
+        self.instrument.precompute(all_states, scenario_dates)
 
-    def get_reset_dates(self) -> list[tuple]:
-        """Return reset tuples for the cap's floating leg.
+        for t_idx in range(self.cube.n_times):
+            sim_date = self.cube.dates[t_idx]
 
-        Standard IBOR legs return 4-tuples
-        ``(reset_date, curve_name, period_start, period_end)``; overnight
-        legs return 5-tuples with a trailing ``True`` so the ExposureEngine
-        routes them through the overnight compounding accumulator.
-        """
-        leg = self.leg
-        sc = self.schedule_config
-        resets: list[tuple] = []
-
-        if leg.overnight_compounding:
-            if leg.reset_frequency_months > 0:
-                for start, end, _ in self.schedule:
-                    for sub_start, sub_end, _ in generate_sub_periods(
-                        start, end, leg.reset_frequency_months,
-                        sc.ql_calendar, ql.ModifiedFollowing,
-                        sc.day_counter, direction="Backward",
-                    ):
-                        resets.append(
-                            (sub_start, leg.curve_name, sub_start, sub_end, True)
-                        )
-            else:
-                for start, end, _ in self.schedule:
-                    resets.append((start, leg.curve_name, start, end, True))
-        else:
-            # Each caplet fixes on its own period's rate at the period start.
-            for start, end, _ in self.schedule:
-                resets.append((start, leg.curve_name, start, end))
-
-        return resets
-
-    def compute_fixings(
-        self,
-        resets: list[tuple[date, str, date, date]],
-        time_slice: dict[str, RiskFactorSlice],
-        scenario_date: date,
-    ) -> dict[tuple[str, date], np.ndarray]:
-        """Compute forward rates for the given resets from an earlier scenario.
-
-        Identical to :meth:`IRSwap.compute_fixings` — honours
-        ``fixing_tenor_months`` and ``forward_business_convention``, splitting
-        the coupon day count (forward rate tau) from the curve day count
-        (discount-factor tenor).
-        """
-        fixings: dict[tuple[str, date], np.ndarray] = {}
-        ql_scenario = to_ql_date(scenario_date)
-        sc = self.schedule_config
-        leg = self.leg
-
-        for _reset_date, curve_name, p_start, p_end in resets:
-            fwd_slice: CurveSlice = time_slice[curve_name]
-            fwd_curve = YieldCurve(
-                year_fracs=fwd_slice.tenors,
-                rates=fwd_slice.values,
-                interpolator=self.interpolator,
+            fixings = fixings_helper._build_fixings(
+                self.instrument, sim_date, scenario_dates, fixing_cache,
             )
-            t_start = sc.curve_day_counter.yearFraction(
-                ql_scenario, to_ql_date(p_start),
+
+            market_state = all_states[t_idx]
+
+            path_npvs = self.instrument.scenario_npvs(
+                sim_date, market_state, fixings=fixings if fixings else None,
             )
-            ql_start = to_ql_date(p_start)
 
-            if leg.fixing_tenor_months is not None:
-                # Fixed-tenor index (e.g. JIBAR-3m): advance from period start
-                # by the index tenor regardless of the schedule period length.
-                fwd_conv = (
-                    BUSINESS_CONVENTIONS[leg.forward_business_convention]
-                    if leg.forward_business_convention
-                    else ql.ModifiedFollowing
-                )
-                ql_fwd_end = sc.ql_calendar.advance(
-                    ql_start,
-                    ql.Period(leg.fixing_tenor_months, ql.Months),
-                    fwd_conv,
-                )
-                t_end = sc.curve_day_counter.yearFraction(ql_scenario, ql_fwd_end)
-                fwd_tau = sc.day_counter.yearFraction(ql_start, ql_fwd_end)
+            results[sim_date] = {
+                p_idx: float(path_npvs[p_idx])
+                for p_idx in range(self.cube.n_paths)
+            }
 
-            elif leg.forward_business_convention is not None:
-                fwd_conv = BUSINESS_CONVENTIONS[leg.forward_business_convention]
-                ql_fwd_end = sc.ql_calendar.advance(
-                    ql_start,
-                    ql.Period(leg.frequency, ql.Months),
-                    fwd_conv,
-                )
-                t_end = sc.curve_day_counter.yearFraction(ql_scenario, ql_fwd_end)
-                fwd_tau = sc.day_counter.yearFraction(ql_start, ql_fwd_end)
+        return results
 
-            else:
-                ql_end = to_ql_date(p_end)
-                t_end = sc.curve_day_counter.yearFraction(ql_scenario, ql_end)
-                fwd_tau = sc.day_counter.yearFraction(ql_start, ql_end)
-
-            rate = fwd_curve.forward_rate(t_start, t_end, tau=fwd_tau)
-            fixings[(curve_name, p_start)] = rate
-
-        return fixings
-
-    def compute_cf_increment(
-        self,
-        curve_name: str,
-        t_j: date,
-        t_j1: date,
-        fix_slice: dict[str, RiskFactorSlice],
-    ) -> np.ndarray:
-        """Overnight compound factor for [t_j, t_j1] — see IRSwap.
-
-        Returns 1 / DF(t_j -> t_j1) per path, the single-period factor the
-        ExposureEngine multiplies into CF_realized for OIS legs.
+    def calculate_mtm_df(self) -> pd.DataFrame:
         """
-        fwd_slice: CurveSlice = fix_slice[curve_name]
-        fwd_curve = YieldCurve(
-            year_fracs=fwd_slice.tenors,
-            rates=fwd_slice.values,
-            interpolator=self.interpolator,
-        )
-        dt = float(self.schedule_config.curve_day_counter.yearFraction(
-            to_ql_date(t_j), to_ql_date(t_j1),
-        ))
-        return 1.0 / fwd_curve.discount_factor(dt)
+        Mark-to-market the instrument and return a DataFrame.
 
-    # ------------------------------------------------------------------
-    # forward rates and expiries
-    # ------------------------------------------------------------------
-
-    def _prev_business_day(self, d: date) -> date:
-        """The business day immediately before *d* on the leg's calendar."""
-        cal = self.schedule_config.ql_calendar
-        return from_ql_date(
-            cal.advance(to_ql_date(d), -1, ql.Days, ql.Preceding, False)
-        )
-
-    def _period_forward_rates(
-        self,
-        future: list[tuple[date, date, float]],
-        t_starts: np.ndarray,
-        t_ends: np.ndarray,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        n_paths: int,
-        fixings: dict[tuple[str, date], np.ndarray] | None,
-    ) -> np.ndarray:
-        """Per-period forward rate F, shape (n_paths, n_periods).
-
-        Reuses IRSwap's forward machinery so the cap sees exactly the rates
-        the equivalent swap leg would see.  ``CapFloor`` then treats each F as
-        a given input, as the specification does.
+        Rows are indexed by simulation date, columns are simulation
+        (path) numbers.
         """
-        leg = self.leg
-        sc = self.schedule_config
+        return pd.DataFrame(self.calculate_mtm()).T
 
-        fwd_slice: CurveSlice = market_state[leg.curve_name]
-        fwd_curve = YieldCurve(
-            year_fracs=fwd_slice.tenors,
-            rates=fwd_slice.values,
-            interpolator=self.interpolator,
-        )
-
-        fwd_t_ends, fwd_tau = _compute_forward_tenors(
-            future, leg, t_ends, val_date,
-            sc.day_counter, sc.curve_day_counter, sc.ql_calendar,
-        )
-
-        in_progress = t_starts[0] < 0
-
-        if leg.overnight_compounding:
-            if in_progress:
-                # §4.2 in-motion blending: the already-realized portion of the
-                # period is combined with the projected remainder, expressed
-                # annualised over the FULL period so the usual tau * F scaling
-                # downstream still reproduces the correct compounded factor.
-                #
-                #   F_blend = (f_elapsed * f_remaining - 1) / tau_total
-                period_start = future[0][0]
-                tau_total = float(fwd_tau[0])
-
-                if (
-                    self.current_compounded_rate is not None
-                    and period_start == self._in_motion_start
-                ):
-                    # User-supplied realized rate.  f_elapsed accrues r_cur
-                    # simply over the elapsed part of the period; f_remaining
-                    # compounds the forward curve daily over business days from
-                    # the valuation date to the current period end.
-                    cpe = self.current_period_end_date or self._in_motion_end
-                    tau_elapsed = float(sc.curve_day_counter.yearFraction(
-                        to_ql_date(period_start), to_ql_date(val_date),
-                    ))
-                    f_elapsed = 1.0 + self.current_compounded_rate * tau_elapsed
-                    f_remaining = fwd_curve.compound_factor(
-                        _build_overnight_tenors(
-                            val_date, cpe, val_date,
-                            sc.ql_calendar, sc.curve_day_counter,
-                        )
-                    )
-                    r_blend = (f_elapsed * f_remaining - 1.0) / tau_total
-                else:
-                    # Simulation path: fixings[(curve, start)] holds
-                    # CF_realized, the compound factor the engine has
-                    # accumulated so far — the same f_elapsed quantity — and
-                    # f_remaining is the risk-neutral 1/DF_fwd(end).
-                    key = (leg.curve_name, period_start)
-                    if fixings and key in fixings:
-                        cf_realized = np.asarray(fixings[key], dtype=np.float64)
-                        if cf_realized.ndim == 0:
-                            cf_realized = np.full(n_paths, float(cf_realized))
-                    else:
-                        cf_realized = np.ones(n_paths)
-
-                    df_end_fwd = fwd_curve.discount_factor(fwd_t_ends[0])
-                    r_blend = (cf_realized / df_end_fwd - 1.0) / tau_total
-
-                r_blend = np.broadcast_to(
-                    np.asarray(r_blend, dtype=np.float64), (n_paths,)
-                )
-                first_col = r_blend.reshape(n_paths, 1)
-
-                if len(future) > 1:
-                    rest = _calc_forward_rates(
-                        fwd_curve, future[1:], t_starts[1:], fwd_t_ends[1:],
-                        fwd_tau[1:], leg, val_date,
-                        sc.ql_calendar, sc.curve_day_counter,
-                    )
-                    rates = np.hstack([first_col, rest])
-                else:
-                    rates = first_col
-            else:
-                rates = _calc_forward_rates(
-                    fwd_curve, future, t_starts, fwd_t_ends, fwd_tau,
-                    leg, val_date, sc.ql_calendar, sc.curve_day_counter,
-                )
-        else:
-            # IBOR: project every period off the curve, including one already
-            # in motion — the curve interpolators flat-extrapolate below their
-            # first pillar, so a negative start tenor simply gives the
-            # curve-implied forward spanning the valuation date.  That is the
-            # schedule's own ForwardRate; realized fixings then override it
-            # where known, which is §4.1's in-motion override supplying the
-            # deterministic rate for the intrinsic evaluation that t <= 0
-            # forces anyway.
-            rates = _calc_forward_rates(
-                fwd_curve, future, t_starts, fwd_t_ends, fwd_tau,
-                leg, val_date, sc.ql_calendar, sc.curve_day_counter,
-            )
-            rates = apply_fixings(rates, future, leg.curve_name, fixings)
-
-            # §4.1 in-motion override.  Applied after apply_fixings so the
-            # user's observed rate wins over the engine's projected fixing for
-            # the one period it describes.
-            if (
-                self.current_ibor_rate is not None
-                and self._in_motion_start is not None
-            ):
-                for i, (start, _end, _accrual) in enumerate(future):
-                    if start == self._in_motion_start:
-                        rates[:, i] = self.current_ibor_rate
-                        break
-
-        return rates + leg.spread
-
-    def _period_expiries(
-        self,
-        val_date: date,
-        start: date,
-        end: date,
-        is_first: bool,
-    ) -> tuple[float, float]:
-        """Return (t, t_vol) for one period — the Black t and the lookup t (§4).
-
-        They coincide everywhere except under OIS vol decay, which shrinks the
-        Black-formula t while holding the vol-surface expiry at the true
-        fixing time.
+    def mtm_to_csv(self, filepath: str | Path) -> None:
         """
-        t_start = (start - val_date).days / _YEAR_DAYS
+        Write MTM results to CSV.
 
-        # §4.1 IBOR: the caplet fixes at the start of its accrual period.
-        if not self.leg.overnight_compounding:
-            return t_start, t_start
+        Output format::
 
-        # §4.2 OIS post-aggregation: the last fixing drives optionality, pulled
-        # back one business day for the overnight publication lag.
-        e_prime = self._prev_business_day(end) if self.less_1_day else end
-        t_vol = (e_prime - val_date).days / _YEAR_DAYS
+            date, 0, 1, ...
+            2025-07-28, 12345.67, 13456.78, ...
+            2026-07-28, 11234.56, 12345.67, ...
 
-        if not self.vol_decay:
-            return t_vol, t_vol
-
-        # §4.3 vol decay.  Only the Black-formula t decays; t_vol stays at the
-        # undecayed fixing time so the surface is still queried where the rate
-        # actually fixes.
-        #
-        # For the first period, when an in-motion compounded rate has been
-        # supplied and that period has started, the general formula (anchored
-        # on the valuation date) misbehaves and is replaced by a version
-        # anchored on the period start, measured to the current period end.
-        in_motion = (
-            is_first
-            and start <= val_date
-            and self.current_compounded_rate is not None
-            and start == self._in_motion_start
-        )
-        if in_motion:
-            cpe = self.current_period_end_date or self._in_motion_end
-            e_dblprime = self._prev_business_day(cpe) if self.less_1_day else cpe
-            d_fix = (e_dblprime - start).days / _YEAR_DAYS
-            d_elapsed = (
-                (val_date - timedelta(days=1)) - start
-            ).days / _YEAR_DAYS
-            return d_fix / 3.0 - d_elapsed, t_vol
-
-        return t_vol - (2.0 / 3.0) * (t_vol - t_start), t_vol
-
-    # ------------------------------------------------------------------
-    # pricing
-    # ------------------------------------------------------------------
-
-    def _evaluate(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict[tuple[str, date], np.ndarray] | None = None,
-        with_details: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray, list[dict]]:
-        """Price every live optionlet and aggregate (§8).
-
-        Returns ``(pv, vega, details)`` where pv and vega are ``(n_paths,)``
-        arrays and details is a per-period diagnostic record list (empty
-        unless *with_details*).
+        Parameters
+        ----------
+        filepath : path for the output CSV file.
         """
-        # Standalone fallback: when precompute() has not run, the first date
-        # this is priced at is taken as the deal's valuation date.
-        self._resolve_in_motion_period(val_date)
-
-        disc_slice: CurveSlice = market_state[self.discount_curve_name]
-        n_paths = disc_slice.values.shape[0]
-        zeros = np.zeros(n_paths)
-
-        if val_date > self.maturity_date:
-            return zeros, zeros.copy(), []
-
-        future = filter_future_periods(
-            self.schedule, val_date, self.include_sim_date_cashflows,
-        )
-        if not future:
-            return zeros, zeros.copy(), []
-
-        discount_curve = YieldCurve(
-            year_fracs=disc_slice.tenors,
-            rates=disc_slice.values,
-            interpolator=self.interpolator,
-        )
-
-        sc = self.schedule_config
-        t_starts, t_ends, accruals = compute_period_year_fractions(
-            future, val_date, sc.curve_day_counter,
-        )
-
-        # DF to each period's pay date, (n_paths, n_periods)
-        dfs = discount_curve.discount_factor(t_ends)
-
-        forwards = self._period_forward_rates(
-            future, t_starts, t_ends, val_date, market_state, n_paths, fixings,
-        )
-
-        K = self.strike
-        phi = self.phi
-        L = self.notional
-        shift = self.forward_shift
-        z = self.digital_payoff
-        vol_maturity = self.cap_vol_maturity
-
-        pv = np.zeros(n_paths)
-        vega = np.zeros(n_paths)
-        details: list[dict] = []
-
-        for i, (start, end, _) in enumerate(future):
-            F = forwards[:, i]
-            df = dfs[:, i]
-            tau = float(accruals[i])
-
-            t, t_vol = self._period_expiries(val_date, start, end, i == 0)
-
-            # §9 — moneyness uses the same formula and sign for cap and floor
-            moneyness = (K - F) * self.moneyness_scale
-            sigma = np.asarray(
-                self.vol_surface.get_vol(moneyness, t_vol, vol_maturity),
-                dtype=np.float64,
-            )
-            if sigma.ndim == 0:
-                sigma = np.full(n_paths, float(sigma))
-
-            # §6 — vega always comes from the VANILLA formula, even for a
-            # digital caplet, because §7.2's skew correction needs exactly
-            # that quantity.  Forward difference, then rescaled to a 1% move.
-            vanilla, d1, d2 = _black_option_factor_given_vol(
-                F, K, sigma, tau, t, shift, phi,
-            )
-            vanilla_bumped, _, _ = _black_option_factor_given_vol(
-                F, K, sigma + _VEGA_BUMP, tau, t, shift, phi,
-            )
-            vega_factor = (vanilla_bumped - vanilla) / _VEGA_BUMP * _VEGA_SCALE
-            vega_pv = L * vega_factor * df
-
-            if not self.digital:
-                factor = vanilla
-
-            elif self.use_call_spread_skew:
-                # §7.3 — replaces the whole digital valuation.  Each leg of the
-                # spread is queried at its own bumped strike's moneyness.
-                eps = float(self.call_spread_width)
-                m_lo = (K - eps - F) * self.moneyness_scale
-                m_hi = (K + eps - F) * self.moneyness_scale
-                sigma_lo = np.asarray(
-                    self.vol_surface.get_vol(m_lo, t_vol, vol_maturity),
-                    dtype=np.float64,
-                )
-                sigma_hi = np.asarray(
-                    self.vol_surface.get_vol(m_hi, t_vol, vol_maturity),
-                    dtype=np.float64,
-                )
-                factor = _call_spread_digital_factor(
-                    F, K, sigma_lo, sigma_hi, tau, t, shift, phi, z, eps,
-                )
-                # Two strikes and two vols — no single d1/d2 pair to report.
-                d1 = np.full(n_paths, np.nan)
-                d2 = np.full(n_paths, np.nan)
-
-            else:
-                factor, d1, d2 = _digital_option_factor_given_vol(
-                    F, K, sigma, tau, t, shift, phi, z,
-                )
-
-            pv_i = L * factor * df
-
-            if self.digital and self.use_skew_adjustment:
-                # §7.2 — Digital(K) = Digital_flat(K) - Vega_raw * dsigma/dK.
-                # get_slope returns dsigma/dm, and m = (K-F)*scale, so
-                # dsigma/dK = slope * scale; Vega_raw = Vega_PV * 100.
-                slope = np.asarray(
-                    self.vol_surface.get_slope(moneyness, t_vol, vol_maturity),
-                    dtype=np.float64,
-                )
-                skew_adjustment = (
-                    slope * self.moneyness_scale * vega_pv * z * 100.0
-                )
-                # Subtract for a cap, add for a floor.
-                pv_i = pv_i - phi * skew_adjustment
-
-            pv += pv_i
-            vega += vega_pv
-
-            if with_details:
-                details.append({
-                    "StartDate": start,
-                    "EndDate": end,
-                    "PayDate": end,
-                    "YearFrac": tau,
-                    "ForwardRate": float(np.mean(F)),
-                    "Moneyness": float(np.mean(moneyness)),
-                    "t_exp": t,
-                    "VolExpiry": t_vol,
-                    "Vol": float(np.mean(sigma)),
-                    "d1": float(np.mean(d1)),
-                    "d2": float(np.mean(d2)),
-                    "OptionFactor": float(np.mean(factor)),
-                    "DF": float(np.mean(df)),
-                    "PV": float(np.mean(pv_i)),
-                    "Vega": float(np.mean(vega_pv)),
-                })
-
-        return pv, vega, details
-
-    def scenario_npvs(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict[tuple[str, date], np.ndarray] | None = None,
-        rng: np.random.Generator | None = None,
-    ) -> np.ndarray:
-        pv, _, _ = self._evaluate(val_date, market_state, fixings)
-        return pv
-
-    def scenario_vegas(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict[tuple[str, date], np.ndarray] | None = None,
-    ) -> np.ndarray:
-        """Total vega per path — PV change for a 1% (100bp) parallel vol move.
-
-        The sum of the per-optionlet vegas of §6/§8, always computed from the
-        vanilla Black formula regardless of ``digital``.
-        """
-        _, vega, _ = self._evaluate(val_date, market_state, fixings)
-        return vega
-
-    def caplet_breakdown(
-        self,
-        val_date: date,
-        market_state: dict[str, RiskFactorSlice],
-        fixings: dict[tuple[str, date], np.ndarray] | None = None,
-    ):
-        """Per-optionlet diagnostics as a DataFrame, averaged across paths.
-
-        One row per live accrual period with the inputs and intermediate
-        quantities of §4–§7 — useful for reconciling against another engine's
-        schedule output.  Path-varying quantities are reported as the mean
-        across paths, so with a single-path market state the values are exact.
-        """
-        import pandas as pd
-
-        _, _, details = self._evaluate(
-            val_date, market_state, fixings, with_details=True,
-        )
-        return pd.DataFrame(details)
+        self.calculate_mtm_df().to_csv(filepath, index_label="date")
