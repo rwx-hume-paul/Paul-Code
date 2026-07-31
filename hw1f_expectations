@@ -1,106 +1,65 @@
 
-    # ------------------------------------------------------------------
-    # Strike slope  ∂σ/∂moneyness  (used by digital cap/floor skew adj.)
-    # ------------------------------------------------------------------
 
-    def _slope_at_expiry_maturity(
-        self,
-        moneyness: float | np.ndarray,
-        expiry: float,
-        maturity: float,
-    ) -> np.ndarray:
-        """Local segment slope ∂σ/∂moneyness at an exact (expiry, maturity).
+def generate_sub_periods(
+    start: date,
+    end: date,
+    freq_months: int,
+    calendar: ql.Calendar,
+    convention: int,
+    day_counter: ql.DayCounter,
+    direction: str = "Backward",
+) -> list[tuple[date, date, float]]:
+    """Split a single accrual period into sub-periods of *freq_months*.
 
-        Since the moneyness axis is interpolated linearly, the slope is the
-        gradient of the bracketing segment — a step function, constant
-        between surface nodes and discontinuous at them.  Flat extrapolation
-        outside the node range implies a slope of zero there.
-        """
-        m_nodes, v_nodes = self._surface[maturity][expiry]
-        m = np.asarray(moneyness, dtype=float)
+    Used for sub-period resets on floating legs (``reset_frequency_months``)
+    and sub-period compounding on fixed legs (``compounding_period_months``).
 
-        if m_nodes.size < 2:
-            return np.zeros_like(m)
+    Parameters
+    ----------
+    start, end : date
+        Endpoints of the payment period to be split.
+    freq_months : int
+        Sub-period length in months.  When ``<= 0``, or when it is at least
+        as long as the period itself, the period is returned unsplit.
+    calendar : ql.Calendar
+        Calendar used to adjust the generated intermediate dates.
+    convention : int
+        Business day convention applied to intermediate dates.
+    day_counter : ql.DayCounter
+        Convention used for each sub-period's accrual fraction.
+    direction : {"Backward", "Forward"}
+        ``"Backward"`` anchors the roll on *end* so any short stub lands at
+        the front of the period; ``"Forward"`` anchors on *start* so the
+        stub lands at the back.
 
-        # Index of the segment [m_nodes[i], m_nodes[i+1]] containing m
-        i = np.clip(
-            np.searchsorted(m_nodes, m, side="right") - 1, 0, m_nodes.size - 2,
-        )
-        seg = (v_nodes[i + 1] - v_nodes[i]) / (m_nodes[i + 1] - m_nodes[i])
+    Returns
+    -------
+    list of (sub_start, sub_end, accrual_fraction)
+        Contiguous sub-periods spanning ``[start, end]``.
+    """
+    if freq_months <= 0 or start >= end:
+        accrual = day_counter.yearFraction(to_ql_date(start), to_ql_date(end))
+        return [(start, end, accrual)]
 
-        outside = (m < m_nodes[0]) | (m > m_nodes[-1])
-        return np.where(outside, 0.0, seg)
+    ql_schedule = ql.Schedule(
+        to_ql_date(start),
+        to_ql_date(end),
+        ql.Period(freq_months, ql.Months),
+        calendar,
+        convention,
+        convention,
+        DATE_GENERATION[direction],
+        False,
+    )
 
-    def _slope_at_maturity(
-        self,
-        moneyness: float | np.ndarray,
-        swaption_expiry: float,
-        maturity: float,
-    ) -> np.ndarray:
-        """Linear interp in swaption_expiry of the moneyness slope."""
-        expiries = np.array(sorted(self._surface[maturity].keys()))
-        idx = int(np.searchsorted(expiries, swaption_expiry))
+    subs: list[tuple[date, date, float]] = []
+    for i in range(1, len(ql_schedule)):
+        sub_start = ql_schedule[i - 1]
+        sub_end = ql_schedule[i]
+        subs.append((
+            from_ql_date(sub_start),
+            from_ql_date(sub_end),
+            day_counter.yearFraction(sub_start, sub_end),
+        ))
 
-        if idx == 0:
-            return self._slope_at_expiry_maturity(moneyness, float(expiries[0]), maturity)
-        if idx == len(expiries):
-            return self._slope_at_expiry_maturity(moneyness, float(expiries[-1]), maturity)
-
-        e2 = float(expiries[idx])
-        if np.isclose(swaption_expiry, e2):
-            return self._slope_at_expiry_maturity(moneyness, e2, maturity)
-
-        e1 = float(expiries[idx - 1])
-        s1 = self._slope_at_expiry_maturity(moneyness, e1, maturity)
-        s2 = self._slope_at_expiry_maturity(moneyness, e2, maturity)
-        w = (swaption_expiry - e1) / (e2 - e1)
-        return s1 + w * (s2 - s1)
-
-    def get_slope(
-        self,
-        moneyness: float | np.ndarray,
-        swaption_expiry: float,
-        swap_maturity: float,
-    ) -> float | np.ndarray:
-        """Return ∂σ/∂moneyness at the queried surface point.
-
-        The derivative of :meth:`get_vol` with respect to its moneyness
-        argument.  Because both the expiry and maturity axes are blended
-        linearly, the slope of the blend equals the blend of the slopes, so
-        this follows exactly the same maturity → expiry → moneyness
-        traversal as :meth:`get_vol`.
-
-        Units follow the input data: the returned slope is per unit of
-        whatever moneyness convention the surface was built with.
-
-        Parameters
-        ----------
-        moneyness : float or array
-            Strike moneyness (convention matches the input data).
-        swaption_expiry : float
-            Time to expiry in year fractions.
-        swap_maturity : float
-            Underlying swap (or caplet) maturity in year fractions.
-
-        Returns
-        -------
-        float or np.ndarray
-            Slope, same shape as *moneyness*.
-        """
-        maturities = self._maturities
-        idx = int(np.searchsorted(maturities, swap_maturity))
-
-        if idx == 0:
-            return self._slope_at_maturity(moneyness, swaption_expiry, float(maturities[0]))
-        if idx == len(maturities):
-            return self._slope_at_maturity(moneyness, swaption_expiry, float(maturities[-1]))
-
-        m2 = float(maturities[idx])
-        if np.isclose(swap_maturity, m2):
-            return self._slope_at_maturity(moneyness, swaption_expiry, m2)
-
-        m1 = float(maturities[idx - 1])
-        s1 = self._slope_at_maturity(moneyness, swaption_expiry, m1)
-        s2 = self._slope_at_maturity(moneyness, swaption_expiry, m2)
-        w = (swap_maturity - m1) / (m2 - m1)
-        return s1 + w * (s2 - s1)
+    return subs
