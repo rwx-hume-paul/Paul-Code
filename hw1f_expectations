@@ -1,67 +1,138 @@
+    # ------------------------------------------------------------------
+    # Fixing cache (Category B resets)
+    # ------------------------------------------------------------------
 
-    def compound_factor(self, t_schedule: np.ndarray) -> np.ndarray:
-        """Cumulative overnight compound factor over a business-day schedule.
-
-        Multiplies the one-day forward factors DF(t_i)/DF(t_{i+1}) across
-        consecutive business days.  That product telescopes exactly to
-        DF(t_first) / DF(t_last), so only the endpoints are evaluated — the
-        interior days still matter because *t_schedule* has already snapped
-        them to business days (a Friday entry is followed by Monday, so the
-        three-day weekend accrual is captured automatically).
-
-        Parameters
-        ----------
-        t_schedule : np.ndarray, shape (n_days,)
-            Ascending year fractions to each business day in the compounding
-            window, as built by ``_build_overnight_tenors``.
-
-        Returns
-        -------
-        np.ndarray, shape (n_paths,)
-            Compound factor per path.  A schedule with fewer than two entries
-            spans no overnight interval and returns 1 (the empty product).
-        """
-        t_schedule = np.asarray(t_schedule, dtype=np.float64)
-        n_paths = self.rates.shape[0]
-
-        if t_schedule.size < 2:
-            return np.ones(n_paths)
-
-        df_first = self.discount_factor(float(t_schedule[0]))
-        df_last = self.discount_factor(float(t_schedule[-1]))
-        return df_first / df_last
-
-    def forward_compounded_overnight_rate(
+    def _build_fixings(
         self,
-        t_schedule_start: np.ndarray,
-        t_schedule_end: np.ndarray,
-        tau: float | np.ndarray,
-    ) -> np.ndarray:
-        """Forward compounded overnight rate for one accrual period.
+        instrument,
+        sim_date: date,
+        scenario_dates: list[date],
+        fixing_cache: dict,
+        all_states: list[dict] | None = None,
+    ) -> dict[tuple, np.ndarray]:
+        """Return fixings for all floating resets before sim_date.
 
-        Both schedules are measured from the same origin (the valuation
-        date), giving the cumulative compound factors CF(origin -> t_start)
-        and CF(origin -> t_end).  The period's compounded rate is then
+        LIBOR-style resets
+        ------------------
+        Computed once at the reset date via ``compute_fixings`` and cached
+        for all later simulation dates (the rate never changes).
 
-            R = (CF_end / CF_start - 1) / tau
+        OIS-style resets (is_overnight=True)
+        -------------------------------------
+        CF_realized must grow at each simulation step because overnight
+        compounding is path-dependent and accumulates across time.  The
+        engine calls ``compute_cf_increment`` to advance the running
+        product by one time step using the scenario curve at the START of
+        that step (the forward-looking convention: use the curve you see
+        at t_j to compound from t_j to t_{j+1}).
 
-        For the first period, where the period start coincides with the
-        origin, CF_start is the empty product 1 and this reduces to the spot
-        compounded overnight rate.
-
-        Parameters
-        ----------
-        t_schedule_start : np.ndarray
-            Business-day year fractions from the origin to the period start.
-        t_schedule_end : np.ndarray
-            Business-day year fractions from the origin to the period end.
-        tau : float or np.ndarray
-            Accrual fraction in the coupon's own day-count convention.
-
-        Returns
-        -------
-        np.ndarray, shape (n_paths,)
+        ``fixing_cache`` stores two keys per OIS period:
+          ``(inst_id, curve_name, p_start, '_ois_cf')``   – running CF
+          ``(inst_id, curve_name, p_start, '_ois_last')``  – last processed date
         """
-        cf_start = self.compound_factor(t_schedule_start)
-        cf_end = self.compound_factor(t_schedule_end)
-        return (cf_end / cf_start - 1.0) / np.asarray(tau)
+        if not hasattr(instrument, "get_reset_dates"):
+            return {}
+
+        has_libor = hasattr(instrument, "compute_fixings")
+        has_ois = hasattr(instrument, "compute_cf_increment")
+        if not has_libor and not has_ois:
+            return {}
+
+        fixings: dict[tuple, np.ndarray] = {}
+        inst_id = id(instrument)
+        n_paths = self.cube.n_paths
+
+        for reset_tuple in instrument.get_reset_dates():
+            reset_date, curve_name, p_start, p_end = reset_tuple[:4]
+            is_overnight = reset_tuple[4] if len(reset_tuple) > 4 else False
+
+            # OIS: only accumulate after period start (nothing to compound on day 0).
+            # LIBOR: also process on the reset date itself — the rate is observable
+            # today and must be cached so apply_fixings uses it consistently.
+            if is_overnight and reset_date >= sim_date:
+                continue
+            if not is_overnight and reset_date > sim_date:
+                continue
+
+            if is_overnight and has_ois:
+                # ----------------------------------------------------------
+                # OIS: accumulate CF_realized incrementally.
+                # At each call we advance the running product by the steps
+                # from the last processed date up to sim_date.
+                # ----------------------------------------------------------
+                cf_key = (inst_id, curve_name, p_start, "_ois_cf")
+                last_key = (inst_id, curve_name, p_start, "_ois_last")
+
+                prev_date = fixing_cache.get(last_key)
+                cf_realized = fixing_cache.get(cf_key)
+
+                # Determine which scenario dates still need to be processed.
+                if prev_date is None:
+                    # First time entering this period.
+                    cf_realized = np.ones(n_paths)
+                    step_starts = [
+                        t for t in scenario_dates
+                        if p_start <= t < sim_date
+                    ]
+                else:
+                    # Incremental: advance from prev_date to sim_date.
+                    step_starts = [
+                        t for t in scenario_dates
+                        if prev_date <= t < sim_date
+                    ]
+
+                for j, t_j in enumerate(step_starts):
+                    t_j1 = (
+                        step_starts[j + 1]
+                        if j + 1 < len(step_starts)
+                        else sim_date
+                    )
+                    t_j_idx = max(
+                        0, bisect_right(scenario_dates, t_j) - 1
+                    )
+                    fix_slice = {
+                        **self.static_data.factors,
+                        **self.cube.get_time_slice(t_j_idx),
+                    }
+                    cf_realized = (
+                        cf_realized
+                        * instrument.compute_cf_increment(
+                            curve_name, t_j, t_j1, fix_slice
+                        )
+                    )
+
+                fixing_cache[cf_key] = cf_realized
+                fixing_cache[last_key] = sim_date
+                fixings[(curve_name, p_start)] = cf_realized
+
+            elif has_libor:
+                # ----------------------------------------------------------
+                # LIBOR: compute rate once at reset_date, cache forever.
+                # ----------------------------------------------------------
+                cache_key = (inst_id, curve_name, p_start)
+                if cache_key not in fixing_cache:
+                    fix_t_idx = max(
+                        0, bisect_right(scenario_dates, reset_date) - 1
+                    )
+                    fix_slice = (
+                        all_states[fix_t_idx]
+                        if all_states is not None
+                        else {**self.static_data.factors,
+                              **self.cube.get_time_slice(fix_t_idx)}
+                    )
+                    computed = instrument.compute_fixings(
+                        [(reset_date, curve_name, p_start, p_end)],
+                        fix_slice,
+                        reset_date,
+                    )
+                    fixing_cache.update(
+                        {(inst_id, k[0], k[1]): v
+                         for k, v in computed.items()}
+                    )
+                fixings[(curve_name, p_start)] = fixing_cache[cache_key]
+
+        return fixings
+
+    # ------------------------------------------------------------------
+    # CPI fixings accumulator (inflation instruments)
+    # ------------------------------------------------------------------
