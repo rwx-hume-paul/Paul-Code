@@ -1,65 +1,67 @@
 
+    def compound_factor(self, t_schedule: np.ndarray) -> np.ndarray:
+        """Cumulative overnight compound factor over a business-day schedule.
 
-def generate_sub_periods(
-    start: date,
-    end: date,
-    freq_months: int,
-    calendar: ql.Calendar,
-    convention: int,
-    day_counter: ql.DayCounter,
-    direction: str = "Backward",
-) -> list[tuple[date, date, float]]:
-    """Split a single accrual period into sub-periods of *freq_months*.
+        Multiplies the one-day forward factors DF(t_i)/DF(t_{i+1}) across
+        consecutive business days.  That product telescopes exactly to
+        DF(t_first) / DF(t_last), so only the endpoints are evaluated — the
+        interior days still matter because *t_schedule* has already snapped
+        them to business days (a Friday entry is followed by Monday, so the
+        three-day weekend accrual is captured automatically).
 
-    Used for sub-period resets on floating legs (``reset_frequency_months``)
-    and sub-period compounding on fixed legs (``compounding_period_months``).
+        Parameters
+        ----------
+        t_schedule : np.ndarray, shape (n_days,)
+            Ascending year fractions to each business day in the compounding
+            window, as built by ``_build_overnight_tenors``.
 
-    Parameters
-    ----------
-    start, end : date
-        Endpoints of the payment period to be split.
-    freq_months : int
-        Sub-period length in months.  When ``<= 0``, or when it is at least
-        as long as the period itself, the period is returned unsplit.
-    calendar : ql.Calendar
-        Calendar used to adjust the generated intermediate dates.
-    convention : int
-        Business day convention applied to intermediate dates.
-    day_counter : ql.DayCounter
-        Convention used for each sub-period's accrual fraction.
-    direction : {"Backward", "Forward"}
-        ``"Backward"`` anchors the roll on *end* so any short stub lands at
-        the front of the period; ``"Forward"`` anchors on *start* so the
-        stub lands at the back.
+        Returns
+        -------
+        np.ndarray, shape (n_paths,)
+            Compound factor per path.  A schedule with fewer than two entries
+            spans no overnight interval and returns 1 (the empty product).
+        """
+        t_schedule = np.asarray(t_schedule, dtype=np.float64)
+        n_paths = self.rates.shape[0]
 
-    Returns
-    -------
-    list of (sub_start, sub_end, accrual_fraction)
-        Contiguous sub-periods spanning ``[start, end]``.
-    """
-    if freq_months <= 0 or start >= end:
-        accrual = day_counter.yearFraction(to_ql_date(start), to_ql_date(end))
-        return [(start, end, accrual)]
+        if t_schedule.size < 2:
+            return np.ones(n_paths)
 
-    ql_schedule = ql.Schedule(
-        to_ql_date(start),
-        to_ql_date(end),
-        ql.Period(freq_months, ql.Months),
-        calendar,
-        convention,
-        convention,
-        DATE_GENERATION[direction],
-        False,
-    )
+        df_first = self.discount_factor(float(t_schedule[0]))
+        df_last = self.discount_factor(float(t_schedule[-1]))
+        return df_first / df_last
 
-    subs: list[tuple[date, date, float]] = []
-    for i in range(1, len(ql_schedule)):
-        sub_start = ql_schedule[i - 1]
-        sub_end = ql_schedule[i]
-        subs.append((
-            from_ql_date(sub_start),
-            from_ql_date(sub_end),
-            day_counter.yearFraction(sub_start, sub_end),
-        ))
+    def forward_compounded_overnight_rate(
+        self,
+        t_schedule_start: np.ndarray,
+        t_schedule_end: np.ndarray,
+        tau: float | np.ndarray,
+    ) -> np.ndarray:
+        """Forward compounded overnight rate for one accrual period.
 
-    return subs
+        Both schedules are measured from the same origin (the valuation
+        date), giving the cumulative compound factors CF(origin -> t_start)
+        and CF(origin -> t_end).  The period's compounded rate is then
+
+            R = (CF_end / CF_start - 1) / tau
+
+        For the first period, where the period start coincides with the
+        origin, CF_start is the empty product 1 and this reduces to the spot
+        compounded overnight rate.
+
+        Parameters
+        ----------
+        t_schedule_start : np.ndarray
+            Business-day year fractions from the origin to the period start.
+        t_schedule_end : np.ndarray
+            Business-day year fractions from the origin to the period end.
+        tau : float or np.ndarray
+            Accrual fraction in the coupon's own day-count convention.
+
+        Returns
+        -------
+        np.ndarray, shape (n_paths,)
+        """
+        cf_start = self.compound_factor(t_schedule_start)
+        cf_end = self.compound_factor(t_schedule_end)
+        return (cf_end / cf_start - 1.0) / np.asarray(tau)
