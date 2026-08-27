@@ -1,400 +1,55 @@
 
-    # ------------------------------------------------------------------
-    # Pricing on expanded grid
-    # ------------------------------------------------------------------
 
-    def _price_expanded_grid(
+# ---------------------------------------------------------------------------
+# FRA
+# ---------------------------------------------------------------------------
+
+class FRA(IRSwap):
+    """Forward rate agreement — an :class:`IRSwap` that settles on its start date.
+
+    Construction, schedule generation, forward projection and the reset /
+    fixing interface are inherited unchanged, so a FRA is specified exactly
+    like the equivalent single-period swap: ``effective_date`` is the start of
+    the contract period (and the settlement date), ``maturity_date`` is the end
+    of the period the rate accrues over.
+
+    The single difference is settlement timing.  A FRA pays at the START of its
+    contract period rather than in arrears at the end, so the trade is
+    extinguished on ``effective_date`` and carries no exposure after it —
+    ``scenario_npvs`` returns zero from the day after settlement onwards, in
+    the same way :class:`IRSwap` returns zero past ``maturity_date``.
+
+    Valuation up to and including the settlement date is unchanged.  The amount
+    actually paid on ``effective_date`` is the period cashflow discounted back
+    from the period end at the realized rate,
+
+        N (L - K) tau / (1 + L tau)
+
+    and since ``1 / (1 + L tau)`` is the discount factor over the period, its
+    present value is what discounting ``N (L - K) tau`` from the period end
+    already gives.  Settling early therefore moves *when* the exposure stops
+    without changing the PV before then.
+
+    Note that this equivalence is exact only when the forecast and discount
+    curves coincide.  Under multi-curve discounting (e.g. a JIBAR-3M forecast
+    leg discounted on ZAR-SWAP) market FRAs discount the settlement at the
+    realized FRA rate itself while this class discounts on the discount curve,
+    leaving a small basis between the two.  That matches how the equivalent
+    swaplet is valued here, which is the intended behaviour.
+    """
+
+    def scenario_npvs(
         self,
-        netting_set: NettingSet,
-        expanded_dates: list[date],
-        scenario_dates: list[date],
-    ) -> np.ndarray:
-        """Price all trades at each date in the expanded grid.
-
-        For dates that exist in the scenario cube, use the cube's market
-        state directly.  For intermediate dates (offset dates not in the
-        cube), interpolate between the two nearest scenario dates.
-
-        Returns
-        -------
-        mtm_all : shape (n_paths, n_expanded)
-        """
-        n_paths = self.cube.n_paths
-        n_expanded = len(expanded_dates)
-        mtm_all = np.zeros((n_paths, n_expanded))
-        cf_all = np.zeros((n_paths, n_expanded))
-
-        # Pre-build all cube time-slice states
-        cube_states = [
-            {**self.static_data.factors, **self.cube.get_time_slice(t)}
-            for t in range(self.cube.n_times)
-        ]
-        # Map scenario dates to cube indices
-        scenario_set = {d: i for i, d in enumerate(scenario_dates)}
-
-        # Precompute instruments using the cube states
-        for trade in netting_set.trades:
-            trade.instrument.precompute(cube_states, scenario_dates)
-
-        fixing_cache: dict[tuple, np.ndarray] = {}
-
-        for exp_idx, exp_date in enumerate(expanded_dates):
-            if exp_date in scenario_set:
-                # Exact match — use cube state directly
-                cube_idx = scenario_set[exp_date]
-                market_state = cube_states[cube_idx]
-            else:
-                # Interpolate between nearest scenario dates
-                market_state = self._interpolate_market_state(
-                    exp_date, scenario_dates, cube_states
-                )
-
-            for trade in netting_set.trades:
-                fixings = self._build_fixings(
-                    trade.instrument, exp_date, scenario_dates, fixing_cache
-                )
-                pricing_state = self._pricing_market_state(
-                    market_state, trade.instrument, netting_set
-                )
-                npv = trade.instrument.scenario_npvs(
-                    exp_date, pricing_state, fixings=fixings or None
-                )
-                mtm_all[:, exp_idx] += trade.notional_scale * npv
-
-                if hasattr(trade.instrument, 'scenario_cashflows'):
-                    cf = trade.instrument.scenario_cashflows(
-                        exp_date, pricing_state, fixings=fixings or None
-                    )
-                    if isinstance(cf, np.ndarray) and cf.shape == npv.shape:
-                        cf_all[:, exp_idx] += trade.notional_scale * cf
-
-        return mtm_all, cf_all
-
-    def _interpolate_market_state(
-        self,
-        target_date: date,
-        scenario_dates: list[date],
-        cube_states: list[dict[str, RiskFactorSlice]],
-    ) -> dict[str, RiskFactorSlice]:
-        """Linearly interpolate a market state for a date between scenario dates.
-
-        Uses the nearest scenario date as a first-order approximation
-        (piecewise-constant interpolation). A full implementation would
-        interpolate each risk factor's values using alpha weights.
-        """
-        idx = bisect_right(scenario_dates, target_date) - 1
-        idx = max(0, min(idx, len(scenario_dates) - 1))
-        return cube_states[idx]
-
-    # ------------------------------------------------------------------
-    # Collateral balance simulation (stateful B(t))
-    # ------------------------------------------------------------------
-
-    def _simulate_collateral_balance(
-        self,
-        mtm_paths: np.ndarray,
-        dates: list[date],
-        csa: CSA,
-        n_paths: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Simulate the path-dependent collateral balance B(t) and portfolio value S(t).
-
-        B(t) is the number of units of the collateral portfolio currently
-        posted.  It evolves through margin calls based on the CSA terms.
-
-        S(t) is the value of one unit of the collateral portfolio (for
-        single-currency cash collateral: (1 - haircut) * amount).
-
-        Returns
-        -------
-        bt : shape (n_paths, n_dates)
-            Collateral balance in portfolio units per path and date.
-            Negative = collateral posted to us (reduces our exposure).
-        st : shape (n_paths, n_dates)
-            Collateral portfolio value per unit at each date.
-            For single-currency ZAR cash, this is a scalar broadcast.
-        """
-        n_times = len(dates)
-        bt = np.zeros((n_paths, n_times))
-        st = np.ones((n_paths, n_times))
-
-        # Compute S(t) from cash collateral entries
-        # For ZAR-only cash, S(t) = sum((1 - haircut) * amount) per entry
-        # (no FX conversion needed when everything is in ZAR)
-        collateral_entries = csa.effective_cash_collateral
-        s_value = sum(
-            (1.0 - entry.haircut) * entry.amount
-            for entry in collateral_entries
-        )
-        st[:] = s_value
-
-        # Initial balance: convert opening_balance to portfolio units
-        if s_value > 0:
-            bt[:, 0] = csa.opening_balance / s_value
-        else:
-            bt[:, 0] = 0.0
-
-        # Build collateral call mask
-        call_mask = self._build_call_mask(dates, csa.collateral_call_frequency)
-
-        # CSA thresholds (in agreement currency = ZAR for now)
-        h = csa.vm_threshold           # received threshold
-        g = -csa.vm_threshold_post     # posted threshold (negative convention)
-        ia = csa.independent_amount
-        min_recv = csa.mta
-        min_post = csa.mta_post
-
-        for t_idx in range(1, n_times):
-            # Default: carry forward previous balance
-            bt[:, t_idx] = bt[:, t_idx - 1]
-
-            if not call_mask[t_idx]:
-                continue
-
-            v_t = mtm_paths[:, t_idx]
-            s_t = st[:, t_idx]
-
-            # Target collateral amount (in base currency)
-            # A(t) = IA + (V - H) * (V > H) + (V - G) * (V < G)
-            a_t = ia + np.where(v_t > h, v_t - h, 0.0) + np.where(v_t < g, v_t - g, 0.0)
-
-            # Target balance in portfolio units
-            bt_target = np.where(s_t > 0, a_t / s_t, 0.0)
-
-            # Minimum transfer triggers (in portfolio units)
-            min_recv_units = np.where(s_t > 0, min_recv / s_t, 0.0)
-            min_post_units = np.where(s_t > 0, min_post / s_t, 0.0)
-
-            # Only update if change exceeds MTA
-            change = bt_target - bt[:, t_idx - 1]
-            # Increasing collateral (change > 0): we receive more → gate by min_recv
-            # Decreasing collateral (change < 0): we return / post → gate by min_post
-            should_update = (
-                (change > min_recv_units) |    # receive trigger
-                (change < -min_post_units)     # post/return trigger
-            )
-            bt[:, t_idx] = np.where(should_update, bt_target, bt[:, t_idx - 1])
-
-        return bt, st
-
-    def _build_call_mask(
-        self, dates: list[date], frequency_days: int
-    ) -> list[bool]:
-        """Build a mask indicating which dates are collateral call dates.
-
-        The first date is always a call date. Subsequent dates are call
-        dates if they are a multiple of ``frequency_days`` from the first.
-        If frequency_days is 1, every date is a call date.
-        """
-        if not dates:
-            return []
-        mask = [True]  # first date is always a call date
-        base = dates[0]
-        for d in dates[1:]:
-            days_since = (d - base).days
-            mask.append(days_since % frequency_days == 0)
-        return mask
-
-    # ------------------------------------------------------------------
-    # Cashflow accumulation
-    # ------------------------------------------------------------------
-
-    def _accumulate_cashflows(
-        self,
-        cf_all: np.ndarray,
-        n_paths: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Accumulate actual instrument settlement cashflows.
-
-        Instruments report their settlement cashflows via
-        ``scenario_cashflows()``.  Positive = received, negative = paid.
-
-        Convention: ``cumulative_recv[t]`` contains the sum of received
-        cashflows from dates 0 to t-1 (exclusive of t).  This matches
-        riskflow's convention so that ``C(ts, te) = cumr[te] - cumr[ts]``
-        captures cashflows that occurred *between* ts and te, without
-        double-counting a cashflow at te that is already reflected in
-        V(te).
-
-        Returns
-        -------
-        cumulative_recv : shape (n_paths, n_dates) -- cumulative received
-        cumulative_paid : shape (n_paths, n_dates) -- cumulative paid (positive)
-        """
-        n_times = cf_all.shape[1]
-        cumulative_recv = np.zeros((n_paths, n_times))
-        cumulative_paid = np.zeros((n_paths, n_times))
-
-        for t in range(1, n_times):
-            # Cashflow at t-1 goes into cumulative at t (exclusive-of-t convention)
-            recv = np.maximum(cf_all[:, t - 1], 0.0)
-            paid = np.maximum(-cf_all[:, t - 1], 0.0)
-            cumulative_recv[:, t] = cumulative_recv[:, t - 1] + recv
-            cumulative_paid[:, t] = cumulative_paid[:, t - 1] + paid
-
-        return cumulative_recv, cumulative_paid
-
-    def _closeout_cashflows(
-        self,
-        cumulative_recv: np.ndarray,
-        cumulative_paid: np.ndarray,
-        ts_idx: int,
-        tl_idx: int,
-        te_idx: int,
-        mode: CashSettlementRiskMode,
-    ) -> np.ndarray:
-        """Compute net cashflows C(ts, te) for the closeout window.
-
-        Three modes control the treatment:
-            RECEIVED_ONLY — both legs over [ts, te]
-            PAID_ONLY — both legs over [tl, te]
-            ALL — received over [ts, te], paid over [tl, te] (most conservative)
-
-        Returns
-        -------
-        shape (n_paths,) — net cashflow contribution to exposure
-        """
-        if mode is CashSettlementRiskMode.RECEIVED_ONLY:
-            recv = cumulative_recv[:, te_idx] - cumulative_recv[:, ts_idx]
-            paid = cumulative_paid[:, te_idx] - cumulative_paid[:, ts_idx]
-        elif mode is CashSettlementRiskMode.PAID_ONLY:
-            recv = cumulative_recv[:, te_idx] - cumulative_recv[:, tl_idx]
-            paid = cumulative_paid[:, te_idx] - cumulative_paid[:, tl_idx]
-        elif mode is CashSettlementRiskMode.ALL:
-            recv = cumulative_recv[:, te_idx] - cumulative_recv[:, ts_idx]
-            paid = cumulative_paid[:, te_idx] - cumulative_paid[:, tl_idx]
-        else:
-            recv = np.zeros(cumulative_recv.shape[0])
-            paid = np.zeros(cumulative_recv.shape[0])
-
-        return recv - paid
-
-    # ------------------------------------------------------------------
-    # Simple collateral simulation (legacy path, no closeout offsets)
-    # ------------------------------------------------------------------
-
-    def _simulate_collateral(
-        self,
-        mtm_paths: np.ndarray,
-        dates: list[date],
-        csa: CSA,
-    ) -> np.ndarray:
-        """Simulate the pathwise collateral account with MPOR lookback.
-
-        At each simulation date ``t`` the collateral available at default
-        is based on the last margin call, which used the MTM at
-        ``t - mpor_days``. The latest simulation date on or before that
-        lookback date is used.
-
-        This method uses stateful balance tracking with MTA enforcement
-        when the CSA specifies non-zero MTA values.
-        """
-        n_paths, n_times = mtm_paths.shape
-        collateral = np.zeros((n_paths, n_times))
-        mpor = timedelta(days=csa.mpor_days)
-
-        # Build call mask for the simple path
-        call_mask = self._build_call_mask(dates, csa.collateral_call_frequency)
-
-        # CSA thresholds
-        h = csa.vm_threshold
-        g_neg = -csa.vm_threshold_post
-        ia = csa.independent_amount
-        min_recv = csa.mta
-        min_post = csa.mta_post
-
-        # Collateral portfolio value (constant for single-currency cash)
-        collateral_entries = csa.effective_cash_collateral
-        s_value = sum(
-            (1.0 - entry.haircut) * entry.amount
-            for entry in collateral_entries
-        )
-
-        # Track the collateral balance in portfolio units
-        bt_prev = np.full(n_paths, csa.opening_balance / s_value if s_value > 0 else 0.0)
-
-        for t_idx, sim_date in enumerate(dates):
-            lookback_date = sim_date - mpor
-            lag_idx = bisect_right(dates, lookback_date) - 1
-            if lag_idx < 0:
-                continue
-
-            lagged_mtm = mtm_paths[:, lag_idx]
-
-            if call_mask[t_idx]:
-                # Target collateral amount
-                a_t = ia + np.where(lagged_mtm > h, lagged_mtm - h, 0.0) + np.where(lagged_mtm < g_neg, lagged_mtm - g_neg, 0.0)
-                bt_target = np.where(s_value > 0, a_t / s_value, 0.0)
-
-                # MTA enforcement
-                change = bt_target - bt_prev
-                min_recv_units = min_recv / s_value if s_value > 0 else 0.0
-                min_post_units = min_post / s_value if s_value > 0 else 0.0
-                # Increasing collateral (change > 0): receive → gate by min_recv
-                # Decreasing collateral (change < 0): post/return → gate by min_post
-                should_update = (
-                    (change > min_recv_units) |
-                    (change < -min_post_units)
-                )
-
-                # When MTA is zero, always update (backward compatible)
-                if min_recv == 0.0 and min_post == 0.0:
-                    should_update = np.ones(n_paths, dtype=bool)
-
-                bt_current = np.where(should_update, bt_target, bt_prev)
-            else:
-                bt_current = bt_prev.copy()
-
-            collateral[:, t_idx] = bt_current * s_value
-            im = self._compute_im(n_paths, csa)
-            collateral[:, t_idx] += im
-            bt_prev = bt_current
-
-        return collateral
-
-    def _compute_im(self, n_paths: int, csa: CSA) -> np.ndarray:
-        """Return the pathwise IM array for a single time step."""
-        if csa.im_method is InitialMarginMethod.NONE:
-            return np.zeros(n_paths)
-        if csa.im_method is InitialMarginMethod.FIXED:
-            return np.full(n_paths, csa.im_amount)
-        if csa.im_method is InitialMarginMethod.SCHEDULE:
-            raise NotImplementedError(
-                "Schedule-based IM requires notional and regulatory factor data "
-                "from the instrument — not yet implemented."
-            )
-        if csa.im_method is InitialMarginMethod.SIMM:
-            raise NotImplementedError("SIMM is not yet implemented.")
-        raise ValueError(f"Unknown IM method: {csa.im_method}")
-
-    # ------------------------------------------------------------------
-    # Close-out market state
-    # ------------------------------------------------------------------
-
-    def _pricing_market_state(
-        self,
+        val_date: date,
         market_state: dict[str, RiskFactorSlice],
-        instrument,
-        netting_set: NettingSet,
-    ) -> dict[str, RiskFactorSlice]:
-        """Return the market state to use for pricing under the close-out method.
+        fixings: dict[tuple[str, date], np.ndarray] | None = None,
+        rng: np.random.Generator | None = None,
+    ) -> np.ndarray:
+        # Settled on the effective date — no exposure beyond it.  The
+        # settlement date itself still values, mirroring IRSwap's treatment of
+        # its own maturity date.
+        if val_date > self.effective_date:
+            disc_slice: CurveSlice = market_state[self.discount_curve_name]
+            return np.zeros(disc_slice.values.shape[0])
 
-        For STANDARD close-out this is the unmodified market state.
-        For FORWARD close-out the instrument's discount curve is replaced
-        with the risky (spread-adjusted) curve from the CSA, approximating
-        the CVA-adjusted replacement value.
-        """
-        csa = netting_set.csa
-        if csa is None or csa.close_out_method is CloseOutMethod.STANDARD:
-            return market_state
-
-        risky_name = csa.risky_curve_name
-        if risky_name is None or risky_name not in market_state:
-            return market_state
-
-        disc_name = getattr(instrument, "discount_curve_name", None)
-        if disc_name is None or disc_name == risky_name:
-            return market_state
-
-        # Replace the discount curve slice with the risky curve slice
-        return {**market_state, disc_name: market_state[risky_name]}
+        return super().scenario_npvs(val_date, market_state, fixings, rng)
