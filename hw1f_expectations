@@ -15,6 +15,12 @@ from models.equity_pv import black76_euro_option
 from utils.ql_helpers import to_ql_date
 
 
+# Floor applied to the SHIFTED forward/strike so the Black log stays defined
+# when the supplied shift is too small to lift them above zero.  Purely a
+# numerical guard — with an adequate shift it never binds.
+_RATE_FLOOR = 1e-5
+
+
 class Swaption(Instrument):
     """European swaption valued with Black-76.
 
@@ -59,6 +65,16 @@ class Swaption(Instrument):
         True for a payer swaption (holder pays fixed).  Default True.
     settlement_style : str
         "cash" or "physical".  Default "cash".
+    forward_shift : float
+        Displacement s for the shifted-lognormal ("shifted Black-76") model.
+        Both the forward and the strike are raised by s inside the option
+        formula, so a negative par swap rate can still be modelled
+        lognormally.  Defaults to 0.0 (standard Black-76).
+
+        The shift is confined to the option formula.  Moneyness is
+        ``(K + s) - (F + s) = K - F`` and the exercise test ``F > K`` is
+        likewise unchanged by a common displacement, so the vol lookup, the
+        exercise decision and the annuity all see the un-shifted values.
     """
 
     def __init__(
@@ -70,11 +86,16 @@ class Swaption(Instrument):
         vol_surface: IRVol,
         is_payer: bool = True,
         settlement_style: str = "cash",
+        forward_shift: float = 0.0,
     ):
         super().__init__(name)
         if settlement_style.lower() not in ("cash", "physical"):
             raise ValueError(
                 f"settlement_style must be 'cash' or 'physical', got {settlement_style!r}"
+            )
+        if forward_shift < 0.0:
+            raise ValueError(
+                f"forward_shift must be non-negative, got {forward_shift!r}"
             )
 
         self.underlying_swap = underlying_swap
@@ -83,6 +104,7 @@ class Swaption(Instrument):
         self.vol_surface = vol_surface
         self.is_payer = is_payer
         self.settlement_style = settlement_style.lower()
+        self.forward_shift = forward_shift
 
         # Populated by precompute() for physical settlement; None until then
         self._exercise_mask: np.ndarray | None = None
@@ -335,10 +357,21 @@ class Swaption(Instrument):
         if vol.ndim == 0:
             vol = np.full(n_paths, float(vol))
 
+        # Shifted-Black76: displace forward and strike by the same amount.
+        # The displacement cancels in the intrinsic value (F+s) - (K+s) = F - K,
+        # so the degenerate T <= 0 / zero-vol branches are unaffected; only
+        # log((F+s)/(K+s)) in d1/d2 sees the shift.
+        shift = self.forward_shift
+        if shift:
+            forward_black = np.maximum(F + shift, _RATE_FLOOR)
+            strike_black = max(self.strike + shift, _RATE_FLOOR)
+        else:
+            forward_black, strike_black = F, self.strike
+
         # Black-76 × notional × annuity
         option_price = black76_euro_option(
-            forward=F,
-            strike=self.strike,
+            forward=forward_black,
+            strike=strike_black,
             vol=vol,
             df=df_expiry,
             T=T,
