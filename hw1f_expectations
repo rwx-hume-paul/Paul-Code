@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from datetime import date, timedelta
+from datetime import date
 from typing import Callable
 
 import numpy as np
@@ -362,7 +362,7 @@ class CapFloor(Instrument):
         is_cap: bool = True,
         cap_vol_maturity: float = 0.25,
         forward_shift: float = 0.0,
-        moneyness_scale: float = 1.0,
+        moneyness_scale: float = 100.0,
         # digital caplets/floorlets
         digital: bool = False,
         digital_payoff: float = 0.0,
@@ -808,7 +808,6 @@ class CapFloor(Instrument):
         val_date: date,
         start: date,
         end: date,
-        is_first: bool,
     ) -> tuple[float, float]:
         """Return (t, t_vol) for one period — the Black t and the lookup t (§4).
 
@@ -834,26 +833,48 @@ class CapFloor(Instrument):
         # undecayed fixing time so the surface is still queried where the rate
         # actually fixes.
         #
-        # For the first period, when an in-motion compounded rate has been
-        # supplied and that period has started, the general formula (anchored
-        # on the valuation date) misbehaves and is replaced by a version
-        # anchored on the period start, measured to the current period end.
-        in_motion = (
-            is_first
-            and start <= val_date
-            and self.current_compounded_rate is not None
+        # A compounded OIS coupon is an arithmetic average of the overnight
+        # rates set across its accrual period, so the variance that is still
+        # to be resolved is the standard "one third" averaging result rather
+        # than the plain time to the fixing date.  With delta_i the accrual
+        # length and t the valuation date:
+        #
+        #   t <= t_i :  t_exp = (t_i - t) + delta_i / 3
+        #   t >  t_i :  t_exp = (t_{i+1} - t)^3 / (3 * delta_i^2)
+        #
+        # The first case is the familiar "start plus a third of the period".
+        # The second applies to ANY valuation date falling inside the period —
+        # whether that is the deal's own in-motion coupon or simply a future
+        # simulation date that lands mid-period — because only the remaining
+        # stub [t, t_{i+1}] is still random, and it carries weight 1/delta_i
+        # inside the average.  The two agree at t = t_i (both give delta_i/3)
+        # and the cubic decays smoothly to exactly zero at t = t_{i+1}.
+        #
+        # The compounding window the user supplied for the bound in-motion
+        # coupon wins over the schedule's own end when the two differ.
+        e_var = end
+        if (
+            self.current_period_end_date is not None
+            and self._in_motion_start is not None
             and start == self._in_motion_start
-        )
-        if in_motion:
-            cpe = self.current_period_end_date or self._in_motion_end
-            e_dblprime = self._prev_business_day(cpe) if self.less_1_day else cpe
-            d_fix = (e_dblprime - start).days / _YEAR_DAYS
-            d_elapsed = (
-                (val_date - timedelta(days=1)) - start
-            ).days / _YEAR_DAYS
-            return d_fix / 3.0 - d_elapsed, t_vol
+        ):
+            e_var = self.current_period_end_date
+        e_var = self._prev_business_day(e_var) if self.less_1_day else e_var
 
-        return t_vol - (2.0 / 3.0) * (t_vol - t_start), t_vol
+        delta = (e_var - start).days / _YEAR_DAYS
+        if delta <= 0.0:
+            # Degenerate zero-length period — nothing to average over.
+            return t_vol, t_vol
+
+        if val_date <= start:
+            # Period has not begun: the whole accrual is still to be averaged.
+            return (e_var - val_date).days / _YEAR_DAYS - delta + delta / 3.0, t_vol
+
+        # Period in progress: only the remaining stub carries variance.  Past
+        # the fixing date rho <= 0, giving t_exp = 0 so §3's intrinsic
+        # fallback takes over.
+        rho = max((e_var - val_date).days / _YEAR_DAYS, 0.0)
+        return rho ** 3 / (3.0 * delta ** 2), t_vol
 
     # ------------------------------------------------------------------
     # pricing
@@ -925,7 +946,7 @@ class CapFloor(Instrument):
             df = dfs[:, i]
             tau = float(accruals[i])
 
-            t, t_vol = self._period_expiries(val_date, start, end, i == 0)
+            t, t_vol = self._period_expiries(val_date, start, end)
 
             # §9 — moneyness uses the same formula and sign for cap and floor
             moneyness = (K - F) * self.moneyness_scale
