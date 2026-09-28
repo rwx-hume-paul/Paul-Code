@@ -1,18 +1,5 @@
+dd = calc.netting_sets.sub_structures[0].dependencies[0].Factor_dep   # adjust index to your cap
+R  = dd['Cashflows'].Resets
 import pandas as pd
-
-scen  = sorted(pd.Timestamp(d).date() for d in calc.time_grid.scenario_dates)
-cubed = set(cube.dates)
-
-missing = [d for d in scen if d not in cubed]
-extra   = [d for d in cube.dates if d not in set(scen)]
-print("in RiskFlow, not in cube:", missing)
-print("in cube, not in RiskFlow:", extra)
-
-# where it was lost — per-factor dates BEFORE the cube intersects them
-for name, df in curve_dfs.items():
-    cols = list(df.columns)[2:]          # cols are: tenor, scenario, <date>, <date>, ...
-    print(f"{name:14} {len(cols)} dates   first={cols[0]}  last={cols[-1]}")
-
-for factor_dates in self._factor_dates.values():
-    common = set(factor_dates) if common is None else common & set(factor_dates)
-common_dates = tuple(d for d in first_dates if d in common)
+print(pd.DataFrame(R[:10], columns=[
+    "Time_Grid","Reset_Day","Scenario","Start_Day","End_Day","Weight","Value","Accrual"]))
