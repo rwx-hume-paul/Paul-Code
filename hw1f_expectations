@@ -1,5 +1,32 @@
-dd = calc.netting_sets.sub_structures[0].dependencies[0].Factor_dep   # adjust index to your cap
-R  = dd['Cashflows'].Resets
+```python
 import pandas as pd
-print(pd.DataFrame(R[:10], columns=[
-    "Time_Grid","Reset_Day","Scenario","Start_Day","End_Day","Weight","Value","Accrual"]))
+
+def walk(node, depth=0, path="root"):
+    """Yield (path, DealDataType) for every deal, at any nesting depth."""
+    for i, dep in enumerate(getattr(node, "dependencies", []) or []):
+        yield f"{path}.dependencies[{i}]", dep
+    for j, sub in enumerate(getattr(node, "sub_structures", []) or []):
+        p = f"{path}.sub_structures[{j}]"
+        yield p + ".obj", sub.obj                  # the netting-set container itself
+        yield from walk(sub, depth + 1, p)
+
+root = calc.netting_sets
+
+# 1) see the tree
+for p, dep in walk(root):
+    obj = dep.Instrument.field.get("Object", "?")
+    ref = dep.Instrument.field.get("Reference", "")
+    has_cf = "Cashflows" in (dep.Factor_dep or {})
+    print(f"{p:<48} {obj:<32} {ref:<20} cashflows={has_cf}")
+
+# 2) grab the first deal that actually carries resets
+cap = next(d for _, d in walk(root)
+           if (d.Factor_dep or {}).get("Cashflows") is not None
+           and getattr(d.Factor_dep["Cashflows"], "Resets", None) is not None)
+
+R = cap.Factor_dep["Cashflows"].Resets
+print(pd.DataFrame(
+    R[:10],
+    columns=["Time_Grid", "Reset_Day", "Scenario",
+             "Start_Day", "End_Day", "Weight", "Value", "Accrual"]))
+```
