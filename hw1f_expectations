@@ -1,15 +1,22 @@
-import pandas as pd
+from datetime import date, timedelta
+import QuantLib as ql
+from utils.ql_helpers import to_ql_date
 
-for p, dep in walk(root):
-    fd = dep.Factor_dep or {}
-    cf = fd.get("Cashflows")
-    R = getattr(cf, "Resets", None)
-    if R is None:
-        continue
-    ref = dep.Instrument.field.get("Reference", "")
-    fwd = dep.Instrument.field.get("Forecast_Rate", "")
-    span = R[:, 4] - R[:, 3]                       # End_Day - Start_Day
-    print(f"{ref:<24} fwd={str(fwd):<28} "
-          f"compound={fd.get('CompoundingMethod')} avg={fd.get('AveragingMethod')} "
-          f"n_resets={len(R):<6} span={sorted(set(span.astype(int)))[:4]} "
-          f"weight={R[0,5]:.6f} accrual={R[0,7]:.6f}")
+BASE = date(2026, 6, 22)
+
+cap1 = next(d for p, d in walk(root)
+            if (d.Factor_dep or {}).get('CompoundingMethod') == 'OIS')   # first caplet
+R = cap1.Factor_dep['Cashflows'].Resets
+rf_days = sorted({BASE + timedelta(days=int(x)) for x in R[:, 3]})        # Start_Day
+
+cal = ql.SouthAfrica()
+p_start, p_end = rf_days[0], BASE + timedelta(days=int(R[:, 4].max()))
+ours, q, qe = [p_start], to_ql_date(p_start) + 1, to_ql_date(p_end)
+while q < qe:
+    if cal.isBusinessDay(q):
+        ours.append(date(q.year(), int(q.month()), q.dayOfMonth()))
+    q = q + 1
+
+print(f"period {p_start} -> {p_end}   RiskFlow={len(rf_days)}  ours={len(ours)}")
+print("RiskFlow has, we don't:", sorted(set(rf_days) - set(ours)))
+print("we have, RiskFlow doesn't:", sorted(set(ours) - set(rf_days)))
