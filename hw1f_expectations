@@ -1,22 +1,14 @@
-from datetime import date, timedelta
-import QuantLib as ql
-from utils.ql_helpers import to_ql_date
+def next_business_day_on_or_after(d: date, calendar: ql.Calendar) -> date:
+    """First business day at or after *d* on *calendar* (*d* itself if it is one).
 
-BASE = date(2026, 6, 22)
-
-cap1 = next(d for p, d in walk(root)
-            if (d.Factor_dep or {}).get('CompoundingMethod') == 'OIS')   # first caplet
-R = cap1.Factor_dep['Cashflows'].Resets
-rf_days = sorted({BASE + timedelta(days=int(x)) for x in R[:, 3]})        # Start_Day
-
-cal = ql.SouthAfrica()
-p_start, p_end = rf_days[0], BASE + timedelta(days=int(R[:, 4].max()))
-ours, q, qe = [p_start], to_ql_date(p_start) + 1, to_ql_date(p_end)
-while q < qe:
-    if cal.isBusinessDay(q):
-        ours.append(date(q.year(), int(q.month()), q.dayOfMonth()))
-    q = q + 1
-
-print(f"period {p_start} -> {p_end}   RiskFlow={len(rf_days)}  ours={len(ours)}")
-print("RiskFlow has, we don't:", sorted(set(rf_days) - set(ours)))
-print("we have, RiskFlow doesn't:", sorted(set(ours) - set(rf_days)))
+    Overnight resets are set on business days and each one locks its WHOLE
+    span, so a Friday reset covering Fri->Mon is already fixed when the trade
+    is valued on the Saturday.  Snapping a valuation date forward with this
+    function gives the date through which the realized compounding actually
+    extends, which is what partitions an OIS accrual by the leg's reset
+    schedule rather than by wherever the simulation grid happens to fall.
+    """
+    q = to_ql_date(d)
+    while not calendar.isBusinessDay(q):
+        q = q + 1
+    return from_ql_date(q)
