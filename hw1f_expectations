@@ -1,14 +1,17 @@
-def next_business_day_on_or_after(d: date, calendar: ql.Calendar) -> date:
-    """First business day at or after *d* on *calendar* (*d* itself if it is one).
+    # ------------------------------------------------------------------
+    # OIS compound-factor accrual
+    # ------------------------------------------------------------------
 
-    Overnight resets are set on business days and each one locks its WHOLE
-    span, so a Friday reset covering Fri->Mon is already fixed when the trade
-    is valued on the Saturday.  Snapping a valuation date forward with this
-    function gives the date through which the realized compounding actually
-    extends, which is what partitions an OIS accrual by the leg's reset
-    schedule rather than by wherever the simulation grid happens to fall.
-    """
-    q = to_ql_date(d)
-    while not calendar.isBusinessDay(q):
-        q = q + 1
-    return from_ql_date(q)
+    @staticmethod
+    def _reset_boundary(instrument, d: date) -> date:
+        """The date through which resets have fixed as at *d*.
+
+        The next business day at or after *d* on the leg's calendar, or *d*
+        unchanged when the instrument exposes no calendar.
+        """
+        calendar = getattr(
+            getattr(instrument, "schedule_config", None), "ql_calendar", None,
+        )
+        if calendar is None:
+            return d
+        return next_business_day_on_or_after(d, calendar)
