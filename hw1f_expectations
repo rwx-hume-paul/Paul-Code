@@ -1,16 +1,19 @@
-            # Accrual window: mark-to-market against remaining DF.
-            # CF_realized runs through the next reset boundary, which is
-            # past val_date across a weekend (Friday's reset locks Fri->Mon).
-            # The projected stub must start there, not at val_date, or the
-            # weekend is counted twice.  On a business day the two coincide,
-            # the factor below is exactly 1, and this is a no-op.
-            stub_from = min(
-                next_business_day_on_or_after(val_date, calendar), future[0][1],
-            )
-            t_stub = float(curve_day_counter.yearFraction(
-                to_ql_date(val_date), to_ql_date(stub_from),
-            ))
-            df_stub = fwd_curve.discount_factor(t_stub)
-            df_end_fwd = fwd_curve.discount_factor(fwd_t_ends[0])
-            r_eff = (cf_realized * df_stub / df_end_fwd - 1.0) / fwd_tau[0]
-        first_col = r_eff.reshape(n_paths, 1)
+                    # CF_realized runs through the next reset boundary, which is
+                    # past val_date across a weekend (Friday's reset locks Fri->Mon).
+                    # The projected stub must start there, not at val_date, or the
+                    # weekend is counted twice.  On a business day the two coincide,
+                    # the factor below is exactly 1, and this is a no-op.
+                    stub_from = min(
+                        next_business_day_on_or_after(
+                            val_date, sc.ql_calendar,
+                        ),
+                        future[0][1],
+                    )
+                    t_stub = float(sc.curve_day_counter.yearFraction(
+                        to_ql_date(val_date), to_ql_date(stub_from),
+                    ))
+                    df_stub = fwd_curve.discount_factor(t_stub)
+                    df_end_fwd = fwd_curve.discount_factor(fwd_t_ends[0])
+                    r_blend = (
+                        cf_realized * df_stub / df_end_fwd - 1.0
+                    ) / tau_total
